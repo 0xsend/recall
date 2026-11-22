@@ -304,11 +304,8 @@ def probe_sidecar_read(path: Path) -> None:
         conn.execute("SELECT 1 FROM message_fts_rowid LIMIT 1").fetchall()
 
 
-def _candidate_join(
-    conn: sqlite3.Connection, candidate_ids: Iterable[str] | None, id_column: str
-) -> str:
-    if candidate_ids is None:
-        return ""
+def prepare_candidate_ids(conn: sqlite3.Connection, candidate_ids: Iterable[str]) -> None:
+    """Populate `temp.fts_candidates` once for repeated paged sidecar searches."""
     conn.execute(
         "CREATE TEMP TABLE IF NOT EXISTS fts_candidates(id TEXT PRIMARY KEY) WITHOUT ROWID"
     )
@@ -320,6 +317,20 @@ def _candidate_join(
             conn.executemany(
                 "INSERT INTO temp.fts_candidates VALUES (?)", [(key,) for key in batch]
             )
+
+
+def _candidate_join(
+    conn: sqlite3.Connection,
+    candidate_ids: Iterable[str] | None,
+    id_column: str,
+    *,
+    use_prepared_candidates: bool = False,
+) -> str:
+    if use_prepared_candidates:
+        return f"JOIN temp.fts_candidates eligible ON eligible.id = {id_column}"
+    if candidate_ids is None:
+        return ""
+    prepare_candidate_ids(conn, candidate_ids)
     # Eligibility changes membership only: bm25 still sees the full FTS corpus.
     return f"JOIN temp.fts_candidates eligible ON eligible.id = {id_column}"
 
@@ -466,33 +477,55 @@ def search_messages_fts(
     limit: int,
     *,
     offset: int = 0,
+    after: tuple[float, str] | None = None,
     candidate_ids: Iterable[str] | None = None,
+    use_prepared_candidates: bool = False,
 ) -> list[tuple[str, float]]:
     """Return message FTS hits with scores normalized to higher-is-better.
 
     Equal scores order by id. Candidate membership is applied before top-k,
-    without changing corpus-wide BM25 statistics.
+    without changing corpus-wide BM25 statistics. Keyset continuation via
+    ``after=(raw_bm25, message_id)`` keeps SQLite's top-N sort bounded to
+    ``limit`` instead of growing with ``offset``.
     """
     if not query.strip() or limit <= 0:
         return []
     if offset < 0:
         raise ValueError("message FTS offset must be non-negative")
+    if after is not None and offset > 0:
+        raise ValueError("message FTS cannot combine keyset cursor with offset")
     match_query = _message_match_query(query, fields)
     if not match_query:
         return []
-    candidate_join = _candidate_join(sidecar_conn, candidate_ids, "mr.message_id")
+    candidate_join = _candidate_join(
+        sidecar_conn,
+        candidate_ids,
+        "mr.message_id",
+        use_prepared_candidates=use_prepared_candidates,
+    )
+    where_parts = ["message_fts MATCH ?"]
+    params: list[object] = [match_query]
+    if after is not None:
+        last_bm25, last_id = after
+        where_parts.append(
+            "(bm25(message_fts) > ? OR (bm25(message_fts) = ? AND mr.message_id > ?))"
+        )
+        params.extend([last_bm25, last_bm25, last_id])
+    limit_sql = "LIMIT ?" if offset == 0 else "LIMIT ? OFFSET ?"
+    params.append(limit)
+    if offset > 0:
+        params.append(offset)
     rows = sidecar_conn.execute(
         f"""
         SELECT mr.message_id, -bm25(message_fts) AS score
         FROM message_fts
         JOIN message_fts_rowid mr ON mr.rowid = message_fts.rowid
         {candidate_join}
-        WHERE message_fts MATCH ?
+        WHERE {" AND ".join(where_parts)}
         ORDER BY bm25(message_fts) ASC, mr.message_id ASC
-        LIMIT ?
-        OFFSET ?
+        {limit_sql}
         """,
-        [match_query, limit, offset],
+        params,
     ).fetchall()
     return [(str(row[0]), float(row[1])) for row in rows]
 
@@ -503,35 +536,57 @@ def search_tool_calls_fts(
     limit: int,
     *,
     offset: int = 0,
+    after: tuple[float, str] | None = None,
     candidate_ids: Iterable[str] | None = None,
+    use_prepared_candidates: bool = False,
 ) -> list[tuple[str, float]]:
     """Return tool call FTS hits with scores normalized to higher-is-better.
 
     Equal scores order by id. Candidate membership is applied before top-k,
-    without changing corpus-wide BM25 statistics.
+    without changing corpus-wide BM25 statistics. Keyset continuation via
+    ``after=(raw_bm25, tool_call_id)`` keeps SQLite's top-N sort bounded to
+    ``limit`` instead of growing with ``offset``.
     """
     if not query.strip() or limit <= 0:
         return []
     if offset < 0:
         raise ValueError("tool call FTS offset must be non-negative")
+    if after is not None and offset > 0:
+        raise ValueError("tool call FTS cannot combine keyset cursor with offset")
     # Escape like the message path so identifiers with -, :, (, ) are searched as
     # terms instead of leaking raw FTS5 errors via `recall search --tool`.
     match_query = _escape_fts5_query(query)
     if not match_query:
         return []
-    candidate_join = _candidate_join(sidecar_conn, candidate_ids, "tr.tool_call_id")
+    candidate_join = _candidate_join(
+        sidecar_conn,
+        candidate_ids,
+        "tr.tool_call_id",
+        use_prepared_candidates=use_prepared_candidates,
+    )
+    where_parts = ["tool_calls_fts MATCH ?"]
+    params: list[object] = [match_query]
+    if after is not None:
+        last_bm25, last_id = after
+        where_parts.append(
+            "(bm25(tool_calls_fts) > ? OR (bm25(tool_calls_fts) = ? AND tr.tool_call_id > ?))"
+        )
+        params.extend([last_bm25, last_bm25, last_id])
+    limit_sql = "LIMIT ?" if offset == 0 else "LIMIT ? OFFSET ?"
+    params.append(limit)
+    if offset > 0:
+        params.append(offset)
     rows = sidecar_conn.execute(
         f"""
         SELECT tr.tool_call_id, -bm25(tool_calls_fts) AS score
         FROM tool_calls_fts
         JOIN tool_calls_fts_rowid tr ON tr.rowid = tool_calls_fts.rowid
         {candidate_join}
-        WHERE tool_calls_fts MATCH ?
+        WHERE {" AND ".join(where_parts)}
         ORDER BY bm25(tool_calls_fts) ASC, tr.tool_call_id ASC
-        LIMIT ?
-        OFFSET ?
+        {limit_sql}
         """,
-        [match_query, limit, offset],
+        params,
     ).fetchall()
     return [(str(row[0]), float(row[1])) for row in rows]
 

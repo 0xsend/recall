@@ -38,6 +38,14 @@ class SearchParams(Params):
     mode: str | None = None
 
 
+class SearchFilteredParams(SearchParams):
+    role: list[str] | None = None
+    project: str | None = None
+    since: str | None = None
+    host: str | None = None
+    per_session: int | None = None
+
+
 class ListParams(Params):
     session: str | None = None
     source: str | None = None

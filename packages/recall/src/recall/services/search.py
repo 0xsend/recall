@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -15,13 +16,15 @@ from recall.core.embeddings import EmbeddingBackend
 from recall.core.fts_text import sql_is_non_blank
 from recall.core.read_cancellation import check_read_cancelled
 from recall.core.snippets import build_search_snippet
-from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
+from recall.core.time import to_naive_utc
+from recall.core.types import UNATTRIBUTED_HOST, Role, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, load_fts_extension
 from recall.db.fts_sidecar import (
     KeywordIndexFailure,
     is_lock_contention,
     open_sidecar,
     open_sidecar_readonly,
+    prepare_candidate_ids,
     search_messages_fts,
     search_tool_calls_fts,
     sidecar_path,
@@ -105,6 +108,11 @@ def search(
     source: Source | None,
     tool: str | None,
     session: str | None = None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     limit: int = 20,
     mode: SearchMode = SearchMode.AUTO,
     config: AppConfig | None = None,
@@ -122,6 +130,11 @@ def search(
             source=source,
             tool=tool,
             session=session,
+            roles=roles,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
             limit=limit,
             mode=mode,
             config=config,
@@ -139,6 +152,11 @@ def search_on(
     source: Source | None,
     tool: str | None,
     session: str | None = None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     limit: int = 20,
     mode: SearchMode = SearchMode.AUTO,
     config: AppConfig,
@@ -156,6 +174,11 @@ def search_on(
             source=source,
             tool=tool,
             session=session,
+            roles=roles,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
             limit=limit,
             mode=mode,
             config=config,
@@ -175,6 +198,11 @@ def _search(
     source: Source | None,
     tool: str | None,
     session: str | None = None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     limit: int = 20,
     mode: SearchMode = SearchMode.AUTO,
     config: AppConfig,
@@ -183,9 +211,18 @@ def _search(
     query_embedding: list[float] | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
+    if tool is not None and roles:
+        raise ValueError("--role cannot be combined with --tool")
+    if per_session is not None and (isinstance(per_session, bool) or per_session <= 0):
+        raise ValueError("per_session must be a positive integer")
+    if since is not None:
+        since = to_naive_utc(since)
     if session is not None:
         session = resolve_session_identifier(
-            conn, session, source=source.value if source is not None else None
+            conn,
+            session,
+            source=source.value if source is not None else None,
+            host=host,
         ).id
     if tool:
         return _finalize_results(
@@ -203,6 +240,10 @@ def _search(
                         tool,
                         limit,
                         session=session,
+                        project=project,
+                        since=since,
+                        host=host,
+                        per_session=per_session,
                         config=config,
                         keyword_access=keyword_access,
                     ),
@@ -244,6 +285,11 @@ def _search(
                     limit,
                     config.fts.fields,
                     session=session,
+                    roles=roles,
+                    project=project,
+                    since=since,
+                    host=host,
+                    per_session=per_session,
                     config=config,
                     keyword_access=keyword_access,
                 ),
@@ -288,6 +334,11 @@ def _search(
                         limit,
                         config.fts.fields,
                         session=session,
+                        roles=roles,
+                        project=project,
+                        since=since,
+                        host=host,
+                        per_session=per_session,
                         config=config,
                         keyword_access=keyword_access,
                     ),
@@ -302,7 +353,18 @@ def _search(
         return _finalize_results(
             lease,
             conn,
-            _vector_search_all(conn, query_embedding, source, limit, session=session),
+            _vector_search_all(
+                conn,
+                query_embedding,
+                source,
+                limit,
+                session=session,
+                roles=roles,
+                project=project,
+                since=since,
+                host=host,
+                per_session=per_session,
+            ),
             query=query,
             fields=config.fts.fields,
         )
@@ -323,6 +385,11 @@ def _search(
                 limit,
                 config.fts.fields,
                 session=session,
+                roles=roles,
+                project=project,
+                since=since,
+                host=host,
+                per_session=per_session,
                 config=config,
                 keyword_access=keyword_access,
             ),
@@ -521,6 +588,92 @@ def _probe_backend(
     return any_backend_available()
 
 
+def _needs_session_state_join(
+    project: str | None,
+    since: datetime | None,
+    host: str | None,
+) -> bool:
+    return project is not None or since is not None or host is not None
+
+
+def _session_state_join_sql(
+    project: str | None,
+    since: datetime | None,
+    host: str | None,
+) -> str:
+    if _needs_session_state_join(project, since, host):
+        return "JOIN session_state ss ON ss.session_id = s.id"
+    return ""
+
+
+def _project_match_sql(ss_alias: str = "ss") -> str:
+    return f"contains(LOWER(COALESCE({ss_alias}.git_repo, '')), LOWER(?))"
+
+
+def _append_session_state_predicates(
+    where_parts: list[str],
+    params: list[object],
+    *,
+    project: str | None,
+    since: datetime | None,
+    host: str | None,
+    message_ts_expr: str | None,
+    ss_alias: str = "ss",
+) -> None:
+    if project is not None:
+        where_parts.append(_project_match_sql(ss_alias))
+        params.append(project)
+    if host is not None:
+        where_parts.append(f"{ss_alias}.host = ?")
+        params.append(host)
+    if since is not None:
+        naive_since = to_naive_utc(since)
+        if message_ts_expr is not None:
+            where_parts.append(
+                f"COALESCE({message_ts_expr}, {ss_alias}.ended_at, "
+                f"{ss_alias}.started_at, {ss_alias}.indexed_at) >= ?"
+            )
+        else:
+            where_parts.append(
+                f"COALESCE({ss_alias}.ended_at, {ss_alias}.started_at, {ss_alias}.indexed_at) >= ?"
+            )
+        params.append(naive_since)
+
+
+def _append_role_predicates(
+    where_parts: list[str],
+    params: list[object],
+    roles: tuple[Role, ...] | None,
+) -> None:
+    if not roles:
+        return
+    placeholders = ", ".join("?" for _ in roles)
+    where_parts.append(f"ms.role IN ({placeholders})")
+    params.extend(role.value for role in roles)
+
+
+def _apply_per_session_cap(
+    results: list[SearchResult],
+    per_session: int | None,
+    limit: int,
+) -> list[SearchResult]:
+    if limit <= 0:
+        return []
+    if per_session is None:
+        return results[:limit]
+    kept: list[SearchResult] = []
+    counts: dict[str, int] = {}
+    for result in results:
+        seen = counts.get(result.session_id, 0)
+        if seen >= per_session:
+            continue
+        counts[result.session_id] = seen + 1
+        kept.append(result)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
 # ---- Hybrid Search (RRF) ----
 
 
@@ -533,6 +686,11 @@ def _hybrid_search(
     fields: tuple[str, ...],
     k: int = 60,
     session: str | None = None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
@@ -546,6 +704,11 @@ def _hybrid_search(
         fetch_limit,
         fields,
         session=session,
+        roles=roles,
+        project=project,
+        since=since,
+        host=host,
+        per_session=per_session,
         config=config,
         keyword_access=keyword_access,
         apply_quality_adjustments=False,
@@ -556,6 +719,11 @@ def _hybrid_search(
         source,
         fetch_limit,
         session=session,
+        roles=roles,
+        project=project,
+        since=since,
+        host=host,
+        per_session=per_session,
         apply_quality_adjustments=False,
     )
 
@@ -593,7 +761,7 @@ def _hybrid_search(
         component_scores=component_scores,
         enforce_lexical_tier=True,
     )
-    return ranked[:limit]
+    return _apply_per_session_cap(ranked, per_session, limit)
 
 
 def _result_key(result: SearchResult) -> str:
@@ -703,21 +871,48 @@ def _vector_search_all(
     limit: int,
     session: str | None = None,
     *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     apply_quality_adjustments: bool = True,
 ) -> list[SearchResult]:
     fetch_limit = limit * _KEYWORD_OVERSAMPLE_FACTOR if apply_quality_adjustments else limit
     results: list[SearchResult] = []
     results.extend(
-        _vector_search_messages(conn, query_embedding, source, fetch_limit, session=session)
+        _vector_search_messages(
+            conn,
+            query_embedding,
+            source,
+            fetch_limit,
+            session=session,
+            roles=roles,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
+        )
     )
-    results.extend(
-        _vector_search_tool_calls(conn, query_embedding, source, fetch_limit, session=session)
-    )
+    if not roles:
+        results.extend(
+            _vector_search_tool_calls(
+                conn,
+                query_embedding,
+                source,
+                fetch_limit,
+                session=session,
+                project=project,
+                since=since,
+                host=host,
+                per_session=per_session,
+            )
+        )
     if apply_quality_adjustments:
         ranked = _apply_result_quality_adjustments(results)
     else:
         ranked = sorted(results, key=lambda r: (-r.score, _stable_result_key(r)))
-    return ranked[:limit]
+    return _apply_per_session_cap(ranked, per_session, limit)
 
 
 def _vector_search_messages(
@@ -726,26 +921,59 @@ def _vector_search_messages(
     source: Source | None,
     limit: int,
     session: str | None = None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
 ) -> list[SearchResult]:
-    where_parts = ["TRUE"]
+    scoped_where_parts = ["TRUE"]
     params: list[object] = [query_embedding, MIN_VECTOR_SIMILARITY, MIN_VECTOR_SIMILARITY]
     if source is not None:
-        where_parts.append("s.source = ?")
+        scoped_where_parts.append("s.source = ?")
         params.append(source.value)
     if session is not None:
-        where_parts.append("m.session_id = ?")
+        scoped_where_parts.append("m.session_id = ?")
         params.append(session)
-    params.append(MIN_VECTOR_SIMILARITY)
+    if project is not None:
+        scoped_where_parts.append(_project_match_sql("ss"))
+        params.append(project)
+    if host is not None:
+        scoped_where_parts.append("ss.host = ?")
+        params.append(host)
 
-    where_clause = "WHERE " + " AND ".join(where_parts)
+    eligible_where_parts = ["TRUE"]
+    _append_role_predicates(eligible_where_parts, params, roles)
+    if since is not None:
+        eligible_where_parts.append(
+            "COALESCE(ms.timestamp, scoped.ended_at, scoped.started_at, scoped.indexed_at) >= ?"
+        )
+        params.append(to_naive_utc(since))
+
+    params.append(MIN_VECTOR_SIMILARITY)
+    qualify_clause = ""
+    if per_session is not None:
+        qualify_clause = (
+            "QUALIFY ROW_NUMBER() OVER ("
+            "PARTITION BY session_id ORDER BY score DESC, message_id ASC"
+            ") <= ?"
+        )
+        params.append(per_session)
+
+    session_state_join = _session_state_join_sql(project, since, host)
+    since_cols = ", ss.ended_at, ss.started_at, ss.indexed_at" if since is not None else ""
+    scoped_where_clause = "WHERE " + " AND ".join(scoped_where_parts)
+    eligible_where_clause = "WHERE " + " AND ".join(eligible_where_parts)
     content_non_blank = sql_is_non_blank("ms.content")
     thinking_non_blank = sql_is_non_blank("ms.thinking")
 
     embed_dim = len(query_embedding)
-    # Materialize scores before identity joins, then rank before wide payloads.
-    # DuckDB 1.5.5 otherwise retains vectors in hash joins and exhausts memory
-    # after writes have loaded ART indexes. test_vector_search_memory covers
-    # both boundaries; remove only when it and the populated benchmark pass.
+    # Materialize scores before identity joins, materialize narrow session-scoped
+    # candidates before reading message_state payloads, and rank before final
+    # hydration. DuckDB 1.5.5 otherwise retains vectors or wide message_state
+    # strings in hash-join build tables and exhausts memory.
+    # test_vector_search_memory covers all three boundaries.
     sql = f"""
         WITH query_vector AS (
             SELECT ?::FLOAT[{embed_dim}] AS embedding
@@ -770,28 +998,40 @@ def _vector_search_messages(
             )
             WHERE COALESCE(content_score, -2.0) >= ?
                OR COALESCE(thinking_score, -2.0) >= ?
-        ), eligible AS (
+        ), scoped AS MATERIALIZED (
             SELECT
                 m.id AS message_id,
-                CASE
-                    WHEN scores.content_score IS NOT NULL AND {content_non_blank}
-                        AND scores.thinking_score IS NOT NULL AND {thinking_non_blank}
-                        THEN GREATEST(scores.content_score, scores.thinking_score)
-                    WHEN scores.content_score IS NOT NULL AND {content_non_blank}
-                        THEN scores.content_score
-                    WHEN scores.thinking_score IS NOT NULL AND {thinking_non_blank}
-                        THEN scores.thinking_score
-                    ELSE NULL
-                END AS score
+                m.session_id AS session_id,
+                scores.content_score,
+                scores.thinking_score
+                {since_cols}
             FROM scores
             JOIN messages m ON m.id = scores.message_id
-            JOIN message_state ms ON ms.message_id = m.id
             JOIN sessions s ON s.id = m.session_id
-            {where_clause}
+            {session_state_join}
+            {scoped_where_clause}
+        ), eligible AS (
+            SELECT
+                scoped.message_id,
+                scoped.session_id,
+                CASE
+                    WHEN scoped.content_score IS NOT NULL AND {content_non_blank}
+                        AND scoped.thinking_score IS NOT NULL AND {thinking_non_blank}
+                        THEN GREATEST(scoped.content_score, scoped.thinking_score)
+                    WHEN scoped.content_score IS NOT NULL AND {content_non_blank}
+                        THEN scoped.content_score
+                    WHEN scoped.thinking_score IS NOT NULL AND {thinking_non_blank}
+                        THEN scoped.thinking_score
+                    ELSE NULL
+                END AS score
+            FROM message_state ms
+            JOIN scoped ON scoped.message_id = ms.message_id
+            {eligible_where_clause}
         ), ranked AS MATERIALIZED (
             SELECT message_id, score
             FROM eligible
             WHERE score IS NOT NULL AND score >= ?
+            {qualify_clause}
             ORDER BY score DESC, message_id ASC
             LIMIT {limit}
         )
@@ -838,6 +1078,11 @@ def _vector_search_tool_calls(
     source: Source | None,
     limit: int,
     session: str | None = None,
+    *,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
 ) -> list[SearchResult]:
     where_parts = ["scores.score >= ?"]
     params: list[object] = [query_embedding, MIN_VECTOR_SIMILARITY]
@@ -847,7 +1092,24 @@ def _vector_search_tool_calls(
     if session is not None:
         where_parts.append("tc.session_id = ?")
         params.append(session)
+    _append_session_state_predicates(
+        where_parts,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr=None,
+    )
+    qualify_clause = ""
+    if per_session is not None:
+        qualify_clause = (
+            "QUALIFY ROW_NUMBER() OVER ("
+            "PARTITION BY tc.session_id ORDER BY scores.score DESC, tc.id ASC"
+            ") <= ?"
+        )
+        params.append(per_session)
 
+    session_state_join = _session_state_join_sql(project, since, host)
     where_clause = "WHERE " + " AND ".join(where_parts)
 
     sql = f"""
@@ -863,8 +1125,10 @@ def _vector_search_tool_calls(
             FROM scores
             JOIN tool_calls tc ON tc.id = scores.tool_call_id
             JOIN sessions s ON s.id = tc.session_id
+            {session_state_join}
             {where_clause}
-            ORDER BY score DESC, tool_call_id ASC
+            {qualify_clause}
+            ORDER BY scores.score DESC, tc.id ASC
             LIMIT {limit}
         )
         SELECT
@@ -912,9 +1176,14 @@ def _search_all(
     limit: int,
     fields: tuple[str, ...],
     session: str | None = None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
-    *,
     apply_quality_adjustments: bool = True,
 ) -> list[SearchResult]:
     fetch_limit = limit * _KEYWORD_OVERSAMPLE_FACTOR if apply_quality_adjustments else limit
@@ -929,11 +1198,16 @@ def _search_all(
                 fetch_limit,
                 message_fields,
                 session=session,
+                roles=roles,
+                project=project,
+                since=since,
+                host=host,
+                per_session=per_session,
                 config=config,
                 keyword_access=keyword_access,
             )
         )
-    if "bash" in fields:
+    if "bash" in fields and not roles:
         results.extend(
             _search_tool_calls(
                 conn,
@@ -942,6 +1216,10 @@ def _search_all(
                 None,
                 fetch_limit,
                 session=session,
+                project=project,
+                since=since,
+                host=host,
+                per_session=per_session,
                 config=config,
                 keyword_access=keyword_access,
             )
@@ -953,7 +1231,7 @@ def _search_all(
     # REQ-CLI-017: every row here is a BM25/FTS hit. Hybrid reuses this as its
     # lexical leg and re-derives the flag per-row, so marking here is correct
     # for the keyword path and harmless for the fused path.
-    return _mark_lexical(ranked[:limit])
+    return _mark_lexical(_apply_per_session_cap(ranked, per_session, limit))
 
 
 def _search_messages(
@@ -963,12 +1241,30 @@ def _search_messages(
     limit: int,
     fields: list[str],
     session: str | None = None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if config is not None and config.fts.backend == "sqlite_sidecar":
         return _search_messages_sidecar(
-            conn, query, source, limit, fields, session, config, keyword_access=keyword_access
+            conn,
+            query,
+            source,
+            limit,
+            fields,
+            session,
+            config,
+            roles=roles,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
+            keyword_access=keyword_access,
         )
 
     fields_value = ",".join(_message_fts_field(field) for field in fields)
@@ -980,6 +1276,25 @@ def _search_messages(
     if session is not None:
         where_parts.append("m.session_id = ?")
         params.append(session)
+    _append_role_predicates(where_parts, params, roles)
+    _append_session_state_predicates(
+        where_parts,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr="ms.timestamp",
+    )
+    qualify_clause = ""
+    if per_session is not None:
+        qualify_clause = (
+            "QUALIFY ROW_NUMBER() OVER ("
+            "PARTITION BY session_id ORDER BY score DESC, message_id ASC"
+            ") <= ?"
+        )
+        params.append(per_session)
+
+    session_state_join = _session_state_join_sql(project, since, host)
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     sql = f"""
@@ -997,10 +1312,12 @@ def _search_messages(
             FROM messages m
             JOIN message_state ms ON ms.message_id = m.id
             JOIN sessions s ON s.id = m.session_id
+            {session_state_join}
             {where_clause}
         )
         SELECT * FROM ranked
         WHERE score IS NOT NULL
+        {qualify_clause}
         ORDER BY score DESC, message_id ASC
         LIMIT {limit}
     """
@@ -1041,21 +1358,76 @@ def _search_messages_sidecar(
     fields: list[str],
     session: str | None,
     config: AppConfig,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
+    has_membership_filter = (
+        source is not None
+        or session is not None
+        or bool(roles)
+        or project is not None
+        or since is not None
+        or host is not None
+    )
     sidecar_conn = keyword_access.open(sidecar_path(config.data_dir))
     try:
-        if source is not None or session is not None:
+        if has_membership_filter or per_session is not None:
+            selective = (
+                _sidecar_filter_is_selective(
+                    conn,
+                    "message",
+                    source,
+                    session,
+                    roles=roles,
+                    project=project,
+                    since=since,
+                    host=host,
+                )
+                if has_membership_filter
+                else False
+            )
             return _search_filtered_sidecar(
                 limit,
-                _sidecar_filter_is_selective(conn, "message", source, session),
-                lambda size, ids, offset: search_messages_fts(
-                    sidecar_conn, query, fields, size, candidate_ids=ids, offset=offset
+                selective,
+                lambda size, use_prepared, after: search_messages_fts(
+                    sidecar_conn,
+                    query,
+                    fields,
+                    size,
+                    after=after,
+                    use_prepared_candidates=use_prepared,
                 ),
-                lambda hits: _hydrate_message_sidecar_hits(conn, hits, source, session),
-                lambda: _sidecar_candidate_ids(conn, "message", source, session),
+                lambda hits: _hydrate_message_sidecar_hits(
+                    conn,
+                    hits,
+                    source,
+                    session,
+                    roles=roles,
+                    project=project,
+                    since=since,
+                    host=host,
+                ),
+                lambda: prepare_candidate_ids(
+                    sidecar_conn,
+                    _sidecar_candidate_ids(
+                        conn,
+                        "message",
+                        source,
+                        session,
+                        roles=roles,
+                        project=project,
+                        since=since,
+                        host=host,
+                    ),
+                ),
+                per_session=per_session,
             )
         hits = search_messages_fts(sidecar_conn, query, fields, limit)
         check_read_cancelled()
@@ -1067,32 +1439,50 @@ def _search_messages_sidecar(
 def _search_filtered_sidecar(
     limit: int,
     selective: bool,
-    fetch_hits: Callable[[int, Iterator[str] | None, int], list[tuple[str, float]]],
+    fetch_hits: Callable[[int, bool, tuple[float, str] | None], list[tuple[str, float]]],
     hydrate_hits: Callable[[list[tuple[str, float]]], list[SearchResult]],
-    candidate_ids: Callable[[], Iterator[str]],
+    prepare_candidates: Callable[[], None],
+    *,
+    per_session: int | None = None,
 ) -> list[SearchResult]:
-    """Rank selective membership once, or page global hits for broad filters.
+    """Rank selective membership with prepared candidates, or page global hits.
 
-    Both strategies retain corpus scores and score/id ordering. Global paging
-    ends at top-k or corpus exhaustion, never at an arbitrary prefix cap.
+    Both strategies retain corpus scores and score/id ordering, use keyset
+    continuation so SQLite's top-N sort stays bounded to ``page_size`` (never
+    growing with ``OFFSET``), enforce per-session caps incrementally in
+    O(limit) memory, and check cancellation per page.
     """
+    if limit <= 0:
+        return []
     if selective:
-        hits = fetch_hits(limit, candidate_ids(), 0)
+        prepare_candidates()
+        if per_session is None:
+            hits = fetch_hits(limit, True, None)
+            check_read_cancelled()
+            return hydrate_hits(hits)
+    page_size = max(limit, _SIDECAR_FILTER_BATCH_SIZE)
+    accepted: list[SearchResult] = []
+    per_session_counts: dict[str, int] = {}
+    after: tuple[float, str] | None = None
+    while len(accepted) < limit:
         check_read_cancelled()
-        return hydrate_hits(hits)
-    else:
-        page_size = max(limit, _SIDECAR_FILTER_BATCH_SIZE)
-        results: list[SearchResult] = []
-        offset = 0
-        while len(results) < limit:
-            check_read_cancelled()
-            hits = fetch_hits(page_size, None, offset)
-            check_read_cancelled()
-            results.extend(hydrate_hits(hits))
-            if len(hits) < page_size:
+        hits = fetch_hits(page_size, selective, after)
+        check_read_cancelled()
+        hydrated = hydrate_hits(hits)
+        for row in hydrated:
+            if per_session is not None:
+                seen = per_session_counts.get(row.session_id, 0)
+                if seen >= per_session:
+                    continue
+                per_session_counts[row.session_id] = seen + 1
+            accepted.append(row)
+            if len(accepted) >= limit:
                 break
-            offset += len(hits)
-        return results[:limit]
+        if len(hits) < page_size:
+            break
+        last_id, last_score = hits[-1]
+        after = (-last_score, last_id)
+    return accepted
 
 
 def _sidecar_filter_is_selective(
@@ -1101,20 +1491,43 @@ def _sidecar_filter_is_selective(
     source: Source | None,
     session: str | None,
     tool: str | None = None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
 ) -> bool:
     """Estimate filter density without exporting eligible identities.
 
-    Session counters keep source/session decisions independent of corpus size.
-    Tool names need a count over narrow tool metadata. These estimates choose
-    only the cost strategy; both paths enforce authoritative current membership.
+    Session counters keep source/session/project/since/host decisions independent
+    of corpus size. Role-only queries without narrow session filters fall back to
+    broad global paging rather than exporting a large fraction of message IDs.
+    These estimates choose only the cost strategy; both paths enforce
+    authoritative current membership.
     """
+    if (
+        roles
+        and source is None
+        and session is None
+        and project is None
+        and since is None
+        and host is None
+    ):
+        return False
     if tool:
         assert kind == "tool_call"
-        rows = "tool_calls item JOIN sessions s ON s.id = item.session_id"
+        session_state_join = (
+            "JOIN session_state ss ON ss.session_id = s.id"
+            if _needs_session_state_join(project, since, host)
+            else ""
+        )
+        rows = f"tool_calls item JOIN sessions s ON s.id = item.session_id {session_state_join}"
         weight = "1"
+        ss_alias = "ss"
     else:
         rows = "session_state item JOIN sessions s ON s.id = item.session_id"
         weight = "item.message_count" if kind == "message" else "item.tool_count"
+        ss_alias = "item"
     predicates = ["TRUE"]
     params: list[object] = []
     if source is not None:
@@ -1126,6 +1539,15 @@ def _sidecar_filter_is_selective(
     if tool:
         predicates.append("LOWER(item.tool_name) = LOWER(?)")
         params.append(tool)
+    _append_session_state_predicates(
+        predicates,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr=None,
+        ss_alias=ss_alias,
+    )
     check_read_cancelled()
     row = conn.execute(
         f"SELECT COALESCE(SUM({weight}) FILTER (WHERE {' AND '.join(predicates)}), 0), "
@@ -1142,6 +1564,11 @@ def _sidecar_candidate_ids(
     source: Source | None,
     session: str | None,
     tool: str | None = None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
 ) -> Iterator[str]:
     """Stream authoritative eligible identities, bounded by their current rows."""
     if kind == "message":
@@ -1150,6 +1577,7 @@ def _sidecar_candidate_ids(
     else:
         table = "tool_calls"
         state_join = ""
+    session_state_join = _session_state_join_sql(project, since, host)
     predicates: list[str] = []
     params: list[object] = []
     if source is not None:
@@ -1162,11 +1590,21 @@ def _sidecar_candidate_ids(
         assert kind == "tool_call"
         predicates.append("LOWER(item.tool_name) = LOWER(?)")
         params.append(tool)
+    if kind == "message":
+        _append_role_predicates(predicates, params, roles)
+    _append_session_state_predicates(
+        predicates,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr="ms.timestamp" if kind == "message" else None,
+    )
     where = "WHERE " + " AND ".join(predicates) if predicates else ""
     check_read_cancelled()
     conn.execute(
         f"SELECT item.id FROM {table} item {state_join} "
-        f"JOIN sessions s ON s.id = item.session_id {where}",
+        f"JOIN sessions s ON s.id = item.session_id {session_state_join} {where}",
         params,
     )
     while rows := conn.fetchmany(_SIDECAR_CANDIDATE_BATCH_SIZE):
@@ -1179,6 +1617,11 @@ def _hydrate_message_sidecar_hits(
     hits: list[tuple[str, float]],
     source: Source | None,
     session: str | None,
+    *,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
 ) -> list[SearchResult]:
     if not hits:
         return []
@@ -1194,6 +1637,16 @@ def _hydrate_message_sidecar_hits(
     if session is not None:
         where_parts.append("m.session_id = ?")
         params.append(session)
+    _append_role_predicates(where_parts, params, roles)
+    _append_session_state_predicates(
+        where_parts,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr="ms.timestamp",
+    )
+    session_state_join = _session_state_join_sql(project, since, host)
     where_clause = "WHERE " + " AND ".join(where_parts)
 
     rows = conn.execute(
@@ -1210,6 +1663,7 @@ def _hydrate_message_sidecar_hits(
         FROM messages m
         JOIN message_state ms ON ms.message_id = m.id
         JOIN sessions s ON s.id = m.session_id
+        {session_state_join}
         {where_clause}
         """,
         params,
@@ -1243,12 +1697,28 @@ def _search_tool_calls(
     tool: str | None,
     limit: int,
     session: str | None = None,
+    *,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if config is not None and config.fts.backend == "sqlite_sidecar":
         return _search_tool_calls_sidecar(
-            conn, query, source, tool, limit, session, config, keyword_access=keyword_access
+            conn,
+            query,
+            source,
+            tool,
+            limit,
+            session,
+            config,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
+            keyword_access=keyword_access,
         )
 
     where_parts: list[str] = []
@@ -1262,6 +1732,24 @@ def _search_tool_calls(
     if session is not None:
         where_parts.append("tc.session_id = ?")
         params.append(session)
+    _append_session_state_predicates(
+        where_parts,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr=None,
+    )
+    qualify_clause = ""
+    if per_session is not None:
+        qualify_clause = (
+            "QUALIFY ROW_NUMBER() OVER ("
+            "PARTITION BY session_id ORDER BY score DESC, tool_call_id ASC"
+            ") <= ?"
+        )
+        params.append(per_session)
+
+    session_state_join = _session_state_join_sql(project, since, host)
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     sql = f"""
@@ -1277,10 +1765,12 @@ def _search_tool_calls(
                 fts_main_tool_calls.match_bm25(tc.id, ?, fields := 'bash_command') AS score
             FROM tool_calls tc
             JOIN sessions s ON s.id = tc.session_id
+            {session_state_join}
             {where_clause}
         )
         SELECT * FROM ranked
         WHERE score IS NOT NULL
+        {qualify_clause}
         ORDER BY score DESC, tool_call_id ASC
         LIMIT {limit}
     """
@@ -1313,21 +1803,74 @@ def _search_tool_calls_sidecar(
     limit: int,
     session: str | None,
     config: AppConfig,
+    *,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
+    has_membership_filter = (
+        tool is not None
+        or source is not None
+        or session is not None
+        or project is not None
+        or since is not None
+        or host is not None
+    )
     sidecar_conn = keyword_access.open(sidecar_path(config.data_dir))
     try:
-        if tool is not None or source is not None or session is not None:
+        if has_membership_filter or per_session is not None:
+            selective = (
+                _sidecar_filter_is_selective(
+                    conn,
+                    "tool_call",
+                    source,
+                    session,
+                    tool,
+                    project=project,
+                    since=since,
+                    host=host,
+                )
+                if has_membership_filter
+                else False
+            )
             return _search_filtered_sidecar(
                 limit,
-                _sidecar_filter_is_selective(conn, "tool_call", source, session, tool),
-                lambda size, ids, offset: search_tool_calls_fts(
-                    sidecar_conn, query, size, candidate_ids=ids, offset=offset
+                selective,
+                lambda size, use_prepared, after: search_tool_calls_fts(
+                    sidecar_conn,
+                    query,
+                    size,
+                    after=after,
+                    use_prepared_candidates=use_prepared,
                 ),
-                lambda hits: _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session),
-                lambda: _sidecar_candidate_ids(conn, "tool_call", source, session, tool),
+                lambda hits: _hydrate_tool_call_sidecar_hits(
+                    conn,
+                    hits,
+                    source,
+                    tool,
+                    session,
+                    project=project,
+                    since=since,
+                    host=host,
+                ),
+                lambda: prepare_candidate_ids(
+                    sidecar_conn,
+                    _sidecar_candidate_ids(
+                        conn,
+                        "tool_call",
+                        source,
+                        session,
+                        tool,
+                        project=project,
+                        since=since,
+                        host=host,
+                    ),
+                ),
+                per_session=per_session,
             )
         hits = search_tool_calls_fts(sidecar_conn, query, limit)
         check_read_cancelled()
@@ -1342,6 +1885,10 @@ def _hydrate_tool_call_sidecar_hits(
     source: Source | None,
     tool: str | None,
     session: str | None,
+    *,
+    project: str | None = None,
+    since: datetime | None = None,
+    host: str | None = None,
 ) -> list[SearchResult]:
     if not hits:
         return []
@@ -1360,6 +1907,15 @@ def _hydrate_tool_call_sidecar_hits(
     if session is not None:
         where_parts.append("tc.session_id = ?")
         params.append(session)
+    _append_session_state_predicates(
+        where_parts,
+        params,
+        project=project,
+        since=since,
+        host=host,
+        message_ts_expr=None,
+    )
+    session_state_join = _session_state_join_sql(project, since, host)
     where_clause = "WHERE " + " AND ".join(where_parts)
 
     rows = conn.execute(
@@ -1374,6 +1930,7 @@ def _hydrate_tool_call_sidecar_hits(
             s.source_path
         FROM tool_calls tc
         JOIN sessions s ON s.id = tc.session_id
+        {session_state_join}
         {where_clause}
         """,
         params,

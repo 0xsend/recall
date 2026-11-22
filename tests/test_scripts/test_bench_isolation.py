@@ -1224,7 +1224,15 @@ def _defaults(path: str) -> dict[str, object]:
     command: Any = typer.main.get_command(app)
     for part in path.split():
         command = _subcommands(command)[part]
-    return {parameter.name: parameter.default for parameter in command.params if parameter.name}
+    return {
+        parameter.name: (
+            ()
+            if getattr(parameter, "multiple", False) and parameter.default is None
+            else parameter.default
+        )
+        for parameter in command.params
+        if parameter.name
+    }
 
 
 ALLOWED = {

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 import typer
 
@@ -35,6 +35,11 @@ from recall.cli.status_notices import (
 )
 from recall.cli.utils import with_fleet_host
 from recall.core.config import AppConfig
+from recall.core.search_filters import (
+    ROLE_HELP,
+    has_filtered_search_params,
+    normalize_search_filters,
+)
 from recall.core.snippets import build_search_snippet, sanitize_snippet
 from recall.core.tool_format import format_tool_call_line
 from recall.core.types import SOURCE_HELP
@@ -162,6 +167,10 @@ def _acquire_tool_probe(
     session: str | None,
     source: str | None,
     mode: str | None,
+    project: str | None = None,
+    since: str | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     limit: int,
     keyword_index_unready: bool = False,
 ) -> ToolProbe:
@@ -181,8 +190,27 @@ def _acquire_tool_probe(
         params["source"] = source
     if mode:
         params["mode"] = mode
+    if project is not None:
+        params["project"] = project
+    if since is not None:
+        params["since"] = since
+    if host is not None:
+        params["host"] = host
+    if per_session is not None:
+        params["per_session"] = per_session
+    method = (
+        "recall.search_filtered"
+        if has_filtered_search_params(
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
+            fleet=False,
+        )
+        else "recall.search"
+    )
     try:
-        unfiltered = rpc_call_or_error("recall.search", params)
+        unfiltered = rpc_call_or_error(method, params)
     except CliError:
         return UnavailableProbe()
     return CountedProbe(len(unfiltered), sum(1 for row in unfiltered if row.get("lexical_match")))
@@ -277,6 +305,20 @@ def command(
         "--tool",
         help="Restrict to one tool's calls (any tool name, e.g. Bash); excludes message text",
     ),
+    role: Annotated[
+        list[str] | None,
+        typer.Option("--role", help=ROLE_HELP),
+    ] = None,
+    project: str | None = typer.Option(
+        None, "--project", help="Filter by git_repo substring (case-insensitive)"
+    ),
+    since: str | None = typer.Option(None, "--since", help="Time window e.g. 7d, 24h, 2026-01-01"),
+    host: str | None = typer.Option(
+        None, "--host", help="Filter by session host (or select fleet endpoint with --fleet)"
+    ),
+    per_session: int | None = typer.Option(
+        None, "--per-session", help="Maximum hits to return per session"
+    ),
     session: str | None = typer.Option(
         None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
     ),
@@ -316,6 +358,11 @@ def command(
             allowed={
                 "query",
                 "tool",
+                "role",
+                "project",
+                "since",
+                "host",
+                "per_session",
                 "session",
                 "source",
                 "mode",
@@ -331,6 +378,11 @@ def command(
             types={
                 "query": "string",
                 "tool": "string",
+                "role": "string[]",
+                "project": "string",
+                "since": "string",
+                "host": "string",
+                "per_session": "integer",
                 "session": "string",
                 "source": "string",
                 "mode": "string",
@@ -352,6 +404,11 @@ def command(
         )
         query = resolve_param(ctx, payload, "query", query)
         tool = resolve_param(ctx, payload, "tool", tool)
+        role_values = resolve_param(ctx, payload, "role", role)
+        project = resolve_param(ctx, payload, "project", project)
+        since = resolve_param(ctx, payload, "since", since)
+        host = resolve_param(ctx, payload, "host", host)
+        per_session = resolve_param(ctx, payload, "per_session", per_session)
         session = resolve_param(ctx, payload, "session", session)
         source = resolve_param(ctx, payload, "source", source)
         validate_source(source)
@@ -381,6 +438,15 @@ def command(
                 details={"field": "query"},
                 exit_code=2,
             )
+        filters = normalize_search_filters(
+            tool=tool,
+            role=role_values,
+            project=project,
+            since=since,
+            host=host,
+            per_session=per_session,
+        )
+        since_str = since.strip() if since is not None else None
 
         top_endpoint: str | None = None
         if fleet:
@@ -397,6 +463,11 @@ def command(
                 tool=tool,
                 source=source,
                 mode=mode,
+                roles=filters.roles,
+                project=filters.project,
+                since=since_str,
+                host=filters.host,
+                per_session=filters.per_session,
                 limit=limit,
                 fleet_config=fleet_config,
                 fleet_inventory_only=fleet_inventory_only,
@@ -411,10 +482,48 @@ def command(
                 rpc_params["source"] = source
             if mode:
                 rpc_params["mode"] = mode
+            if filters.roles:
+                rpc_params["role"] = [r.value for r in filters.roles]
+            if filters.project is not None:
+                rpc_params["project"] = filters.project
+            if since_str is not None:
+                rpc_params["since"] = since_str
+            if filters.host is not None:
+                rpc_params["host"] = filters.host
+            if filters.per_session is not None:
+                rpc_params["per_session"] = filters.per_session
 
-            results = rpc_call_or_error(
-                "recall.search", rpc_params, on_notification=_render_search_progress
+            method = (
+                "recall.search_filtered"
+                if has_filtered_search_params(
+                    roles=filters.roles,
+                    project=filters.project,
+                    since=filters.since,
+                    host=filters.host,
+                    per_session=filters.per_session,
+                    fleet=False,
+                )
+                else "recall.search"
             )
+            try:
+                results = rpc_call_or_error(
+                    method, rpc_params, on_notification=_render_search_progress
+                )
+            except CliError as err:
+                if (
+                    method == "recall.search_filtered"
+                    and "method not found: recall.search_filtered" in err.message
+                ):
+                    raise CliError(
+                        code=err.code,
+                        message=(
+                            "running daemon does not support search filters "
+                            f"({err.message}); upgrade or run `recall daemon restart`"
+                        ),
+                        details=err.details,
+                        exit_code=err.exit_code,
+                    ) from None
+                raise
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -451,6 +560,10 @@ def command(
         session=session,
         source=source,
         mode=mode,
+        project=filters.project,
+        since=since_str,
+        host=filters.host,
+        per_session=filters.per_session,
         limit=limit,
         keyword_index_unready=keyword_index_unready,
     )
@@ -523,8 +636,8 @@ def command(
         typer.echo(with_fleet_host(header, result, fleet=fleet))
         if result.get("kind") == "message":
             snippet = result.get("snippet") or ""
-            role = sanitize_snippet(str(result.get("role") or "unknown"), max_chars=64)
-            typer.echo(f"  {role}: {snippet}")
+            role_label = sanitize_snippet(str(result.get("role") or "unknown"), max_chars=64)
+            typer.echo(f"  {role_label}: {snippet}")
         else:
             raw_tool_snippet = result.get("snippet")
             tool_line = (
