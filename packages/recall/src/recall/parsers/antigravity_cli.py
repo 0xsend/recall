@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,14 +104,16 @@ class AntigravityCliParser:
         return default_discover(self)
 
     def sidecar_paths(self, path: Path) -> list[Path]:
-        """Per-session conversation DB carrying workspace and git metadata.
+        """Per-session conversation DB and WAL carrying workspace and git metadata.
 
-        Declared in lockstep with ``_read_conversation_metadata`` so sidecar
-        updates participate in staleness fingerprinting (REQ-PARSE-015 /
-        REQ-INDEX-018).
+        Declared in lockstep with ``_read_conversation_metadata`` so both main DB
+        and uncheckpointed WAL updates participate in staleness fingerprinting
+        (REQ-PARSE-015 / REQ-INDEX-018).
         """
         db_path = _conversation_db_path(path)
-        return [db_path] if db_path is not None else []
+        if db_path is None:
+            return []
+        return [db_path, _wal_path(db_path)]
 
     def live_candidates(self, *, now: datetime, idle_threshold: float) -> list[Path]:
         return default_live_candidates(self, now=now, idle_threshold=idle_threshold)
@@ -520,49 +523,60 @@ class _ConversationMetadata:
     conversation_id: str | None = None
 
 
-_SQLITE_HEADER = b"SQLite format 3\x00"
+def _wal_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.name}-wal")
 
 
-def _read_conversation_metadata(db_path: Path | None) -> _ConversationMetadata:
-    """Read workspace and git metadata from ``conversations/<id>.db``.
-
-    Missing files return empty metadata. Non-regular files (e.g., FIFOs) and
-    unreadable files (e.g., ``chmod 000``) are opened through ``open_source``
-    and propagate ``SidecarRefusedError`` so the coordinator fails closed
-    rather than mistaking a refused sidecar for absent metadata. SQLite or
-    protobuf decode errors on a readable regular file are non-fatal.
-    """
-    if db_path is None:
-        return _ConversationMetadata()
+def _read_optional_regular_bytes(path: Path) -> bytes | None:
+    """Read a regular sidecar file via ``open_source``; None if absent, refuse on error."""
     try:
-        with open_source(db_path) as stream:
-            raw = bytearray(stream.read())
+        with open_source(path) as stream:
+            return stream.read()
     except FileNotFoundError:
-        return _ConversationMetadata()
+        return None
     except OSError as err:
         raise SidecarRefusedError(str(err)) from err
 
-    if not raw:
-        return _ConversationMetadata()
-    # SQLite's in-memory deserializer rejects WAL-mode header bytes (2, 2);
-    # normalize the in-memory copy to rollback-journal bytes (1, 1) so the
-    # snapshot reads without touching the filesystem or blocking on locks.
-    if len(raw) >= 20 and raw[:16] == _SQLITE_HEADER and raw[18] == 2 and raw[19] == 2:
-        raw[18] = 1
-        raw[19] = 1
 
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.deserialize(bytes(raw))
-        row = conn.execute(
-            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1"
-        ).fetchone()
-        if row is None:
-            row = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
-    except sqlite3.Error:
+def _read_conversation_metadata(db_path: Path | None) -> _ConversationMetadata:
+    """Read workspace and git metadata from ``conversations/<id>.db`` (+ ``-wal``).
+
+    Missing files return empty metadata. Non-regular files (e.g., FIFOs) and
+    unreadable files (e.g., ``chmod 000``) on either the main DB or its WAL are
+    opened through ``open_source`` and propagate ``SidecarRefusedError`` so the
+    coordinator fails closed rather than mistaking a refused sidecar for absent
+    metadata. SQLite or protobuf decode errors on a readable regular file are
+    non-fatal.
+    """
+    if db_path is None:
         return _ConversationMetadata()
-    finally:
-        conn.close()
+    # Read the WAL before the main DB so an intervening checkpoint cannot drop
+    # newly committed frames (if a checkpoint runs in between, the main DB
+    # already holds those pages).
+    wal_bytes = _read_optional_regular_bytes(_wal_path(db_path))
+    db_bytes = _read_optional_regular_bytes(db_path)
+    if not db_bytes:
+        return _ConversationMetadata()
+
+    with tempfile.TemporaryDirectory(prefix="recall-agy-sidecar-") as tmp_dir:
+        tmp_db = Path(tmp_dir) / "conversation.db"
+        tmp_db.write_bytes(db_bytes)
+        if wal_bytes:
+            _wal_path(tmp_db).write_bytes(wal_bytes)
+        try:
+            conn = sqlite3.connect(str(tmp_db))
+        except sqlite3.Error:
+            return _ConversationMetadata()
+        try:
+            row = conn.execute(
+                "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1"
+            ).fetchone()
+            if row is None:
+                row = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return _ConversationMetadata()
+        finally:
+            conn.close()
     if row is None or not isinstance(row[0], (bytes, bytearray)):
         return _ConversationMetadata()
     return _decode_trajectory_metadata(bytes(row[0]))

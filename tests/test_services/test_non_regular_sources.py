@@ -51,6 +51,12 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
             "transcript_full.jsonl",
             "session.db",
         ),
+        (
+            "antigravity_cli",
+            "antigravity_cli/session1/.system_generated/logs/transcript_full.jsonl",
+            "transcript_full.jsonl",
+            "session.db-wal",
+        ),
     ],
 )
 def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(

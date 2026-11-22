@@ -203,7 +203,7 @@ def test_antigravity_cli_reads_sidecar_metadata_and_project_skills(tmp_path: Pat
     )
 
     parser = AntigravityCliParser()
-    assert parser.sidecar_paths(transcript) == [db_path]
+    assert parser.sidecar_paths(transcript) == [db_path, db_path.with_name(f"{cid}.db-wal")]
 
     session = parser.parse(transcript).session
     assert session.source_session_id == cid
@@ -317,10 +317,14 @@ def test_antigravity_cli_reads_wal_mode_sidecar_and_refuses_unreadable_sidecar(
     )
 
     db_path = app_dir / "conversations" / f"{cid}.db"
+    wal_path = db_path.with_name(f"{cid}.db-wal")
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the writer connection open with autocheckpoint disabled so the
+    # metadata row lives exclusively in the uncheckpointed -wal file.
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
         conn.execute("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)")
         conn.execute(
             "INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)",
@@ -334,23 +338,46 @@ def test_antigravity_cli_reads_wal_mode_sidecar_and_refuses_unreadable_sidecar(
             ),
         )
         conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert wal_path.is_file() and wal_path.stat().st_size > 0
+
+        parser = AntigravityCliParser()
+        session = parser.parse(transcript).session
+        assert session.cwd == "/Users/dev/wal-repo"
+        assert session.git_repo == "/Users/dev/wal-repo"
+        assert session.git_branch == "main"
+
+        # Update branch only in WAL (uncheckpointed) and verify fresh read.
+        conn.execute(
+            "UPDATE trajectory_metadata_blob SET data = ? WHERE id = 'main'",
+            (
+                _build_metadata_blob(
+                    workspace_uri="file:///Users/dev/wal-repo",
+                    git_root_uri="file:///Users/dev/wal-repo",
+                    git_branch="feat/uncheckpointed",
+                ),
+            ),
+        )
+        conn.commit()
+        updated = parser.parse(transcript).session
+        assert updated.git_branch == "feat/uncheckpointed"
     finally:
         conn.close()
-
-    parser = AntigravityCliParser()
-    session = parser.parse(transcript).session
-    assert session.cwd == "/Users/dev/wal-repo"
-    assert session.git_repo == "/Users/dev/wal-repo"
-    assert session.git_branch == "main"
 
     if os.geteuid() != 0:
         db_path.chmod(0)
         try:
             with pytest.raises(SidecarRefusedError):
-                parser.parse(transcript)
+                AntigravityCliParser().parse(transcript)
         finally:
             db_path.chmod(0o644)
+
+        wal_path.write_bytes(b"wal")
+        wal_path.chmod(0)
+        try:
+            with pytest.raises(SidecarRefusedError):
+                AntigravityCliParser().parse(transcript)
+        finally:
+            wal_path.chmod(0o644)
 
 
 def test_antigravity_cli_diagnoses_unknown_record_and_declines_checkpoint(tmp_path: Path) -> None:
