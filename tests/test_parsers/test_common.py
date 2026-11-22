@@ -341,6 +341,6 @@ def test_antigravity_cli_run_command_subagent_and_skill_attribution() -> None:
 
     plugin = build_tool_call(
         "read_file",
-        {"Path": "/Users/dev/.gemini/antigravity-cli/plugins/acme/skills/deploy/SKILL.md"},
+        {"Path": "/Users/dev/.gemini/config/plugins/acme/skills/deploy/SKILL.md"},
     )
     assert plugin.skill_name == "acme:deploy"

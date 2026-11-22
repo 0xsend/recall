@@ -123,7 +123,7 @@ recall index --root PATH --host NAME
 ```
 
 `--root PATH` treats `PATH` as a home directory laid out like `$HOME` (`.claude/`,
-`.codex/`, `.pi/`, `.grok/`, `.kimi-code/`). `--host NAME` labels every session
+`.codex/`, `.pi/`, `.grok/`, `.kimi-code/`, `.gemini/`). `--host NAME` labels every session
 indexed in that run and defaults to the basename of `--root`; ordinary local runs
 label sessions with the machine's short hostname. Re-indexing the same tree is
 idempotent: session identity is a source+path hash, so host and token totals
@@ -150,6 +150,12 @@ rsync -az --delete --prune-empty-dirs \
   --include='.pi/'        --include='.pi/**' \
   --include='.grok/'      --include='.grok/**' \
   --include='.kimi-code/' --include='.kimi-code/**' \
+  --include='.gemini/' \
+  --include='.gemini/antigravity-cli/' \
+  --include='.gemini/antigravity-cli/brain/' \
+  --include='.gemini/antigravity-cli/brain/**' \
+  --include='.gemini/antigravity-cli/conversations/' \
+  --include='.gemini/antigravity-cli/conversations/**' \
   --exclude='*' \
   "$REMOTE:" "$ROOT/"
 

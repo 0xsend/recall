@@ -41,7 +41,6 @@ _INSTALLED_ROOTS: Final = (
     ".codex/plugins/",
     ".codex/skills/",
     ".gemini/antigravity-cli/builtin/skills/",
-    ".gemini/antigravity-cli/plugins/",
     ".gemini/antigravity-cli/skills/",
     ".gemini/config/plugins/",
     ".gemini/config/skills/",

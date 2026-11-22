@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
@@ -22,7 +22,7 @@ from recall.core.models import (
     TailFacts,
     ToolCall,
 )
-from recall.core.source_io import SidecarRefusedError, require_regular_source
+from recall.core.source_io import SidecarRefusedError, open_source
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -206,6 +206,8 @@ class AntigravityCliParser:
                     )
 
                     content = _coerce_str(entry.get("content"))
+                    if content is None and entry.get("status") == "ERROR":
+                        content = _coerce_str(entry.get("error"))
                     thinking = _coerce_str(entry.get("thinking"))
                     msg_tool_calls = _parse_tool_calls(entry.get("tool_calls"))
 
@@ -229,6 +231,14 @@ class AntigravityCliParser:
                             tool_call.message_id = msg.id
                             tool_calls.append(tool_call)
                         _record_stop_marker(stop_markers, entry, msg)
+                    elif entry.get("status") == "ERROR" and (message_idx_base + len(messages)) > 0:
+                        stop_markers.append(
+                            StopMarker(
+                                idx=message_idx_base + len(messages) - 1,
+                                reason="error",
+                                ends_turn=True,
+                            )
+                        )
 
                 elif entry_type == "GENERIC":
                     content = _coerce_str(entry.get("content")) or _coerce_str(entry.get("error"))
@@ -510,29 +520,40 @@ class _ConversationMetadata:
     conversation_id: str | None = None
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
 def _read_conversation_metadata(db_path: Path | None) -> _ConversationMetadata:
     """Read workspace and git metadata from ``conversations/<id>.db``.
 
     Missing files return empty metadata. Non-regular files (e.g., FIFOs) and
-    unreadable files propagate ``SidecarRefusedError`` so the coordinator fails
-    closed rather than mistaking a refused sidecar for absent metadata. SQLite
-    or protobuf decode errors on a readable regular file are non-fatal.
+    unreadable files (e.g., ``chmod 000``) are opened through ``open_source``
+    and propagate ``SidecarRefusedError`` so the coordinator fails closed
+    rather than mistaking a refused sidecar for absent metadata. SQLite or
+    protobuf decode errors on a readable regular file are non-fatal.
     """
     if db_path is None:
         return _ConversationMetadata()
     try:
-        require_regular_source(db_path, db_path.stat())
+        with open_source(db_path) as stream:
+            raw = bytearray(stream.read())
     except FileNotFoundError:
         return _ConversationMetadata()
     except OSError as err:
         raise SidecarRefusedError(str(err)) from err
 
-    uri = f"file:{quote(str(db_path))}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-    except (OSError, sqlite3.Error):
+    if not raw:
         return _ConversationMetadata()
+    # SQLite's in-memory deserializer rejects WAL-mode header bytes (2, 2);
+    # normalize the in-memory copy to rollback-journal bytes (1, 1) so the
+    # snapshot reads without touching the filesystem or blocking on locks.
+    if len(raw) >= 20 and raw[:16] == _SQLITE_HEADER and raw[18] == 2 and raw[19] == 2:
+        raw[18] = 1
+        raw[19] = 1
+
+    conn = sqlite3.connect(":memory:")
     try:
+        conn.deserialize(bytes(raw))
         row = conn.execute(
             "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1"
         ).fetchone()

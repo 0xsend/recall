@@ -48,7 +48,7 @@ Tests use fixtures in `tests/fixtures/`.
 packages/recall/src/recall/
 ├── core/       # domain models, config, IDs, bash parsing (no external deps beyond Pydantic)
 ├── db/         # DuckDB schema, migrations, connection, queries, FTS sidecar
-├── parsers/    # per-source JSONL parsers (Claude Code, Codex, Pi Agent, Grok, Kimi Code)
+├── parsers/    # per-source JSONL parsers (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI)
 ├── services/   # daemon, RPC server, indexing, reconciliation, search, analytics
 └── cli/        # Typer commands; most call the daemon over RPC
 ```

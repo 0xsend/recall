@@ -254,6 +254,7 @@ Optional [contextual retrieval](docs/contextual-retrieval.md) adds a per-message
 | Grok sessions | `~/.grok/sessions/**/chat_history.jsonl` |
 | Grok usage log | `~/.grok/logs/unified.jsonl` (rotates; see [multiple hosts](docs/multi-host.md#grok-log-rotation-cadence)) |
 | Kimi Code sessions | `~/.kimi-code/sessions/**/wire.jsonl` |
+| Antigravity CLI sessions | `~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript_full.jsonl` |
 
 ## Documentation
 

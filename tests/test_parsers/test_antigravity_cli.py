@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
+import pytest
 from recall.cli.contract import validate_source
 from recall.core.models import StopMarker
+from recall.core.source_io import SidecarRefusedError
 from recall.core.types import Role, Source, parse_source
 from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.common import use_home_root
@@ -259,6 +262,95 @@ def test_antigravity_cli_error_planner_response_ends_turn(tmp_path: Path) -> Non
     )
     result = AntigravityCliParser().parse(transcript)
     assert result.tail_facts.stop_markers == (StopMarker(idx=0, reason="error", ends_turn=True),)
+
+
+def test_antigravity_cli_empty_error_planner_response_closes_turn(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript_full.jsonl"
+    transcript.write_text(
+        "".join(
+            json.dumps(entry) + "\n"
+            for entry in (
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-11-21T20:00:00Z",
+                    "content": "run check",
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-21T20:00:01Z",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": "true"}}],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "ERROR",
+                    "created_at": "2026-11-21T20:00:02Z",
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = AntigravityCliParser().parse(transcript)
+    assert result.tail_facts.stop_markers == (
+        StopMarker(idx=1, reason="tool_calls", ends_turn=False),
+        StopMarker(idx=1, reason="error", ends_turn=True),
+    )
+
+
+def test_antigravity_cli_reads_wal_mode_sidecar_and_refuses_unreadable_sidecar(
+    tmp_path: Path,
+) -> None:
+    app_dir = tmp_path / ".gemini" / "antigravity-cli"
+    cid = "wal-and-perm-test"
+    transcript = app_dir / "brain" / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-21T20:00:00Z","content":"hi"}\n',
+        encoding="utf-8",
+    )
+
+    db_path = app_dir / "conversations" / f"{cid}.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)")
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)",
+            (
+                "main",
+                _build_metadata_blob(
+                    workspace_uri="file:///Users/dev/wal-repo",
+                    git_root_uri="file:///Users/dev/wal-repo",
+                    git_branch="main",
+                ),
+            ),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+    parser = AntigravityCliParser()
+    session = parser.parse(transcript).session
+    assert session.cwd == "/Users/dev/wal-repo"
+    assert session.git_repo == "/Users/dev/wal-repo"
+    assert session.git_branch == "main"
+
+    if os.geteuid() != 0:
+        db_path.chmod(0)
+        try:
+            with pytest.raises(SidecarRefusedError):
+                parser.parse(transcript)
+        finally:
+            db_path.chmod(0o644)
 
 
 def test_antigravity_cli_diagnoses_unknown_record_and_declines_checkpoint(tmp_path: Path) -> None:
