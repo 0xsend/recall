@@ -292,7 +292,7 @@ def _parse_json_arguments(raw: Any) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 # Union of all bash-like tool names across providers
-_BASH_TOOL_NAMES = frozenset({"bash", "shell", "exec_command", "shell_command"})
+_BASH_TOOL_NAMES = frozenset({"bash", "shell", "exec_command", "shell_command", "run_command"})
 
 
 def build_tool_call(tool_name: str, tool_input: Any, *, tool_use_id: str | None = None) -> ToolCall:
@@ -320,6 +320,10 @@ def build_tool_call(tool_name: str, tool_input: Any, *, tool_use_id: str | None 
             subagent_type = tool_input.get("subagent_type") or None
             subagent_description = tool_input.get("description") or None
             subagent_model = tool_input.get("model") or None
+        elif tool_name == "invoke_subagent":
+            subagent_type = tool_input.get("TypeName") or None
+            subagent_description = tool_input.get("Role") or None
+            subagent_model = tool_input.get("Model") or None
         elif tool_name == "Skill":
             skill_name = tool_input.get("skill") or None
 
@@ -374,6 +378,8 @@ def extract_bash_command(tool_name: str, tool_input: Any) -> str | None:
             return tool_input["command"]
         if isinstance(tool_input.get("cmd"), str):
             return tool_input["cmd"]
+        if isinstance(tool_input.get("CommandLine"), str):
+            return tool_input["CommandLine"]
         if isinstance(tool_input.get("commands"), list):
             return " && ".join(str(cmd) for cmd in tool_input["commands"] if cmd)
     return None

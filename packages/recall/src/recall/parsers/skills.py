@@ -40,6 +40,11 @@ _INSTALLED_ROOTS: Final = (
     ".claude/skills/",
     ".codex/plugins/",
     ".codex/skills/",
+    ".gemini/antigravity-cli/builtin/skills/",
+    ".gemini/antigravity-cli/plugins/",
+    ".gemini/antigravity-cli/skills/",
+    ".gemini/config/plugins/",
+    ".gemini/config/skills/",
     ".grok/bundled/skills/",
     ".pi/agent/git/",
     ".pi/agent/plugins/",
@@ -79,7 +84,7 @@ _READ_VERBS: Final = frozenset({"bat", "cat", "head", "less", "more", "nl", "sed
 # Tools whose entire job is reading one file.
 _READ_TOOLS: Final = frozenset({"read", "read_file", "view", "readfile"})
 
-_PATH_KEYS: Final = ("path", "file_path", "filePath", "absolute_path", "target_file")
+_PATH_KEYS: Final = ("path", "Path", "file_path", "filePath", "absolute_path", "target_file")
 
 # Shell control operators, as `shlex(punctuation_chars=True)` groups them.
 _OPERATOR_CHARS: Final = frozenset("&|;<>()")

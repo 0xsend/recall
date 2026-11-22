@@ -391,7 +391,7 @@ def command(
         None, "--embed/--no-embed", help="Enable/disable the adaptive embed phase"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
+        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
     ),
     batch_size: int | None = typer.Option(
         None, "--batch-size", help="Override embedding batch size for this daemon process"

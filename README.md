@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/0xsend/recall/actions/workflows/ci.yml/badge.svg)](https://github.com/0xsend/recall/actions/workflows/ci.yml)
 
-Session recall and analytics for AI coding agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code).
+Session recall and analytics for AI coding agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI).
 
 Search past sessions, follow what running agents are doing, analyze tool usage, and generate permission suggestions from your local agent history. Everything stays on your machine in a local DuckDB index.
 

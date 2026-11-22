@@ -39,6 +39,18 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
         ("grok", "grok/session1.jsonl", "chat_history.jsonl", "signals.json"),
         ("kimi_code", "kimi_code/session1/agents/main/wire.jsonl", "wire.jsonl", None),
         ("kimi_code", "kimi_code/session1/agents/main/wire.jsonl", "wire.jsonl", "state.json"),
+        (
+            "antigravity_cli",
+            "antigravity_cli/session1/.system_generated/logs/transcript_full.jsonl",
+            "transcript_full.jsonl",
+            None,
+        ),
+        (
+            "antigravity_cli",
+            "antigravity_cli/session1/.system_generated/logs/transcript_full.jsonl",
+            "transcript_full.jsonl",
+            "session.db",
+        ),
     ],
 )
 def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(
@@ -57,18 +69,27 @@ def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(
 def _coordinator_preserves_history_when_a_source_becomes_a_pipe(
     tmp_path: Path, source: str, fixture: str, name: str, sidecar: str | None
 ) -> None:
-    root = tmp_path / "transcripts"
-    root.mkdir()
-    path = root / "session/agents/main" / name
-    path.parent.mkdir(parents=True)
+    if source == "antigravity_cli":
+        app_dir = tmp_path / "transcripts"
+        root = app_dir / "brain"
+        path = root / "session" / ".system_generated" / "logs" / name
+    else:
+        root = tmp_path / "transcripts"
+        path = root / "session/agents/main" / name
+    root.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     data = (FIXTURES / fixture).read_bytes()
     path.write_bytes(zstd.compress(data) if name.endswith(".zst") else data)
-    special = (
-        path
-        if sidecar is None
-        else (path.parents[2] / sidecar if source == "kimi_code" else path.parent / sidecar)
-    )
+    if sidecar is None:
+        special = path
+    elif source == "kimi_code":
+        special = path.parents[2] / sidecar
+    elif source == "antigravity_cli":
+        special = path.parents[4] / "conversations" / sidecar
+    else:
+        special = path.parent / sidecar
     if sidecar:
+        special.parent.mkdir(parents=True, exist_ok=True)
         special.write_text('{"cwd":"/project","info":{"cwd":"/project"}}')
     parser = get_parser(Source(source))
     parser.roots = (root,)

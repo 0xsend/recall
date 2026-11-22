@@ -233,7 +233,7 @@ def command(
         None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
+        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
     ),
     mode: str | None = typer.Option(
         None,

@@ -11,6 +11,7 @@ import pytest
 from recall import _native
 from recall.core.config import AppConfig
 from recall.db.schema import ensure_schema
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.parsers.grok import GrokParser
@@ -32,6 +33,7 @@ class MetadataCase:
         | type[PiAgentParser]
         | type[GrokParser]
         | type[KimiCodeParser]
+        | type[AntigravityCliParser]
     )
     relative_path: str
     boundary: bytes
@@ -133,6 +135,14 @@ CASES = (
         ),
         records({"type": "profile.bind", "modelAlias": "first"}),
         records({"type": "llm.request", "modelAlias": "second"}),
+        "first",
+    ),
+    MetadataCase(
+        AntigravityCliParser,
+        "brain/session/.system_generated/logs/transcript_full.jsonl",
+        records({"type": "USER_INPUT", "content": "boundary"}),
+        records({"type": "PLANNER_RESPONSE", "model": "first", "content": "first"}),
+        records({"type": "PLANNER_RESPONSE", "model": "second", "content": "second"}),
         "first",
     ),
 )

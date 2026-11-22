@@ -41,7 +41,7 @@ def command(
         ),
     ),
     source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
+        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
     ),
     recreate: bool = typer.Option(
         False,
@@ -339,12 +339,12 @@ def command(
 
 
 def _warn_if_unrecognized_home(root: Path) -> None:
-    agent_homes = (".claude", ".codex", ".pi", ".grok", ".kimi-code")
+    agent_homes = (".claude", ".codex", ".pi", ".grok", ".kimi-code", ".gemini")
     if root.is_dir() and not any((root / name).is_dir() for name in agent_homes):
         typer.secho(
             f"warning: --root {root} has no recognized agent-home subdirectories; "
             "expected a home layout containing .claude/, .codex/, .pi/, .grok/, "
-            "or .kimi-code/. No sessions will be discovered from this root.",
+            ".kimi-code/, or .gemini/. No sessions will be discovered from this root.",
             err=True,
             fg=typer.colors.YELLOW,
         )

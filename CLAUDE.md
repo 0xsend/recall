@@ -1,6 +1,6 @@
 # recall
 
-Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code).
+Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI).
 [README.md](README.md) covers usage; [CONTRIBUTING.md](CONTRIBUTING.md) covers setup and the document map.
 
 ## Commands

@@ -95,7 +95,7 @@ def test_the_registry_builds_parsers_with_their_configured_roots(tmp_path) -> No
 
 
 def test_the_registry_without_config_matches_the_bare_parsers() -> None:
-    assert [parser.roots for parser in all_parsers()] == [None] * 5
+    assert [parser.roots for parser in all_parsers()] == [None] * len(Source)
 
 
 def test_live_window_boundary_is_inclusive(tmp_path) -> None:
@@ -213,6 +213,7 @@ def test_each_source_follows_nested_directory_links_once(tmp_path) -> None:
             "codex": "rollout-session.jsonl",
             "grok": "chat_history.jsonl",
             "kimi_code": "wire.jsonl",
+            "antigravity_cli": "transcript_full.jsonl",
         }.get(parser.source.value, "session.jsonl")
         transcript = _transcript(target, name)
         (root / "relative").symlink_to(Path("../target"), target_is_directory=True)

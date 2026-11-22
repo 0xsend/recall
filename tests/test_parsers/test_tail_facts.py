@@ -254,3 +254,21 @@ def test_kimi_pairs_tool_results_and_records_finish_reasons() -> None:
         ("tool_use", False),
         ("stop", True),
     ]
+
+
+def test_antigravity_cli_records_stop_markers() -> None:
+    """Antigravity CLI tool steps keep turns open; final content closes them."""
+    from recall.parsers.antigravity_cli import AntigravityCliParser
+
+    result = AntigravityCliParser().parse(
+        FIXTURES
+        / "antigravity_cli"
+        / "session1"
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+
+    assert [
+        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
+    ] == [(1, "tool_calls", False), (8, "stop", True)]

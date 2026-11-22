@@ -36,6 +36,7 @@ from recall.core.models import (
     ParseResult,
     StopMarker,
 )
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.parsers.grok import GrokParser
@@ -499,6 +500,88 @@ PI_RECORDS = (
 )
 
 
+ANTIGRAVITY_CLI_RECORDS = (
+    _line(
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:00Z",
+            "content": "<USER_REQUEST>\nList files\n</USER_REQUEST>",
+        }
+    ),
+    _line(
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:02Z",
+            "model": "gemini-4-neon-high",
+            "input_tokens": 500,
+            "cache_read_tokens": 0,
+            "output_tokens": 40,
+            "thinking": "Checking directory",
+            "tool_calls": [
+                {
+                    "name": "run_command",
+                    "args": {"CommandLine": "ls -la", "WaitMsBeforeAsync": 5000},
+                }
+            ],
+        }
+    ),
+    _line(
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:03Z",
+            "content": "README.md\n",
+        }
+    ),
+    _line(
+        {
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:05Z",
+            "model": "gemini-4-neon-high",
+            "input_tokens": 100,
+            "cache_read_tokens": 500,
+            "output_tokens": 20,
+            "content": "Found README.md.",
+        }
+    ),
+    _line(
+        {
+            "step_index": 4,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:10Z",
+            "content": "<USER_REQUEST>\nRead README.md\n</USER_REQUEST>",
+        }
+    ),
+    _line(
+        {
+            "step_index": 5,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:00:12Z",
+            "model": "gemini-4-neon-high",
+            "input_tokens": 120,
+            "cache_read_tokens": 600,
+            "output_tokens": 30,
+            "content": "Done reading.",
+        }
+    ),
+)
+
+
 @dataclass(frozen=True)
 class AdapterCase:
     name: str
@@ -511,6 +594,7 @@ class AdapterCase:
 
     def parser(self, root: Path) -> SessionParser:
         factories = {
+            "antigravity_cli": AntigravityCliParser,
             "claude_code": ClaudeCodeParser,
             "codex": CodexParser,
             "grok": GrokParser,
@@ -565,6 +649,13 @@ CASES = (
         records=PI_RECORDS,
         relative_path="sessions/session.jsonl",
         closed_split=5,
+        open_splits=(),
+    ),
+    AdapterCase(
+        name="antigravity_cli",
+        records=ANTIGRAVITY_CLI_RECORDS,
+        relative_path="brain/sess-1/.system_generated/logs/transcript_full.jsonl",
+        closed_split=4,
         open_splits=(),
     ),
 )

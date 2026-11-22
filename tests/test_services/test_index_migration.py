@@ -16,6 +16,7 @@ from recall.core.config import AppConfig
 from recall.db import connect
 from recall.db.lease import StandaloneLifetime
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.parsers.grok import GrokParser
@@ -356,6 +357,11 @@ _SOURCE_CASES = (
     (GrokParser, "grok/session1.jsonl", "chat_history.jsonl"),
     (PiAgentParser, "pi_agent/session1.jsonl", "session.jsonl"),
     (KimiCodeParser, "kimi_code/session1/agents/main/wire.jsonl", "wire.jsonl"),
+    (
+        AntigravityCliParser,
+        "antigravity_cli/session1/.system_generated/logs/transcript_full.jsonl",
+        "transcript_full.jsonl",
+    ),
 )
 
 

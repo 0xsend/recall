@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
@@ -63,6 +64,7 @@ def test_capture_enforces_record_limit(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("parser_type", "complete_record"),
     [
+        (AntigravityCliParser, {"type": "USER_INPUT", "content": "hi"}),
         (ClaudeCodeParser, {"type": "system"}),
         # An empty object is an unsupported Codex semantic record.  Exercise
         # capture with supported metadata so this shared contract does not
@@ -91,7 +93,15 @@ def test_all_parsers_expose_capture_contract(
 
 
 @pytest.mark.parametrize(
-    "parser_type", [ClaudeCodeParser, CodexParser, GrokParser, KimiCodeParser, PiAgentParser]
+    "parser_type",
+    [
+        AntigravityCliParser,
+        ClaudeCodeParser,
+        CodexParser,
+        GrokParser,
+        KimiCodeParser,
+        PiAgentParser,
+    ],
 )
 def test_unknown_semantic_records_are_acknowledged_but_prevent_clean_coverage(
     tmp_path: Path, parser_type: type

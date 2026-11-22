@@ -161,6 +161,7 @@ def daemon_lane(tmp_path: Path, socket_dir: Path) -> Iterator[DaemonLane]:
         "[sources.pi_agent]\nroots = []\n"
         "[sources.grok]\nroots = []\n"
         "[sources.kimi_code]\nroots = []\n"
+        "[sources.antigravity_cli]\nroots = []\n"
     )
     yield DaemonLane(root, config, socket_dir / "recall.sock")
 

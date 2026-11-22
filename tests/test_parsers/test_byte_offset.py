@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from recall.core.models import ParseResult
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
@@ -491,6 +492,108 @@ class TestKimiCodeByteOffset:
 
         empty = parser.parse(
             wire, offset=full.next_byte_offset, message_idx_base=1, resume_state=_state(full)
+        )
+        assert empty.session.message_count == 0
+        assert empty.is_full_parse is False
+
+
+class TestAntigravityCliByteOffset:
+    def _step(self, entry: dict) -> str:
+        return json.dumps(entry) + "\n"
+
+    def test_offset_parse_returns_only_new_messages(self, tmp_path: Path) -> None:
+        transcript = tmp_path / "transcript_full.jsonl"
+        transcript.write_text(
+            "".join(
+                self._step(e)
+                for e in (
+                    {
+                        "step_index": 0,
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "status": "DONE",
+                        "created_at": "2026-11-21T20:00:00Z",
+                        "content": "<USER_REQUEST>\nhello\n</USER_REQUEST>",
+                    },
+                    {
+                        "step_index": 1,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-21T20:00:02Z",
+                        "model": "gemini-4-neon-high",
+                        "input_tokens": 100,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 20,
+                        "content": "hi there",
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+        parser = AntigravityCliParser()
+        full = parser.parse(transcript)
+        assert full.is_full_parse is True
+        assert full.session.message_count == 2
+        assert full.session.model == "gemini-4-neon-high"
+
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                self._step(
+                    {
+                        "step_index": 2,
+                        "source": "MODEL",
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-21T20:00:10Z",
+                        "model": "gemini-4-carbon-high",
+                        "input_tokens": 50,
+                        "cache_read_tokens": 100,
+                        "output_tokens": 10,
+                        "content": "follow up",
+                    }
+                )
+            )
+
+        incr = parser.parse(
+            transcript,
+            offset=full.next_byte_offset,
+            message_idx_base=2,
+            resume_state=_state(full),
+        )
+        assert incr.is_full_parse is False
+        assert incr.session.message_count == 1
+        assert incr.session.messages[0].idx == 2
+        assert incr.session.messages[0].content == "follow up"
+        assert incr.session.model == "gemini-4-neon-high"
+        assert incr.session.started_at == full.session.started_at
+        assert incr.session.input_tokens == 150
+        assert incr.session.cached_input_tokens == 100
+        assert incr.session.output_tokens == 10
+        assert incr.next_byte_offset == transcript.stat().st_size
+
+    def test_offset_at_eof_returns_empty(self, tmp_path: Path) -> None:
+        transcript = tmp_path / "transcript_full.jsonl"
+        transcript.write_text(
+            self._step(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-11-21T20:00:00Z",
+                    "content": "only",
+                }
+            ),
+            encoding="utf-8",
+        )
+        parser = AntigravityCliParser()
+        full = parser.parse(transcript)
+        empty = parser.parse(
+            transcript,
+            offset=full.next_byte_offset,
+            message_idx_base=1,
+            resume_state=_state(full),
         )
         assert empty.session.message_count == 0
         assert empty.is_full_parse is False

@@ -315,3 +315,32 @@ def test_an_unexpanded_shell_word_names_no_skill() -> None:
 
     assert derive_skill_names("Bash", None, loop, cwd="/Users/dev/dotfiles/agent-profile") == ()
     assert derive_skill_names("Bash", None, glob) == ()
+
+
+def test_antigravity_cli_run_command_subagent_and_skill_attribution() -> None:
+    cmd = build_tool_call(
+        "run_command", {"CommandLine": "git status --short", "WaitMsBeforeAsync": 5000}
+    )
+    assert cmd.bash_command == "git status --short"
+    assert cmd.bash_base == "git"
+    assert cmd.bash_sub == "status"
+
+    sub = build_tool_call(
+        "invoke_subagent",
+        {"TypeName": "research", "Role": "Codebase Researcher", "Model": "flash", "Prompt": "..."},
+    )
+    assert sub.subagent_type == "research"
+    assert sub.subagent_description == "Codebase Researcher"
+    assert sub.subagent_model == "flash"
+
+    builtin = build_tool_call(
+        "read_file",
+        {"Path": "/Users/dev/.gemini/antigravity-cli/builtin/skills/antigravity_guide/SKILL.md"},
+    )
+    assert builtin.skill_name == "antigravity_guide"
+
+    plugin = build_tool_call(
+        "read_file",
+        {"Path": "/Users/dev/.gemini/antigravity-cli/plugins/acme/skills/deploy/SKILL.md"},
+    )
+    assert plugin.skill_name == "acme:deploy"

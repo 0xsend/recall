@@ -260,6 +260,7 @@ def test_active_observation_pages_cover_large_rosters_and_exclude_foreign_roots(
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
     signature = SourceSignature(1, 2, 3, int(now * 1e9), 5)
