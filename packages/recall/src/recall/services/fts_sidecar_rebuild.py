@@ -51,6 +51,7 @@ from recall.db.lease import (
 )
 from recall.db.ownership import offline_writer_ownership
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
+from recall.services.fts_sidecar_reconcile import iter_tool_call_fts_batches
 from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.recreation import consistent_backup
 
@@ -230,45 +231,49 @@ def verify_totals(conn: sqlite3.Connection, table: str, columns: int) -> tuple[i
     return tuple(totals)
 
 
+def _fingerprint_tool_batch(batch: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Hash one tool-call batch and clear its payload list before yielding fingerprints."""
+    fingerprints = [(key, content_fingerprint((fts_text,))) for key, fts_text in batch]
+    batch.clear()
+    return fingerprints
+
+
 def _canonical_rows(
     source: duckdb.DuckDBPyConnection,
     kind: Literal["message", "tool_call"],
     fields: tuple[str, ...],
 ) -> Iterator[tuple[str, str]]:
+    if kind == "tool_call":
+        if not should_index_bash_fts(fields):
+            return
+        for batch in iter_tool_call_fts_batches(source, batch_size=BATCH_SIZE):
+            yield from _fingerprint_tool_batch(batch)
+        return
+
     fts_content_expr = sql_derive_fts("ms.context_text", "ms.content")
     fts_thinking_expr = sql_derive_fts("ms.context_text", "ms.thinking")
     last_id = ""
     while True:
-        if kind == "message":
-            batch = source.execute(
-                f"""
-                WITH page AS MATERIALIZED (
-                    SELECT message_id
-                    FROM message_state
-                    WHERE message_id > ?
-                    ORDER BY message_id
-                    LIMIT ?
-                )
-                SELECT ms.message_id, {fts_content_expr}, {fts_thinking_expr}
-                FROM page
-                JOIN message_state ms ON ms.message_id = page.message_id
-                ORDER BY ms.message_id
-                """,
-                [last_id, BATCH_SIZE],
-            ).fetchall()
-            rows = [
-                (str(key), scope_message_fts_columns(str(content), str(thinking), fields))
-                for key, content, thinking in batch
-            ]
-        elif should_index_bash_fts(fields):
-            batch = source.execute(
-                "SELECT id, bash_command FROM tool_calls WHERE bash_command IS NOT NULL "
-                "AND id > ? ORDER BY id LIMIT ?",
-                [last_id, BATCH_SIZE],
-            ).fetchall()
-            rows = [(str(key), (str(command),)) for key, command in batch]
-        else:
-            return
+        batch = source.execute(
+            f"""
+            WITH page AS MATERIALIZED (
+                SELECT message_id
+                FROM message_state
+                WHERE message_id > ?
+                ORDER BY message_id
+                LIMIT ?
+            )
+            SELECT ms.message_id, {fts_content_expr}, {fts_thinking_expr}
+            FROM page
+            JOIN message_state ms ON ms.message_id = page.message_id
+            ORDER BY ms.message_id
+            """,
+            [last_id, BATCH_SIZE],
+        ).fetchall()
+        rows = [
+            (str(key), scope_message_fts_columns(str(content), str(thinking), fields))
+            for key, content, thinking in batch
+        ]
         if not rows:
             return
         for key, columns in rows:

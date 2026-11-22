@@ -32,6 +32,7 @@ from recall.db.fts_sidecar import (
 from recall.db.lease import DbLease
 from recall.db.ownership import standalone_read_lease
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
+from recall.services.fts_sidecar_reconcile import iter_tool_call_inputs_bounded
 from recall.services.session_ids import resolve_session_identifier
 
 logger = logging.getLogger("recall.search")
@@ -409,32 +410,77 @@ def _finalize_results(
     query: str,
     fields: tuple[str, ...],
 ) -> list[SearchResult]:
-    return _attach_snippets(_attach_hosts(lease, conn, results), query=query, fields=fields)
+    with_hosts = _attach_hosts(lease, conn, results)
+    return _attach_snippets_streamed(
+        lease,
+        conn,
+        with_hosts,
+        query=query,
+        fields=fields,
+    )
 
 
-def _attach_snippets(
+def _attach_snippets_streamed(
+    lease: DbLease,
+    conn: duckdb.DuckDBPyConnection,
     results: list[SearchResult],
     *,
     query: str,
     fields: tuple[str, ...],
 ) -> list[SearchResult]:
+    """Attach snippets while consuming non-bash `tool_input` JSON one bounded chunk at a time."""
     if not results:
         return results
+    non_bash_indices: dict[str, list[int]] = {}
+    for index, result in enumerate(results):
+        if result.kind == "tool_call" and result.bash_command is None and result.tool_call_id:
+            non_bash_indices.setdefault(result.tool_call_id, []).append(index)
+
+    precomputed: dict[int, str] = {}
+    if non_bash_indices:
+        try:
+            for chunk in iter_tool_call_inputs_bounded(conn, sorted(non_bash_indices)):
+                while chunk:
+                    tc_id, raw_input = chunk.popitem()
+                    for index in non_bash_indices.get(tc_id, ()):
+                        result = results[index]
+                        precomputed[index] = build_search_snippet(
+                            query=query,
+                            kind=result.kind,
+                            content=result.content,
+                            thinking=result.thinking,
+                            role=result.role,
+                            tool_name=result.tool_name,
+                            bash_command=result.bash_command,
+                            tool_input=raw_input,
+                            fields=fields,
+                        )
+                    del raw_input
+        except SCHEMA_MISMATCH_ERRORS as err:
+            if lease.observe(err, "search:tool_inputs"):
+                raise
+            logger.debug("search tool_input hydration failed", exc_info=True)
+
     return [
         dataclasses.replace(
             result,
-            snippet=build_search_snippet(
-                query=query,
-                kind=result.kind,
-                content=result.content,
-                thinking=result.thinking,
-                role=result.role,
-                tool_name=result.tool_name,
-                bash_command=result.bash_command,
-                fields=fields,
+            snippet=(
+                precomputed[index]
+                if index in precomputed
+                else build_search_snippet(
+                    query=query,
+                    kind=result.kind,
+                    content=result.content,
+                    thinking=result.thinking,
+                    role=result.role,
+                    tool_name=result.tool_name,
+                    bash_command=result.bash_command,
+                    tool_input=None,
+                    fields=fields,
+                )
             ),
         )
-        for result in results
+        for index, result in enumerate(results)
     ]
 
 

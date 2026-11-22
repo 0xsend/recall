@@ -91,7 +91,7 @@ def test_upsert_tool_calls_dual_writes(tmp_path: Path) -> None:
         duckdb_conn.close()
 
 
-def test_tool_call_with_null_bash_command_skips_sidecar(tmp_path: Path) -> None:
+def test_tool_call_with_null_bash_command_maintains_sidecar_membership(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
@@ -100,8 +100,9 @@ def test_tool_call_with_null_bash_command_skips_sidecar(tmp_path: Path) -> None:
         with staged(duckdb_conn, tmp_path) as stage:
             _upsert_tool_calls(duckdb_conn, {}, {tool_call.id: tool_call}, stage=stage)
 
-        assert _tool_call_rowid(sidecar_conn, tool_call.id) is None
-        assert _count(sidecar_conn, "tool_calls_fts_rowid") == 0
+        assert _tool_call_rowid(sidecar_conn, tool_call.id) is not None
+        assert _count(sidecar_conn, "tool_calls_fts_rowid") == 1
+        assert _matches(sidecar_conn, "tool_calls_fts", "bash") == []
     finally:
         sidecar_conn.close()
         duckdb_conn.close()

@@ -10,9 +10,14 @@ from collections.abc import Mapping
 from typing import Any
 
 from recall.core.fts_text import escape_fts5_query, has_non_whitespace
-from recall.core.tool_format import format_tool_call_line
+from recall.core.tool_format import (
+    TOOL_FTS_MAX_CHARS,
+    format_tool_detail,
+    parse_tool_input_mapping,
+)
 
 SNIPPET_MAX_CHARS = 240
+TOOL_NAME_SNIPPET_MAX_CHARS = 64
 _SNIPPET_TOKEN_WINDOW = 28
 _MAX_FTS_DOC_CHARS = 2 * 1024 * 1024
 _MATCH_OPEN = "\x01"
@@ -56,21 +61,10 @@ def sanitize_snippet(text: str, *, max_chars: int = SNIPPET_MAX_CHARS) -> str:
     return cleaned[: max_chars - 3].rstrip() + "..."
 
 
-def _sanitize_tool_input(value: Any, *, depth: int = 0) -> Any:
-    if isinstance(value, str):
-        return _strip_terminal_controls(value)
-    if depth >= 2:
-        return None
-    if isinstance(value, Mapping):
-        sanitized: dict[str, Any] = {}
-        for idx, (k, v) in enumerate(value.items()):
-            if idx >= 64:
-                break
-            sanitized[str(k)] = _sanitize_tool_input(v, depth=depth + 1)
-        return sanitized
-    if isinstance(value, list):
-        return [_sanitize_tool_input(v, depth=depth + 1) for v in value[:32]]
-    return value
+def _strip_escapes_keep_newlines(text: str) -> str:
+    """Strip ESC/C1 terminal sequences while preserving line breaks for structured extractors."""
+    cleaned = _TERMINAL_ESCAPE_RE.sub("", _safe_utf8(text))
+    return _CONTROL_CHAR_RE.sub("", cleaned)
 
 
 def build_search_snippet(
@@ -82,7 +76,7 @@ def build_search_snippet(
     role: str | None,
     tool_name: str | None = None,
     bash_command: str | None = None,
-    tool_input: Mapping[str, Any] | None = None,
+    tool_input: Mapping[str, Any] | str | None = None,
     fields: tuple[str, ...] = ("content", "thinking"),
     max_chars: int = SNIPPET_MAX_CHARS,
 ) -> str:
@@ -95,20 +89,48 @@ def build_search_snippet(
     """
     assert max_chars >= 4, f"max_chars must be >= 4, got {max_chars}"
     if kind == "tool_call":
-        # Strip terminal sequences BEFORE format_tool_call_line truncates so long
-        # OSC titles cannot consume the preview budget and hide trailing text.
-        safe_tool_name = _strip_terminal_controls(tool_name or "tool") or "tool"
-        safe_bash = _strip_terminal_controls(bash_command) if bash_command is not None else None
-        safe_input = _sanitize_tool_input(tool_input) if tool_input is not None else None
-        line = format_tool_call_line(
-            {
-                "tool_name": safe_tool_name,
-                "bash_command": safe_bash,
-                "tool_input": safe_input,
-            },
-            max_chars=max_chars,
+        # Bound only the displayed tool-name prefix; pass the full tool name and
+        # parsed input to `format_tool_detail` so field selection matches indexing.
+        name_limit = min(TOOL_NAME_SNIPPET_MAX_CHARS, max(4, max_chars - 2))
+        raw_name = _strip_terminal_controls(tool_name or "tool") or "tool"
+        safe_tool_name = sanitize_snippet(raw_name, max_chars=name_limit) or "tool"
+        prefix = f"[{safe_tool_name}]"
+        if len(prefix) > max_chars:
+            return sanitize_snippet(prefix, max_chars=max_chars)
+
+        # Strip terminal escapes inside selected string values while preserving
+        # newlines so structured extractors (e.g. apply_patch) match indexing and
+        # OSC titles cannot consume the truncation budget.
+        parsed_input = parse_tool_input_mapping(tool_input) if tool_input is not None else None
+        raw_detail = format_tool_detail(
+            tool_name or "",
+            parsed_input,
+            bash_command,
+            max_chars=TOOL_FTS_MAX_CHARS,
+            text_transform=_strip_escapes_keep_newlines,
         )
-        return sanitize_snippet(line, max_chars=max_chars)
+        clean_detail = _strip_terminal_controls(raw_detail)
+        detail_budget = max_chars - len(prefix) - 1
+        if not clean_detail or detail_budget < 4:
+            return prefix
+        if len(clean_detail) <= detail_budget:
+            return f"{prefix} {clean_detail}"
+        match_query = escape_fts5_query(_safe_utf8(query))
+        matched_detail: str | None = None
+        if match_query:
+            matched = _fts5_match_snippet(
+                content_body=clean_detail,
+                thinking_body="",
+                match_query=match_query,
+                allowed=("content",),
+            )
+            if matched is not None:
+                matched_detail = matched[1]
+        rendered_detail = _center_and_sanitize_snippet(
+            matched_detail if matched_detail is not None else clean_detail,
+            max_chars=detail_budget,
+        )
+        return f"{prefix} {rendered_detail}" if rendered_detail else prefix
 
     safe_query = _safe_utf8(query)
     safe_content = _safe_utf8(content) if content is not None else None

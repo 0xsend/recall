@@ -9,6 +9,7 @@ import duckdb
 from recall.core.fts_text import sql_derive_fts
 from recall.db.fts_sidecar import publish_sidecar, should_index_bash_fts
 from recall.db.lease import DbLease, StandaloneLifetime
+from recall.services.fts_sidecar_reconcile import iter_tool_call_fts_batches
 
 _MESSAGE_KIND = "message"
 _TOOL_CALL_KIND = "tool_call"
@@ -210,9 +211,11 @@ def _bootstrap_messages(
             )
             _record_batch_progress(sidecar_conn, _MESSAGE_KIND, batch_last_id)
 
-        processed += len(batch)
+        batch_count = len(batch)
+        batch.clear()
+        processed += batch_count
         last_id = batch_last_id
-        after_batch(len(batch))
+        after_batch(batch_count)
 
 
 def _bootstrap_tool_calls(
@@ -230,32 +233,22 @@ def _bootstrap_tool_calls(
         _mark_completed(sidecar_conn, _TOOL_CALL_KIND, start_after)
         return processed, True
 
-    while True:
-        batch = duckdb_conn.execute(
-            """
-            SELECT id, bash_command
-            FROM tool_calls
-            WHERE bash_command IS NOT NULL
-              AND id > ?
-            ORDER BY id
-            LIMIT ?
-            """,
-            [last_id, batch_size],
-        ).fetchmany(batch_size)
-        if not batch:
-            _mark_completed(sidecar_conn, _TOOL_CALL_KIND, start_after)
-            return processed, True
-
-        batch_last_id = str(batch[-1][0])
+    for batch in iter_tool_call_fts_batches(
+        duckdb_conn, start_after=last_id, batch_size=batch_size
+    ):
+        batch_last_id = batch[-1][0]
         with publish_sidecar(sidecar_conn) as publication:
-            publication.tools(
-                [(str(key), str(command)) for key, command in batch], fields=fts_fields
-            )
+            publication.tools(batch, fields=fts_fields)
             _record_batch_progress(sidecar_conn, _TOOL_CALL_KIND, batch_last_id)
 
-        processed += len(batch)
+        batch_count = len(batch)
+        batch.clear()
+        processed += batch_count
         last_id = batch_last_id
-        after_batch(len(batch))
+        after_batch(batch_count)
+
+    _mark_completed(sidecar_conn, _TOOL_CALL_KIND, last_id or start_after)
+    return processed, True
 
 
 def _record_batch_progress(conn: sqlite3.Connection, kind: str, last_id: str) -> None:

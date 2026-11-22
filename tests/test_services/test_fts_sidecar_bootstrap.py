@@ -21,12 +21,12 @@ def test_bootstrap_populates_sidecar(tmp_path: Path) -> None:
 
         assert progress == BootstrapProgress(
             messages_processed=50,
-            tool_calls_processed=20,
+            tool_calls_processed=25,
             messages_done=True,
             tool_calls_done=True,
         )
         assert _count(sidecar_conn, "message_fts_rowid") == 50
-        assert _count(sidecar_conn, "tool_calls_fts_rowid") == 20
+        assert _count(sidecar_conn, "tool_calls_fts_rowid") == 25
         assert _completed(sidecar_conn, "message")
         assert _completed(sidecar_conn, "tool_call")
     finally:
