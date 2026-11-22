@@ -34,6 +34,8 @@ from recall.cli.status_notices import (
 )
 from recall.cli.utils import with_fleet_host
 from recall.core.config import AppConfig
+from recall.core.tool_format import format_tool_call_line
+from recall.core.types import SOURCE_HELP
 
 
 def _render_search_progress(method: str, payload: dict[str, Any]) -> None:
@@ -232,9 +234,7 @@ def command(
     session: str | None = typer.Option(
         None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
     ),
-    source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
-    ),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     mode: str | None = typer.Option(
         None,
         "--mode",
@@ -336,6 +336,7 @@ def command(
                 exit_code=2,
             )
 
+        top_endpoint: str | None = None
         if fleet:
             if session is not None:
                 raise CliError(
@@ -345,7 +346,7 @@ def command(
                 )
             from recall.cli.fleet import run_fleet_search
 
-            results = run_fleet_search(
+            results, top_endpoint = run_fleet_search(
                 query=query,
                 tool=tool,
                 source=source,
@@ -431,7 +432,11 @@ def command(
             include_pending_coverage=coverage_note is None,
         )
 
-    ctas = cta_for_search(results) if (cta or output_format == OutputFormat.TEXT) else []
+    ctas = (
+        cta_for_search(results, fleet=fleet, endpoint=top_endpoint)
+        if (cta or output_format == OutputFormat.TEXT)
+        else []
+    )
 
     if output_format != OutputFormat.TEXT:
         # Warnings-only on stderr so agents using --json still see health issues
@@ -477,9 +482,7 @@ def command(
             role = result.get("role") or "unknown"
             typer.echo(f"  {role}: {snippet}")
         else:
-            tool_name = result.get("tool_name") or "tool"
-            bash_cmd = result.get("bash_command") or ""
-            typer.echo(f"  [{tool_name}] {bash_cmd}")
+            typer.echo(f"  {format_tool_call_line(result)}")
         if result.get("source_path"):
             typer.echo(f"  source: {result['source_path']}")
         if result.get("timestamp"):

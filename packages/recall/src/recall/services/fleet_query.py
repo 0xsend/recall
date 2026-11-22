@@ -26,6 +26,9 @@ class FleetQueryResult:
     errors: list[dict[str, str]] = field(default_factory=list)
     hosts_ok: int = 0
     hosts_failed: int = 0
+    # Canonical answering endpoint per returned row (parallel to `rows`),
+    # distinct from the preserved stored origin in `row["host"]`.
+    endpoints: tuple[HostValue, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -152,15 +155,32 @@ def _arrays(
     executor: FleetExecutor, operation: FleetOperation, concurrency: int
 ) -> FleetQueryResult:
     rows: list[dict[str, Any]] = []
+    endpoints: list[HostValue] = []
     errors: list[dict[str, str]] = []
     successful = 0
     for outcome in executor.execute(operation, concurrency=concurrency):
         if isinstance(outcome, EndpointSuccess):
             successful += 1
-            rows.extend(stamp_host(row, outcome.name) for row in outcome.value)
+            for row in outcome.value:
+                rows.append(stamp_host(row, outcome.name))
+                endpoints.append(outcome.name)
         else:
             errors.append({"name": outcome.name, "error": outcome.error})
-    return FleetQueryResult(rows, errors, successful, len(errors))
+    return FleetQueryResult(rows, errors, successful, len(errors), endpoints=tuple(endpoints))
+
+
+def _merge_with_endpoints(
+    rows: Sequence[dict[str, Any]],
+    endpoints: Sequence[HostValue],
+    *,
+    key: Any,
+    limit: int,
+) -> tuple[list[dict[str, Any]], tuple[HostValue, ...]]:
+    paired = list(zip(rows, endpoints, strict=True))
+    ordered = sorted(paired, key=lambda item: key(item[0]), reverse=True)
+    if limit > 0:
+        ordered = ordered[:limit]
+    return [row for row, _ in ordered], tuple(ep for _, ep in ordered)
 
 
 def fleet_list(
@@ -189,8 +209,11 @@ def fleet_list(
         ),
         concurrency,
     )
+    merged_rows, merged_endpoints = _merge_with_endpoints(
+        raw.rows, raw.endpoints, key=_recency_key, limit=limit
+    )
     return FleetQueryResult(
-        merge_list_rows(raw.rows, limit=limit), raw.errors, raw.hosts_ok, raw.hosts_failed
+        merged_rows, raw.errors, raw.hosts_ok, raw.hosts_failed, endpoints=merged_endpoints
     )
 
 
@@ -221,8 +244,18 @@ def fleet_search(
         ),
         concurrency,
     )
+
+    def score_key(row: dict[str, Any]) -> float:
+        try:
+            return float(row.get("score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    merged_rows, merged_endpoints = _merge_with_endpoints(
+        raw.rows, raw.endpoints, key=score_key, limit=limit
+    )
     return FleetQueryResult(
-        merge_search_rows(raw.rows, limit=limit), raw.errors, raw.hosts_ok, raw.hosts_failed
+        merged_rows, raw.errors, raw.hosts_ok, raw.hosts_failed, endpoints=merged_endpoints
     )
 
 
@@ -337,6 +370,7 @@ class FleetShowResult:
     errors: list[dict[str, str]] = field(default_factory=list)
     hosts_tried: int = 0
     ambiguous_hosts: tuple[str, ...] = ()
+    endpoint: HostValue | None = None
 
 
 def fleet_show(
@@ -370,7 +404,7 @@ def fleet_show(
         ),
         concurrency=concurrency,
     )
-    found: list[tuple[str, dict[str, Any]]] = []
+    found: list[tuple[HostValue, dict[str, Any]]] = []
     errors: list[dict[str, str]] = []
     for outcome in outcomes:
         if isinstance(outcome, EndpointSuccess):
@@ -380,5 +414,5 @@ def fleet_show(
         ):
             errors.append({"name": outcome.name, "error": outcome.error})
     if len(found) == 1:
-        return FleetShowResult(found[0][1], errors, len(outcomes))
+        return FleetShowResult(found[0][1], errors, len(outcomes), endpoint=found[0][0])
     return FleetShowResult(None, errors, len(outcomes), tuple(sorted(name for name, _ in found)))

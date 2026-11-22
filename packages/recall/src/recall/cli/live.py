@@ -33,6 +33,7 @@ from recall.cli.utils import (
     stale_after_fresh_note,
     with_fleet_host,
 )
+from recall.core.types import SOURCE_HELP
 
 app = typer.Typer(
     help=(
@@ -64,9 +65,7 @@ def command(
     all_sessions: bool = typer.Option(
         False, "--all", help="Also include recent idle and ended sessions (default window 24 h)"
     ),
-    source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
-    ),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     project: str | None = typer.Option(None, "--project", help="Filter by git repo path"),
     session: str | None = typer.Option(
         None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"

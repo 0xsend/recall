@@ -15,6 +15,26 @@ from recall.cli.fleet_help import (
 )
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
+from recall.core.types import SOURCE_ALIASES, SOURCE_CLI_NAMES
+
+
+def _source_option(
+    *,
+    repeatable: bool = False,
+    description: str | None = None,
+) -> dict[str, Any]:
+    option: dict[str, Any] = {
+        "name": "source",
+        "type": "string[]" if repeatable else "string",
+        "enum": list(SOURCE_CLI_NAMES),
+        "aliases": dict(SOURCE_ALIASES),
+    }
+    if repeatable:
+        option["repeatable"] = True
+    if description is not None:
+        option["description"] = description
+    return option
+
 
 # Preserve the published host position while deriving every field from the model.
 _SESSION_SUMMARY_FIELDS = [field.name for field in fields(SessionSummary) if field.name != "host"]
@@ -97,18 +117,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "args": [],
         "options": [
             {"name": "full", "type": "boolean", "default": False},
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(),
             {"name": "recreate", "type": "boolean", "default": False, "destructive": True},
             {"name": "yes", "type": "boolean", "default": False},
             {"name": "embed", "type": "boolean"},
@@ -413,18 +422,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     " unknown or ambiguous indexed IDs are errors."
                 ),
             },
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(),
             {"name": "mode", "type": "string", "enum": ["auto", "keyword", "vector", "hybrid"]},
             {"name": "limit", "type": "integer", "default": 20},
             {"name": "fleet", "type": "boolean", "default": False},
@@ -487,18 +485,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     " scoped by source/host, local only."
                 ),
             },
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(),
             {"name": "since", "type": "string"},
             {"name": "project", "type": "string"},
             {"name": "host", "type": "string"},
@@ -558,18 +545,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                 ),
             },
             {"name": "all", "type": "boolean", "default": False},
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(),
             {"name": "project", "type": "string"},
             {"name": "host", "type": "string"},
             {"name": "limit", "type": "integer", "default": 50, "minimum": 1, "maximum": 256},
@@ -642,19 +618,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
                 ),
             },
             {"name": "pid", "type": "integer", "required": True},
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-                "description": "Source scope; defaults to claude-code only for unindexed IDs.",
-            },
+            _source_option(
+                description="Source scope; defaults to claude-code only for unindexed IDs.",
+            ),
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -776,18 +742,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"name": "mode", "type": "string", "enum": ["auto", "watch", "poll"]},
             {"name": "interval", "type": "integer"},
             {"name": "embed", "type": "boolean"},
-            {
-                "name": "source",
-                "type": "string",
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(),
             {"name": "batch_size", "type": "integer"},
             {"name": "verbose", "type": "boolean", "default": False},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -1219,19 +1174,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "args": [],
         "options": [
             {"name": "since", "type": "string"},
-            {
-                "name": "source",
-                "type": "string[]",
-                "repeatable": True,
-                "enum": [
-                    "claude-code",
-                    "codex",
-                    "pi-agent",
-                    "grok",
-                    "kimi-code",
-                    "antigravity-cli",
-                ],
-            },
+            _source_option(repeatable=True),
             {"name": "local", "type": "boolean", "default": False},
             {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},

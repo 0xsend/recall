@@ -28,6 +28,7 @@ from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error, stderr_progress, structured_progress
 from recall.core.index_request import resolve_index_request
 from recall.core.rpc_params import IndexParams
+from recall.core.types import SOURCE_HELP
 
 
 def command(
@@ -40,9 +41,7 @@ def command(
             "--context template, or every message without stored LLM context is summarized"
         ),
     ),
-    source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
-    ),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     recreate: bool = typer.Option(
         False,
         "--recreate",

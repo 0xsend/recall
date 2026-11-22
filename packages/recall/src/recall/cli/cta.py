@@ -6,38 +6,73 @@ with real IDs and values pre-filled (REQ-CLI-016).
 
 from __future__ import annotations
 
+import re
 import shlex
 from typing import Any
 
 from recall.cli.contract import Cta
+from recall.core.host_text import HostValue
+from recall.core.types import is_attributed_host
+
+# Only plain ASCII host names are safe to embed unescaped as `--host` CLI args;
+# unusual or control-bearing origins fall back to `--fleet` without `--host`.
+_SAFE_CLI_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def cta_for_list(sessions: list[dict[str, Any]]) -> list[Cta]:
+def _fleet_flags(*, fleet: bool, host: object = None) -> str:
+    if not fleet:
+        return ""
+    raw_host = host.raw() if isinstance(host, HostValue) else host
+    if isinstance(raw_host, str):
+        candidate = raw_host.strip()
+        if is_attributed_host(candidate) and _SAFE_CLI_HOST_RE.fullmatch(candidate):
+            return f" --fleet --host {candidate}"
+    return " --fleet"
+
+
+def cta_for_list(
+    sessions: list[dict[str, Any]], *, fleet: bool = False, endpoint: object = None
+) -> list[Cta]:
     ctas: list[Cta] = []
     if sessions:
         first_id = sessions[0].get("id", "")
         if first_id:
-            ctas.append(Cta(f"recall show {first_id}", "View most recent session"))
-    ctas.append(Cta("recall search '<query>'", "Search across sessions"))
+            flags = _fleet_flags(fleet=fleet, host=endpoint)
+            ctas.append(
+                Cta(f"recall show {shlex.quote(str(first_id))}{flags}", "View most recent session")
+            )
+    search_cmd = "recall search '<query>' --fleet" if fleet else "recall search '<query>'"
+    ctas.append(Cta(search_cmd, "Search across sessions"))
     return ctas
 
 
-def cta_for_search(results: list[dict[str, Any]]) -> list[Cta]:
+def cta_for_search(
+    results: list[dict[str, Any]], *, fleet: bool = False, endpoint: object = None
+) -> list[Cta]:
     ctas: list[Cta] = []
     if results:
         sid = results[0].get("session_id", "")
         if sid:
-            ctas.append(Cta(f"recall show {sid} --tools", "View top result session"))
+            flags = _fleet_flags(fleet=fleet, host=endpoint)
+            ctas.append(
+                Cta(
+                    f"recall show {shlex.quote(str(sid))} --tools{flags}", "View top result session"
+                )
+            )
     return ctas
 
 
-def cta_for_show(session: dict[str, Any]) -> list[Cta]:
+def cta_for_show(
+    session: dict[str, Any], *, fleet: bool = False, endpoint: object = None
+) -> list[Cta]:
     ctas: list[Cta] = []
     cwd = session.get("cwd")
     if cwd:
         quoted = shlex.quote(cwd)
-        ctas.append(Cta(f"recall list --project {quoted}", "List sessions in same project"))
-    ctas.append(Cta("recall search '<query>'", "Search across all sessions"))
+        flags = _fleet_flags(fleet=fleet, host=endpoint)
+        ctas.append(Cta(f"recall list --project {quoted}{flags}", "List sessions in same project"))
+    search_cmd = "recall search '<query>' --fleet" if fleet else "recall search '<query>'"
+    ctas.append(Cta(search_cmd, "Search across all sessions"))
     return ctas
 
 

@@ -153,7 +153,7 @@ def test_text_show_names_unreadable_transcript(
 def test_text_show_readable_transcript_keeps_output(
     monkeypatch: pytest.MonkeyPatch, fresh: bool
 ) -> None:
-    monkeypatch.setattr(show_cli, "cta_for_show", lambda _session: [])
+    monkeypatch.setattr(show_cli, "cta_for_show", lambda _session, **_kwargs: [])
     _install_rpc(monkeypatch, _session(current=True))
     result = CliRunner().invoke(
         app, ["show", "abc123", "--format", "text", *(["--fresh"] if fresh else [])]

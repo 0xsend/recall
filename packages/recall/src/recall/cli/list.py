@@ -27,13 +27,12 @@ from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
 from recall.cli.utils import format_datetime, with_fleet_host
+from recall.core.types import SOURCE_HELP
 
 
 def command(
     ctx: typer.Context,
-    source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
-    ),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     since: str | None = typer.Option(None, "--since", help="Time window (7d, 24h, 2024-01-01)"),
     project: str | None = typer.Option(None, "--project", help="Filter by git repo path"),
     session: str | None = typer.Option(
@@ -137,10 +136,11 @@ def command(
         if fleet and session is not None:
             raise ValueError("--session is not supported with --fleet list")
 
+        top_endpoint: str | None = None
         if fleet:
             from recall.cli.fleet import run_fleet_list
 
-            sessions_raw: Any = run_fleet_list(
+            sessions_raw, top_endpoint = run_fleet_list(
                 since=since,
                 source=source,
                 project=project,
@@ -166,7 +166,11 @@ def command(
             method = "recall.list" if session is None else "recall.list_by_session"
             sessions_raw = rpc_call_or_error(method, rpc_params)
         sessions = cast(list[dict[str, Any]], sessions_raw)
-        ctas = cta_for_list(sessions) if (cta or output_format == OutputFormat.TEXT) else []
+        ctas = (
+            cta_for_list(sessions, fleet=fleet, endpoint=top_endpoint)
+            if (cta or output_format == OutputFormat.TEXT)
+            else []
+        )
 
         if output_format != OutputFormat.TEXT:
             # Warnings-only on stderr so agents using --json still see health

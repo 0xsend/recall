@@ -63,7 +63,7 @@ from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
 from recall.core.poll_reads import PollRead, PollSnapshot, PollSnapshotSelected
 from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
 from recall.core.schema_version import UNFENCED_SCHEMA_REMEDY, SchemaTooNewError
-from recall.core.types import parse_scheduler_kind
+from recall.core.types import SOURCE_HELP, parse_scheduler_kind
 from recall.read_budget import ReadBudget
 
 logger = logging.getLogger("recall.cli.daemon")
@@ -390,9 +390,7 @@ def command(
     embed: bool | None = typer.Option(
         None, "--embed/--no-embed", help="Enable/disable the adaptive embed phase"
     ),
-    source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
-    ),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     batch_size: int | None = typer.Option(
         None, "--batch-size", help="Override embedding batch size for this daemon process"
     ),

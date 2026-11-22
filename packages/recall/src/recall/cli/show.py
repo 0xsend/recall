@@ -32,6 +32,7 @@ from recall.cli.utils import (
     stale_after_fresh_note,
     with_fleet_host,
 )
+from recall.core.tool_format import format_tool_call_line
 
 # A follower is read line by line — `while read line; do ... done` — so the
 # stream is NDJSON whatever `--format` says. A TOON table or a pretty-printed
@@ -347,10 +348,11 @@ def command(
             _run_follow(follow_params, tools=tools, thinking=thinking)
             return
 
+        show_endpoint: str | None = None
         if fleet:
             from recall.cli.fleet import run_fleet_show
 
-            session_raw: Any = run_fleet_show(
+            session_raw, show_endpoint = run_fleet_show(
                 session_id=session_id,
                 host=host,
                 tools=tools,
@@ -405,7 +407,11 @@ def command(
         if note is not None:
             typer.echo(f"note: {note}", err=True)
 
-    ctas = cta_for_show(session) if (cta or output_format == OutputFormat.TEXT) else []
+    ctas = (
+        cta_for_show(session, fleet=fleet, endpoint=show_endpoint)
+        if (cta or output_format == OutputFormat.TEXT)
+        else []
+    )
 
     if output_format != OutputFormat.TEXT:
         try:
@@ -466,9 +472,7 @@ def command(
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
-                label = tool_call.get("tool_name", "tool")
-                detail = tool_call.get("bash_command") or ""
-                typer.echo(f"  [{label}] {detail}")
+                typer.echo(f"  {format_tool_call_line(tool_call)}")
         typer.echo("")
 
     orphans = session.get("orphan_tool_calls") if tools else None
@@ -477,8 +481,6 @@ def command(
         for tool_call in orphans:
             if not isinstance(tool_call, dict):
                 continue
-            label = tool_call.get("tool_name", "tool")
-            detail = tool_call.get("bash_command") or ""
-            typer.echo(f"  [{label}] {detail}")
+            typer.echo(f"  {format_tool_call_line(tool_call)}")
 
     render_cta_hints(ctas)

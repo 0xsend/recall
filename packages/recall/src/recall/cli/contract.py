@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from recall.cli.manifest import request_safety
 from recall.core.host_text import HostDiagnostic, HostMessage, HostValue
+from recall.core.types import VALID_SOURCE_VALUES, parse_source
 
 
 class OutputFormat(StrEnum):
@@ -277,31 +278,14 @@ def parse_fields(value: Any) -> tuple[str, ...] | None:
     return fields
 
 
-# Valid source values accepted by the CLI (both kebab-case and underscore forms)
-VALID_SOURCES = {
-    "claude-code",
-    "claude_code",
-    "codex",
-    "pi-agent",
-    "pi_agent",
-    "pi",
-    "grok",
-    "grok-build",
-    "grok_build",
-    "kimi",
-    "kimi-code",
-    "kimi_code",
-    "antigravity-cli",
-    "antigravity_cli",
-    "antigravity",
-    "agy",
-}
+# Valid source values accepted by the CLI (derived from core.types.SOURCE_SPECS)
+VALID_SOURCES = VALID_SOURCE_VALUES
 
 
 def validate_source(value: str | None) -> None:
     """Validate source against accepted values, if provided."""
-    if value is not None and value not in VALID_SOURCES:
-        raise ValueError(f"unsupported source: {value}")
+    if value is not None:
+        parse_source(value)
 
 
 # Maps manifest type names to allowed Python types for --params validation.

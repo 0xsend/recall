@@ -67,6 +67,40 @@ def test_cta_for_show_without_cwd_skips_project() -> None:
     assert any("recall search" in c.command for c in ctas)
 
 
+def test_cta_for_list_fleet_includes_fleet_and_answering_endpoint() -> None:
+    sessions = [{"id": "abc123", "source": "antigravity_cli", "host": "CometOasis"}]
+    ctas = cta_for_list(sessions, fleet=True, endpoint="cometoasis")
+    assert ctas[0].command == "recall show abc123 --fleet --host cometoasis"
+    assert ctas[1].command == "recall search '<query>' --fleet"
+
+
+def test_cta_for_list_fleet_omits_unattributed_host_flag() -> None:
+    sessions = [{"id": "abc123", "source": "antigravity_cli", "host": "local"}]
+    ctas = cta_for_list(sessions, fleet=True, endpoint="local")
+    assert ctas[0].command == "recall show abc123 --fleet"
+
+
+def test_cta_for_search_fleet_omits_unsafe_host_flag() -> None:
+    results = [{"session_id": "def456", "source": "antigravity_cli", "host": "CometOasis"}]
+    ctas = cta_for_search(results, fleet=True, endpoint="edge\x1b[31m")
+    assert ctas == [Cta("recall show def456 --tools --fleet", "View top result session")]
+
+
+def test_cta_for_search_fleet_includes_plain_endpoint_flag() -> None:
+    results = [{"session_id": "def456", "source": "antigravity_cli", "host": "CometOasis"}]
+    ctas = cta_for_search(results, fleet=True, endpoint="cometoasis")
+    assert ctas == [
+        Cta("recall show def456 --tools --fleet --host cometoasis", "View top result session")
+    ]
+
+
+def test_cta_for_show_fleet_preserves_fleet_and_endpoint() -> None:
+    session = {"id": "abc", "cwd": "/home/ae/app", "host": "CometOasis"}
+    ctas = cta_for_show(session, fleet=True, endpoint="cometoasis")
+    assert ctas[0].command == "recall list --project /home/ae/app --fleet --host cometoasis"
+    assert ctas[1].command == "recall search '<query>' --fleet"
+
+
 def test_cta_for_index_suggests_list_and_search() -> None:
     summary = {"indexed": 5, "total": 10}
     ctas = cta_for_index(summary)
