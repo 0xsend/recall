@@ -39,6 +39,7 @@ def _config(tmp_path: Path, lane: Path) -> AppConfig:
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
 

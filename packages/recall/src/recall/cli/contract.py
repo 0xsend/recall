@@ -291,6 +291,10 @@ VALID_SOURCES = {
     "kimi",
     "kimi-code",
     "kimi_code",
+    "antigravity-cli",
+    "antigravity_cli",
+    "antigravity",
+    "agy",
 }
 
 

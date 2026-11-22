@@ -10,6 +10,7 @@ class Source(StrEnum):
     PI_AGENT = "pi_agent"
     GROK = "grok"
     KIMI_CODE = "kimi_code"
+    ANTIGRAVITY_CLI = "antigravity_cli"
 
 
 ABSOLUTE_TOKEN_SOURCES = frozenset({Source.CODEX})
@@ -117,6 +118,8 @@ def parse_source(value: str) -> Source:
             return Source.GROK
         case "kimi" | "kimi-code" | "kimi_code":
             return Source.KIMI_CODE
+        case "antigravity-cli" | "antigravity_cli" | "antigravity" | "agy":
+            return Source.ANTIGRAVITY_CLI
         case _:
             raise ValueError(f"unsupported source: {value}")
 

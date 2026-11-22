@@ -1,6 +1,6 @@
 # recall
 
-Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code).
+Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI).
 [README.md](README.md) covers usage; [CONTRIBUTING.md](CONTRIBUTING.md) covers setup and the document map.
 
 ## Commands
@@ -48,7 +48,7 @@ Tests use fixtures in `tests/fixtures/`.
 packages/recall/src/recall/
 ├── core/       # domain models, config, IDs, bash parsing (no external deps beyond Pydantic)
 ├── db/         # DuckDB schema, migrations, connection, queries, FTS sidecar
-├── parsers/    # per-source JSONL parsers (Claude Code, Codex, Pi Agent, Grok, Kimi Code)
+├── parsers/    # per-source JSONL parsers (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI)
 ├── services/   # daemon, RPC server, indexing, reconciliation, search, analytics
 └── cli/        # Typer commands; most call the daemon over RPC
 ```

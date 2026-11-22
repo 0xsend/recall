@@ -32,7 +32,7 @@ from recall.cli.utils import format_datetime, with_fleet_host
 def command(
     ctx: typer.Context,
     source: str | None = typer.Option(
-        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
+        None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli"
     ),
     since: str | None = typer.Option(None, "--since", help="Time window (7d, 24h, 2024-01-01)"),
     project: str | None = typer.Option(None, "--project", help="Filter by git repo path"),

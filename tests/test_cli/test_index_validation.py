@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 @pytest.mark.parametrize("format_name", ["text", "json"])
 @pytest.mark.parametrize(
-    "layout", ["wrong", "empty", ".claude", ".codex", ".pi", ".grok", ".kimi-code"]
+    "layout", ["wrong", "empty", ".claude", ".codex", ".pi", ".grok", ".kimi-code", ".gemini"]
 )
 def test_index_explains_unrecognized_home_layout(
     tmp_path: Path, format_name: str, layout: str
@@ -43,7 +43,7 @@ def test_index_explains_unrecognized_home_layout(
         assert warnings == (
             f"warning: --root {root} has no recognized agent-home subdirectories; "
             "expected a home layout containing .claude/, .codex/, .pi/, .grok/, "
-            "or .kimi-code/. No sessions will be discovered from this root."
+            ".kimi-code/, or .gemini/. No sessions will be discovered from this root."
         )
     else:
         assert warnings == ""

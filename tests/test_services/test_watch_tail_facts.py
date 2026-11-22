@@ -60,6 +60,7 @@ def _config(tmp_path: Path, lane: Path) -> AppConfig:
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
 
@@ -140,6 +141,7 @@ def test_codex_lifecycle_survives_split_start_and_abort_only_appends(
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
     config.db_path.parent.mkdir(parents=True)
@@ -192,6 +194,7 @@ def test_codex_open_turn_survives_paired_tools_and_completion_without_another_me
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
     config.db_path.parent.mkdir(parents=True)

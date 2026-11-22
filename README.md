@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/0xsend/recall/actions/workflows/ci.yml/badge.svg)](https://github.com/0xsend/recall/actions/workflows/ci.yml)
 
-Session recall and analytics for AI coding agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code).
+Session recall and analytics for AI coding agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code, Antigravity CLI).
 
 Search past sessions, follow what running agents are doing, analyze tool usage, and generate permission suggestions from your local agent history. Everything stays on your machine in a local DuckDB index.
 
@@ -254,6 +254,7 @@ Optional [contextual retrieval](docs/contextual-retrieval.md) adds a per-message
 | Grok sessions | `~/.grok/sessions/**/chat_history.jsonl` |
 | Grok usage log | `~/.grok/logs/unified.jsonl` (rotates; see [multiple hosts](docs/multi-host.md#grok-log-rotation-cadence)) |
 | Kimi Code sessions | `~/.kimi-code/sessions/**/wire.jsonl` |
+| Antigravity CLI sessions | `~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript_full.jsonl` |
 
 ## Documentation
 

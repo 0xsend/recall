@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from recall.core.types import Source
+from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.parsers.common import home_root_overridden
@@ -23,6 +24,7 @@ ParserType = (
     | type[PiAgentParser]
     | type[GrokParser]
     | type[KimiCodeParser]
+    | type[AntigravityCliParser]
 )
 
 _PARSER_TYPES: tuple[ParserType, ...] = (
@@ -31,6 +33,7 @@ _PARSER_TYPES: tuple[ParserType, ...] = (
     PiAgentParser,
     GrokParser,
     KimiCodeParser,
+    AntigravityCliParser,
 )
 
 

@@ -121,6 +121,7 @@ def test_foreign_historical_catalog_rows_do_not_block_configured_readiness(lane)
             "pi_agent": SourceConfig(roots=()),
             "grok": SourceConfig(roots=()),
             "kimi_code": SourceConfig(roots=()),
+            "antigravity_cli": SourceConfig(roots=()),
         },
     )
     lane.server._database.call(

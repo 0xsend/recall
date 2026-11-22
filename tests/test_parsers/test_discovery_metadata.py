@@ -89,6 +89,7 @@ def test_periodic_inventory_finds_changes_without_notifications(
         Source.CODEX: "rollout-history.jsonl",
         Source.GROK: "chat_history.jsonl",
         Source.KIMI_CODE: "wire.jsonl",
+        Source.ANTIGRAVITY_CLI: "transcript_full.jsonl",
     }.get(source, "history.jsonl")
     path = root / name
     path.write_text("{}\n")

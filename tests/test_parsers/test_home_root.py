@@ -36,6 +36,10 @@ def test_alternate_home_wins_over_source_roots_for_every_registered_parser(
         Source.PI_AGENT: home / ".pi/agent/sessions/chat.jsonl",
         Source.GROK: home / ".grok/sessions/project/session/chat_history.jsonl",
         Source.KIMI_CODE: home / ".kimi-code/sessions/project/session/wire.jsonl",
+        Source.ANTIGRAVITY_CLI: (
+            home
+            / ".gemini/antigravity-cli/brain/session/.system_generated/logs/transcript_full.jsonl"
+        ),
     }
     for path in expected.values():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,4 +54,4 @@ def test_alternate_home_wins_over_source_roots_for_every_registered_parser(
             assert parser.discover() == [expected[parser.source]]
             assert get_parser(parser.source, sources).discover() == [expected[parser.source]]
 
-    assert [parser.roots for parser in all_parsers(sources)] == [roots] * 5
+    assert [parser.roots for parser in all_parsers(sources)] == [roots] * len(Source)

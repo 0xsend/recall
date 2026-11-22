@@ -49,7 +49,7 @@ recall index [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--full` | Force full reindex of all sessions |
-| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
+| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli` |
 | `--recreate` | Backup and rebuild a disposable database from scratch; not a recovery for an upgraded database |
 | `--context` | Context mode for this run: `off`, `template`, `llm-local`, `llm-remote`, `llm-codex` (overrides config) |
 | `--recompute-context` | Rebuild stored context for existing CONTENT and THINKING rows without reparsing JSONL |
@@ -57,7 +57,7 @@ recall index [OPTIONS]
 | `--project` | Limit reconciliation to an indexed git repo path match |
 | `--no-embed` | Omit embedding generation for this request |
 | `--only-mode` | Only recompute rows currently marked with this context mode |
-| `--root` | Alternate home directory for multi-host ingest, laid out like `$HOME` (`.claude/`, `.codex/`, `.pi/`, `.grok/`, `.kimi-code/`) |
+| `--root` | Alternate home directory for multi-host ingest, laid out like `$HOME` (`.claude/`, `.codex/`, `.pi/`, `.grok/`, `.kimi-code/`, `.gemini/`) |
 | `--host` | Host label stored on every session indexed in this run; defaults to the machine's short hostname, or the basename of `--root` |
 | `-v, --verbose` | Enable verbose logging |
 | `--json` | Output results as JSON |
@@ -110,7 +110,7 @@ recall search <query> [OPTIONS]
 |--------|-------------|
 | `--tool` | Restrict results to one tool's calls — accepts any tool name (`Bash`, `Read`, `Edit`, …). **Excludes all message/conversation text;** see caveat below. |
 | `--session` | Restrict to either session ID or a unique recall ID prefix (local only) |
-| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
+| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli` |
 | `--mode` | `keyword`, `vector`, `hybrid`, `auto` (default `auto` → hybrid when embeddings exist, else keyword) |
 | `--limit` | Max results to return (default 20) |
 | `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
@@ -152,7 +152,7 @@ recall list [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--session` | Filter by either session ID or a unique recall ID prefix (local only) |
-| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
+| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli` |
 | `--since` | Time window: `7d`, `24h`, `2024-01-01` |
 | `--project` | Filter by git repo path |
 | `--host` | Local origin host filter; in fleet select a canonical/inventory endpoint or declared self alias |
@@ -237,7 +237,7 @@ recall live mark --session <id> --pid <pid>
 |--------|-------------|
 | `--all` | Also include recent idle and ended sessions (idle window defaults to 24 h), plus ended rows still watched |
 | `--session` | Filter by either session ID or a unique recall ID prefix (local only) |
-| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
+| `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli` |
 | `--project` | Filter by git repo path |
 | `--host` | Local origin host filter; in fleet select a canonical/inventory endpoint or declared self alias |
 | `--fresh` | Catch up already-indexed rows on this page; does not first-index |
@@ -670,3 +670,4 @@ recall stats tools --json | jq 'max_by(.count)'
 | Grok sessions | `~/.grok/sessions/**/chat_history.jsonl` |
 | Grok usage log | `~/.grok/logs/unified.jsonl` |
 | Kimi Code sessions | `~/.kimi-code/sessions/**/wire.jsonl` |
+| Antigravity CLI sessions | `~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript_full.jsonl` |

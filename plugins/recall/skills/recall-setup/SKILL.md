@@ -132,7 +132,7 @@ recall daemon status
 
 ## Step 3 — First index
 
-First run may take minutes depending on how many sessions the user has in `~/.claude/projects/`, `~/.codex/sessions/`, `~/.pi/agent/sessions/`, `~/.grok/sessions/`, and `~/.kimi-code/sessions/`.
+First run may take minutes depending on how many sessions the user has in `~/.claude/projects/`, `~/.codex/sessions/`, `~/.pi/agent/sessions/`, `~/.grok/sessions/`, `~/.kimi-code/sessions/`, and `~/.gemini/antigravity-cli/brain/`.
 
 Run:
 

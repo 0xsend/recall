@@ -1440,7 +1440,7 @@ recall list                            # may print one-line index/daemon freshne
 Environment variables:
 - `RECALL_DAEMON_INTERVAL` — periodic interval in seconds
 - `RECALL_DAEMON_EMBED` — whether daemon cycles embed inline during indexing (`true` / `false` / `auto`, default `auto`)
-- `RECALL_DAEMON_SOURCE` — optional single-source filter (`claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`)
+- `RECALL_DAEMON_SOURCE` — optional single-source filter (`claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli`)
 - `RECALL_DAEMON_SCHEDULER` — optional scheduler preference (`auto`, `launchd`, `systemd`, `cron`)
 - `RECALL_DAEMON_MODE` — daemon mode (`auto`, `watch`, `poll`)
 - `RECALL_DAEMON_DEBOUNCE` — per-file debounce interval in seconds for watch mode (default `5`)
@@ -2389,6 +2389,7 @@ class Source(StrEnum):
     PI_AGENT = "pi_agent"
     GROK = "grok"
     KIMI_CODE = "kimi_code"
+    ANTIGRAVITY_CLI = "antigravity_cli"
 
 class ContextMode(StrEnum):
     OFF = "off"
@@ -2566,9 +2567,9 @@ In TEXT mode, CTAs always render on stderr:
 ### Flag Normalization
 
 **`--source` flag:**
-- CLI accepts: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` (kebab-case for CLI ergonomics)
-- Internally normalized to: `claude_code`, `codex`, `pi_agent`, `grok`, `kimi_code` (schema values)
-- Mapping: `claude-code` → `claude_code`, `pi-agent` / `pi` / `pi_agent` → `pi_agent`, `kimi` / `kimi-code` / `kimi_code` → `kimi_code`
+- CLI accepts: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code`, `antigravity-cli` (kebab-case for CLI ergonomics)
+- Internally normalized to: `claude_code`, `codex`, `pi_agent`, `grok`, `kimi_code`, `antigravity_cli` (schema values)
+- Mapping: `claude-code` → `claude_code`, `pi-agent` / `pi` / `pi_agent` → `pi_agent`, `kimi` / `kimi-code` / `kimi_code` → `kimi_code`, `antigravity-cli` / `antigravity_cli` / `antigravity` / `agy` → `antigravity_cli`
 
 **`--since` flag:**
 - Accepts relative durations: `7d`, `24h`, `30m`, `1w`
@@ -2768,6 +2769,23 @@ The Claude Code subagent fixture and parser tests cover this representation.
 - `turn.prompt` / `turn.steer` duplicate `context.append_message` and are skipped.
 - Wire files under `agents/agent-N/` mark all their Messages/ToolCalls with `agent_id`.
 - Per-session token totals are populated from `usage.record` (REQ-PARSE-013); the Fleet Token/Usage Ledger consumes them as-is and does not re-implement the Kimi parser.
+
+### Antigravity CLI
+
+**Location:**
+- Session transcript: `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript_full.jsonl`
+- Sidecar (per-session): `~/.gemini/antigravity-cli/conversations/<conversation-id>.db` (`trajectory_metadata_blob` carrying workspace URI, git root URI, and git branch)
+
+**Session ID source:** `<conversation-id>` directory name (= `source_session_id`).
+
+**Format:** JSONL trajectory steps with `step_index`, `source`, `type`, `status`, and `created_at`:
+- `USER_INPUT` → `Message(role="user")` (extracts inner `<USER_REQUEST>` when present)
+- `PLANNER_RESPONSE` → `Message(role="assistant")` with `thinking`, `content`, `tool_calls` (`name`, `args`), first-wins `model`, additive per-call token deltas (`input_tokens + cache_read_tokens` for billable input, `cache_read_tokens` for `cached_input_tokens`, `output_tokens`), and stop markers
+- `GENERIC` / `SYSTEM_MESSAGE` / `ERROR_MESSAGE` / `CHECKPOINT` → `Message(role="system")` (`CHECKPOINT` also contributes per-call token usage)
+
+**Notes:**
+- `transcript.jsonl` (compact truncated view) and `chunks/` are ignored; only `transcript_full.jsonl` is indexed.
+- `run_command` (`CommandLine`) triggers bash extraction; `invoke_subagent` (`TypeName`, `Role`, `Model`) populates subagent fields; `read_file` (`Path`) participates in skill attribution.
 
 ### Grok (xAI Grok Build)
 
