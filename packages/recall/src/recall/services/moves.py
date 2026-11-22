@@ -20,6 +20,7 @@ from typing import Final, Literal
 
 import duckdb
 
+from recall.core.fts_text import sql_derive_fts, sql_is_non_blank
 from recall.core.ids import message_id, tool_call_id
 from recall.core.models import ParseResult
 from recall.core.source_io import open_source
@@ -772,8 +773,14 @@ CARRIED_CONTEXTS_SELECT: Final = """
 """
 
 
-CARRIED_MESSAGE_VECTORS_SELECT: Final = """
-    SELECT s.id AS successor_message, e.content_embedding, e.thinking_embedding
+_CARRIED_CONTENT_NON_BLANK: Final = sql_is_non_blank("ss.content")
+_CARRIED_THINKING_NON_BLANK: Final = sql_is_non_blank("ss.thinking")
+
+CARRIED_MESSAGE_VECTORS_SELECT: Final = f"""
+    SELECT
+        s.id AS successor_message,
+        CASE WHEN {_CARRIED_CONTENT_NON_BLANK} THEN e.content_embedding ELSE NULL END,
+        CASE WHEN {_CARRIED_THINKING_NON_BLANK} THEN e.thinking_embedding ELSE NULL END
     FROM messages p
     JOIN message_state ps ON ps.message_id = p.id
     JOIN message_embeddings e ON e.message_id = p.id
@@ -786,6 +793,10 @@ CARRIED_MESSAGE_VECTORS_SELECT: Final = """
       AND ss.thinking IS NOT DISTINCT FROM ps.thinking
       AND COALESCE(ss.context_text, '') = COALESCE(ps.context_text, '')
       AND COALESCE(ss.context_mode, 'off') = COALESCE(ps.context_mode, 'off')
+      AND (
+          ({_CARRIED_CONTENT_NON_BLANK} AND e.content_embedding IS NOT NULL)
+          OR ({_CARRIED_THINKING_NON_BLANK} AND e.thinking_embedding IS NOT NULL)
+      )
 """
 
 
@@ -838,28 +849,58 @@ def _carry_stored_contexts(
         "CREATE OR REPLACE TEMP TABLE carried_contexts AS " + CARRIED_CONTEXTS_SELECT,
         [successor_id, predecessor_id],
     )
-    conn.execute(
-        """
-        UPDATE message_state
-        SET
-            context_text = c.context_text,
-            context_mode = c.context_mode,
-            fts_content = COALESCE(c.context_text, '') || COALESCE(message_state.content, ''),
-            fts_thinking = COALESCE(c.context_text, '') || COALESCE(message_state.thinking, '')
-        FROM carried_contexts c
-        WHERE message_state.message_id = c.successor_message
-        """
-    )
+    fts_c_expr = sql_derive_fts("c.context_text", "message_state.content")
+    fts_t_expr = sql_derive_fts("c.context_text", "message_state.thinking")
+    c_diff = f"message_state.fts_content IS DISTINCT FROM ({fts_c_expr})"
+    t_diff = f"message_state.fts_thinking IS DISTINCT FROM ({fts_t_expr})"
+    # Update only the derived FTS columns whose values actually change.
+    for set_extra, diff_pred in (
+        (
+            f",\n            fts_content = {fts_c_expr},\n            fts_thinking = {fts_t_expr}",
+            f"({c_diff}) AND ({t_diff})",
+        ),
+        (
+            f",\n            fts_content = {fts_c_expr}",
+            f"({c_diff}) AND NOT ({t_diff})",
+        ),
+        (
+            f",\n            fts_thinking = {fts_t_expr}",
+            f"NOT ({c_diff}) AND ({t_diff})",
+        ),
+        (
+            "",
+            f"NOT ({c_diff}) AND NOT ({t_diff})",
+        ),
+    ):
+        conn.execute(
+            f"""
+            UPDATE message_state
+            SET
+                context_text = c.context_text,
+                context_mode = c.context_mode{set_extra}
+            FROM carried_contexts c
+            WHERE message_state.message_id = c.successor_message
+              AND ({diff_pred})
+            """
+        )
     conn.execute(
         "DELETE FROM message_embeddings"
         " WHERE message_id IN (SELECT successor_message FROM carried_contexts)"
     )
+    content_non_blank = sql_is_non_blank("ms.content")
+    thinking_non_blank = sql_is_non_blank("ms.thinking")
     conn.execute(
-        """
+        f"""
         INSERT INTO message_embeddings (message_id, content_embedding, thinking_embedding)
-        SELECT c.successor_message, e.content_embedding, e.thinking_embedding
+        SELECT
+            c.successor_message,
+            CASE WHEN {content_non_blank} THEN e.content_embedding ELSE NULL END,
+            CASE WHEN {thinking_non_blank} THEN e.thinking_embedding ELSE NULL END
         FROM carried_contexts c
         JOIN message_embeddings e ON e.message_id = c.predecessor_message
+        JOIN message_state ms ON ms.message_id = c.successor_message
+        WHERE ({content_non_blank} AND e.content_embedding IS NOT NULL)
+           OR ({thinking_non_blank} AND e.thinking_embedding IS NOT NULL)
         """
     )
     conn.execute(

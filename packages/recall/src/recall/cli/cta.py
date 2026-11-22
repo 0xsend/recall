@@ -17,6 +17,11 @@ from recall.core.types import is_attributed_host
 # Only plain ASCII host names are safe to embed unescaped as `--host` CLI args;
 # unusual or control-bearing origins fall back to `--fleet` without `--host`.
 _SAFE_CLI_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _is_safe_cli_value(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and _CONTROL_CHAR_RE.search(value) is None
 
 
 def _fleet_flags(*, fleet: bool, host: object = None) -> str:
@@ -36,7 +41,7 @@ def cta_for_list(
     ctas: list[Cta] = []
     if sessions:
         first_id = sessions[0].get("id", "")
-        if first_id:
+        if _is_safe_cli_value(first_id):
             flags = _fleet_flags(fleet=fleet, host=endpoint)
             ctas.append(
                 Cta(f"recall show {shlex.quote(str(first_id))}{flags}", "View most recent session")
@@ -52,7 +57,7 @@ def cta_for_search(
     ctas: list[Cta] = []
     if results:
         sid = results[0].get("session_id", "")
-        if sid:
+        if _is_safe_cli_value(sid):
             flags = _fleet_flags(fleet=fleet, host=endpoint)
             ctas.append(
                 Cta(
@@ -67,8 +72,8 @@ def cta_for_show(
 ) -> list[Cta]:
     ctas: list[Cta] = []
     cwd = session.get("cwd")
-    if cwd:
-        quoted = shlex.quote(cwd)
+    if _is_safe_cli_value(cwd):
+        quoted = shlex.quote(str(cwd))
         flags = _fleet_flags(fleet=fleet, host=endpoint)
         ctas.append(Cta(f"recall list --project {quoted}{flags}", "List sessions in same project"))
     search_cmd = "recall search '<query>' --fleet" if fleet else "recall search '<query>'"

@@ -84,8 +84,8 @@ def test_explicit_common_context_overrides_message_context() -> None:
             "SELECT context_text, context_mode, fts_content, fts_thinking "
             "FROM message_state ORDER BY message_id"
         ).fetchall() == [
-            ("shared ", "template", "shared λ", "shared "),
-            ("shared ", "template", "shared ", "shared thought"),
+            ("shared ", "template", "shared λ", ""),
+            ("shared ", "template", "", "shared thought"),
         ]
 
 

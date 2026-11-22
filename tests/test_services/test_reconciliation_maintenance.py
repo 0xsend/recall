@@ -113,7 +113,8 @@ def test_poll_repairs_pending_keyword_updates_without_new_raw_work(lane: Lane) -
     server._database.call(
         "fixture",
         lambda conn: conn.execute(
-            "UPDATE message_state SET fts_content = 'repairablekeyword' WHERE message_id = ?",
+            "UPDATE message_state SET content = 'repairablekeyword', "
+            "fts_content = 'repairablekeyword' WHERE message_id = ?",
             [message_id],
         ).fetchall(),
     )

@@ -225,7 +225,7 @@ def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
                 "[new] ",
                 "template",
                 "[new] stable context content",
-                "[new] ",
+                "",
             ),
             (
                 "indexed-message",
@@ -2960,7 +2960,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
                 "[a] ",
                 "template",
                 "[a] changed\n'λ'",
-                "[a] ",
+                "",
                 None,
             ),
             (
@@ -2975,7 +2975,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
                 "fresh thoughts",
                 "new-agent",
             ),
-            ("assistant", "", "", None, False, "[b] ", "llm-local", "[b] ", "[b] ", "old-agent"),
+            ("assistant", "", "", None, False, "[b] ", "llm-local", "", "", "old-agent"),
         ]
         expected = [cases[index % 3] for index in range(514)]
         assert conn.execute(query).fetchall() == expected

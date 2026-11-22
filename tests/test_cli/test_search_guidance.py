@@ -347,7 +347,12 @@ def test_search_results_carry_lexical_match(tmp_path, monkeypatch) -> None:
 @pytest.mark.parametrize("mode", ["keyword", "hybrid", "auto", None, "vector"])
 @pytest.mark.parametrize("tool", [None, "Bash"])
 @pytest.mark.parametrize(
-    "rows", [[], [{"score": 1.0, "lexical_match": False}], [{"score": 1.0, "lexical_match": True}]]
+    "rows",
+    [
+        [],
+        [{"score": 1.0, "lexical_match": False, "snippet": ""}],
+        [{"score": 1.0, "lexical_match": True, "snippet": ""}],
+    ],
 )
 def test_search_warns_when_its_keyword_leg_is_unready(
     tmp_path, monkeypatch, format_args, mode, tool, rows

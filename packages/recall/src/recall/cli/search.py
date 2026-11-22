@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,8 +35,53 @@ from recall.cli.status_notices import (
 )
 from recall.cli.utils import with_fleet_host
 from recall.core.config import AppConfig
+from recall.core.snippets import build_search_snippet, sanitize_snippet
 from recall.core.tool_format import format_tool_call_line
 from recall.core.types import SOURCE_HELP
+
+
+def _normalize_search_snippets(
+    results: list[dict[str, Any]],
+    *,
+    query: str,
+    fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Sanitize/bound server-supplied snippets and backfill missing ones from older peers."""
+    normalized: list[dict[str, Any]] = []
+    for row in results:
+        if not isinstance(row, dict):
+            normalized.append(row)
+            continue
+        try:
+            raw_snippet = row.get("snippet")
+            if isinstance(raw_snippet, str):
+                snippet = sanitize_snippet(raw_snippet)
+            else:
+                snippet = build_search_snippet(
+                    query=query,
+                    kind=str(row.get("kind") or "message"),
+                    content=row.get("content") if isinstance(row.get("content"), str) else None,
+                    thinking=row.get("thinking") if isinstance(row.get("thinking"), str) else None,
+                    role=row.get("role") if isinstance(row.get("role"), str) else None,
+                    tool_name=(
+                        row.get("tool_name") if isinstance(row.get("tool_name"), str) else None
+                    ),
+                    bash_command=(
+                        row.get("bash_command")
+                        if isinstance(row.get("bash_command"), str)
+                        else None
+                    ),
+                    tool_input=(
+                        row.get("tool_input")
+                        if isinstance(row.get("tool_input"), Mapping)
+                        else None
+                    ),
+                    fields=fields,
+                )
+        except Exception:
+            snippet = ""
+        normalized.append({**row, "snippet": snippet})
+    return normalized
 
 
 def _render_search_progress(method: str, payload: dict[str, Any]) -> None:
@@ -384,6 +430,7 @@ def command(
     # (REQ-CLI-021/023). The read honours `[cli] status_notices` and never
     # forks a daemon, so a search cannot start one to decorate its stderr.
     config = AppConfig.load()
+    results = _normalize_search_snippets(results, query=query, fields=config.fts.fields)
     status = fetch_daemon_status(config)
     coverage_note = pending_coverage_guidance(status) if not results else None
     reconciliation = status.get("reconciliation") if status is not None else None
@@ -470,23 +517,28 @@ def command(
 
     for result in results:
         score = result.get("score", 0)
-        session_id = result.get("session_id", "?")
-        source_val = result.get("source", "?")
+        session_id = sanitize_snippet(str(result.get("session_id", "?")), max_chars=256)
+        source_val = sanitize_snippet(str(result.get("source", "?")), max_chars=128)
         header = f"[{score:.2f}] {session_id} ({source_val})"
         typer.echo(with_fleet_host(header, result, fleet=fleet))
         if result.get("kind") == "message":
-            content = result.get("content")
-            snippet = content.strip() if isinstance(content, str) else str(content or "")
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "..."
-            role = result.get("role") or "unknown"
+            snippet = result.get("snippet") or ""
+            role = sanitize_snippet(str(result.get("role") or "unknown"), max_chars=64)
             typer.echo(f"  {role}: {snippet}")
         else:
-            typer.echo(f"  {format_tool_call_line(result)}")
+            raw_tool_snippet = result.get("snippet")
+            tool_line = (
+                raw_tool_snippet
+                if isinstance(raw_tool_snippet, str) and raw_tool_snippet
+                else sanitize_snippet(format_tool_call_line(result))
+            )
+            typer.echo(f"  {tool_line}")
         if result.get("source_path"):
-            typer.echo(f"  source: {result['source_path']}")
+            safe_path = sanitize_snippet(str(result["source_path"]), max_chars=1024)
+            typer.echo(f"  source: {safe_path}")
         if result.get("timestamp"):
-            typer.echo(f"  time: {result['timestamp']}")
+            safe_ts = sanitize_snippet(str(result["timestamp"]), max_chars=128)
+            typer.echo(f"  time: {safe_ts}")
         typer.echo("")
 
     render_cta_hints(ctas)

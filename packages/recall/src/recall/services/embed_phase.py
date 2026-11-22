@@ -17,6 +17,7 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.failure_observation import FailureObserver
+from recall.core.fts_text import derive_fts_text
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.db.fts_sidecar_stage import Publication
@@ -1099,27 +1100,34 @@ def _commit_prepared_embed_cycle(
                     message.context_mode,
                 ):
                     context_changed_ids.append(message.id)
+                existing_row = conn.execute(
+                    "SELECT context_text, context_mode, fts_content, fts_thinking "
+                    "FROM message_state WHERE message_id = ?",
+                    [message.id],
+                ).fetchone()
+                if existing_row is None:
+                    continue
+                fts_content = derive_fts_text(message.context_text, message.content)
+                fts_thinking = derive_fts_text(message.context_text, message.thinking)
+                desired_fields = (
+                    ("context_text", message.context_text),
+                    ("context_mode", message.context_mode),
+                    ("fts_content", fts_content),
+                    ("fts_thinking", fts_thinking),
+                )
+                changed = [
+                    (col, val)
+                    for (col, val), old in zip(desired_fields, existing_row, strict=True)
+                    if old != val
+                ]
+                if not changed:
+                    continue
+                set_sql = ", ".join(f"{col} = ?" for col, _ in changed)
+                set_params = [val for _, val in changed]
                 updated = execute_count(
                     conn,
-                    """UPDATE message_state SET context_text = ?, context_mode = ?,
-                        fts_content = ? || COALESCE(content, ''),
-                        fts_thinking = ? || COALESCE(thinking, '')
-                        WHERE message_id = ? AND (
-                            context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
-                            OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
-                            OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
-                        )""",
-                    [
-                        message.context_text,
-                        message.context_mode,
-                        message.context_text,
-                        message.context_text,
-                        message.id,
-                        message.context_text,
-                        message.context_mode,
-                        message.context_text,
-                        message.context_text,
-                    ],
+                    f"UPDATE message_state SET {set_sql} WHERE message_id = ?",
+                    [*set_params, message.id],
                 )
                 if updated == 1:
                     refreshed.append(message.id)
@@ -1236,8 +1244,8 @@ def _publish_prepared_embed_cycle(
             changed.append(
                 (
                     message.id,
-                    message.context_text + (message.content or ""),
-                    message.context_text + (message.thinking or ""),
+                    derive_fts_text(message.context_text, message.content),
+                    derive_fts_text(message.context_text, message.thinking),
                 )
             )
     if not changed:

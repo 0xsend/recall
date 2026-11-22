@@ -12,6 +12,7 @@ import duckdb
 
 from recall.core.config import EmbeddingConfig
 from recall.core.embeddings import BackendDescriptor, EmbeddingBackend, set_backend_probe
+from recall.core.fts_text import has_non_whitespace
 from recall.core.models import Message, Session, ToolCall
 from recall.core.types import EmbedKind
 
@@ -181,7 +182,8 @@ def embed_session(
             fallback_context_text=context_text,
             fallback_context_version=context_version,
         )
-        if message.content:
+        if has_non_whitespace(message.content):
+            assert message.content is not None
             content_entries.append(
                 _prepare_text(
                     EmbedKind.CONTENT,
@@ -192,7 +194,8 @@ def embed_session(
                 )
             )
             content_indices.append(i)
-        if message.thinking:
+        if has_non_whitespace(message.thinking):
+            assert message.thinking is not None
             thinking_entries.append(
                 _prepare_text(
                     EmbedKind.THINKING,

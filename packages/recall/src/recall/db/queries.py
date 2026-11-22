@@ -14,6 +14,7 @@ import duckdb
 
 from recall.core.config import FtsConfig
 from recall.core.failure_observation import FailureObserver, observe_failure
+from recall.core.fts_text import sql_derive_fts
 from recall.core.models import Message, Session, StopMarker, ToolCall
 from recall.db.mutations import execute_count
 
@@ -159,7 +160,11 @@ def _raise_fts_settings_restore_error(
 
 
 def create_fts_indexes(
-    conn: duckdb.DuckDBPyConnection, fts: FtsConfig, *, observer: FailureObserver
+    conn: duckdb.DuckDBPyConnection,
+    fts: FtsConfig,
+    *,
+    observer: FailureObserver,
+    refresh_columns: bool = True,
 ) -> None:
     if fts.backend == "sqlite_sidecar":
         _log_sidecar_rebuild_skip_once()
@@ -173,13 +178,14 @@ def create_fts_indexes(
             with observe_failure(observer, "fts:rebuild"):
                 _apply_fts_session_settings(conn, prior)
                 load_fts_extension(conn)
-                refreshed = refresh_message_fts_columns(conn)
-                if refreshed:
-                    logger.info(
-                        "create_fts_indexes: backfilled %d out-of-sync "
-                        "fts_content/fts_thinking rows",
-                        refreshed,
-                    )
+                if refresh_columns:
+                    refreshed = refresh_message_fts_columns(conn)
+                    if refreshed:
+                        logger.info(
+                            "create_fts_indexes: backfilled %d out-of-sync "
+                            "fts_content/fts_thinking rows",
+                            refreshed,
+                        )
                 message_fields = [
                     _MESSAGE_FTS_COLUMNS[field]
                     for field in ("content", "thinking")
@@ -237,18 +243,37 @@ def refresh_message_fts_columns(conn: duckdb.DuckDBPyConnection) -> int:
 
     Returns the number of rows updated.
     """
-    return execute_count(
+    content_expr = sql_derive_fts("context_text", "content")
+    thinking_expr = sql_derive_fts("context_text", "thinking")
+    content_stale = f"fts_content IS DISTINCT FROM ({content_expr})"
+    thinking_stale = f"fts_thinking IS DISTINCT FROM ({thinking_expr})"
+    both_updated = execute_count(
         conn,
-        """
+        f"""
         UPDATE message_state
         SET
-            fts_content = COALESCE(context_text, '') || COALESCE(content, ''),
-            fts_thinking = COALESCE(context_text, '') || COALESCE(thinking, '')
-        WHERE
-            fts_content IS DISTINCT FROM (COALESCE(context_text, '') || COALESCE(content, ''))
-            OR fts_thinking IS DISTINCT FROM (COALESCE(context_text, '') || COALESCE(thinking, ''))
+            fts_content = {content_expr},
+            fts_thinking = {thinking_expr}
+        WHERE ({content_stale}) AND ({thinking_stale})
         """,
     )
+    content_only = execute_count(
+        conn,
+        f"""
+        UPDATE message_state
+        SET fts_content = {content_expr}
+        WHERE ({content_stale}) AND NOT ({thinking_stale})
+        """,
+    )
+    thinking_only = execute_count(
+        conn,
+        f"""
+        UPDATE message_state
+        SET fts_thinking = {thinking_expr}
+        WHERE NOT ({content_stale}) AND ({thinking_stale})
+        """,
+    )
+    return both_updated + content_only + thinking_only
 
 
 SidecarPendingKind = Literal["message", "tool_call"]
@@ -551,7 +576,7 @@ def insert_messages(
                 "SELECT id, session_id, idx, agent_id FROM _recall_message_inserts"
             )
             conn.execute(
-                """
+                f"""
                 INSERT INTO message_state (
                     message_id, role, content, thinking, timestamp, has_thinking,
                     context_text, context_mode, fts_content, fts_thinking
@@ -559,8 +584,8 @@ def insert_messages(
                 SELECT id, role, content, thinking,
                     COALESCE(CAST(timestamp_utc AS TIMESTAMP), timestamp), has_thinking,
                     context_text, context_mode,
-                    context_text || COALESCE(content, ''),
-                    context_text || COALESCE(thinking, '')
+                    {sql_derive_fts("context_text", "content")},
+                    {sql_derive_fts("context_text", "thinking")}
                 FROM _recall_message_inserts
                 """
             )

@@ -125,7 +125,7 @@ def test_treats_null_content_thinking_as_empty(conn: duckdb.DuckDBPyConnection) 
     row = conn.execute(
         "SELECT fts_content, fts_thinking FROM message_state WHERE message_id = 'm1'"
     ).fetchone()
-    assert row == ("ctx::", "ctx::")
+    assert row == ("", "")
 
 
 def test_idempotent_second_call_is_zero(conn: duckdb.DuckDBPyConnection) -> None:

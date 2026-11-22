@@ -601,7 +601,7 @@ def test_supersede_moved_keeps_the_stored_summaries(
     conn = connect(AppConfig.load())
     try:
         carried = conn.execute(
-            "SELECT m.id, ms.fts_content FROM messages m"
+            "SELECT m.id, ms.content, ms.fts_content FROM messages m"
             " JOIN message_state ms ON ms.message_id = m.id"
             " WHERE m.session_id = ? AND ms.context_mode = 'llm-local'"
             " AND ms.context_text = 'summary'",
@@ -611,8 +611,12 @@ def test_supersede_moved_keeps_the_stored_summaries(
             "SELECT id FROM fts_sidecar_pending WHERE kind = 'message' AND op = 'upsert'"
         ).fetchall()
         assert carried
-        assert all(text.startswith("summary") for _, text in carried)
-        assert {message_id for message_id, _ in carried} <= {row[0] for row in queued}
+        assert any(content and content.strip() for _, content, _ in carried)
+        assert all(
+            text.startswith("summary") if (content and content.strip()) else text == ""
+            for _, content, text in carried
+        )
+        assert {message_id for message_id, _, _ in carried} <= {row[0] for row in queued}
     finally:
         conn.close()
 
@@ -1723,12 +1727,13 @@ def test_historical_repair_preserves_equivalent_donor_only_vectors(
         "populated": tuple(target_vector),
         "processed": None,
     }[target]
+    expected_thinking = None if target == "missing" else expected
     with connect(config) as connection:
         assert connection.execute(
             "SELECT content_embedding, thinking_embedding FROM message_embeddings"
             " WHERE message_id=?",
             [message_ids[0]],
-        ).fetchone() == (expected, expected)
+        ).fetchone() == (expected, expected_thinking)
         assert connection.execute(
             "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id=?", [tool_ids[0]]
         ).fetchone() == (expected,)

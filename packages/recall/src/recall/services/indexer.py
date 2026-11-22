@@ -22,6 +22,7 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.failure_observation import FailureObserver
+from recall.core.fts_text import derive_fts_text, has_non_whitespace, sql_derive_fts
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
@@ -447,8 +448,8 @@ def _insert_messages(
     stage.messages(
         (
             message.id,
-            f"{contexts[message.id][0]}{message.content or ''}",
-            f"{contexts[message.id][0]}{message.thinking or ''}",
+            derive_fts_text(contexts[message.id][0], message.content),
+            derive_fts_text(contexts[message.id][0], message.thinking),
         )
         for message in materialized
     )
@@ -1275,8 +1276,8 @@ def _recompute_context_for_rows(
                     (
                         context_text,
                         context_mode,
-                        f"{context_text}{message.content or ''}",
-                        f"{context_text}{message.thinking or ''}",
+                        derive_fts_text(context_text, message.content),
+                        derive_fts_text(context_text, message.thinking),
                         message.id,
                     )
                 )
@@ -1291,20 +1292,35 @@ def _recompute_context_for_rows(
 
         if selected_count:
             with turn.transaction(conn) as stage:
-                conn.executemany(
-                    """
-                    UPDATE message_state
-                    SET
-                        context_text = ?,
-                        context_mode = ?,
-                        fts_content = ?,
-                        fts_thinking = ?
-                    WHERE message_id = ?
-                    """,
-                    updates,
-                )
                 message_ids = [row[4] for row in updates]
                 placeholders = ", ".join("?" for _ in message_ids)
+                stored_by_id = {
+                    str(row[0]): (row[1], row[2], row[3], row[4])
+                    for row in conn.execute(
+                        "SELECT message_id, context_text, context_mode, fts_content, fts_thinking "
+                        f"FROM message_state WHERE message_id IN ({placeholders})",
+                        message_ids,
+                    ).fetchall()
+                }
+                col_names = ("context_text", "context_mode", "fts_content", "fts_thinking")
+                cohorts: dict[tuple[int, ...], list[tuple[object, ...]]] = {}
+                for ctx_text, ctx_mode, fts_c, fts_t, message_id in updates:
+                    desired = (ctx_text, ctx_mode, fts_c, fts_t)
+                    existing = stored_by_id.get(message_id)
+                    if existing is None:
+                        continue
+                    diff_idx = tuple(i for i in range(4) if existing[i] != desired[i])
+                    if not diff_idx:
+                        continue
+                    cohorts.setdefault(diff_idx, []).append(
+                        (*(desired[i] for i in diff_idx), message_id)
+                    )
+                for diff_idx, rows_for_cohort in cohorts.items():
+                    set_sql = ", ".join(f"{col_names[i]} = ?" for i in diff_idx)
+                    conn.executemany(
+                        f"UPDATE message_state SET {set_sql} WHERE message_id = ?",
+                        rows_for_cohort,
+                    )
                 conn.execute(
                     f"DELETE FROM message_embeddings WHERE message_id IN ({placeholders})",
                     message_ids,
@@ -2784,8 +2800,8 @@ _MESSAGE_STATE_UPDATE_ASSIGNMENTS = (
     "has_thinking = incoming.has_thinking",
     "context_text = incoming.context_text",
     "context_mode = incoming.context_mode",
-    "fts_content = incoming.context_text || COALESCE(incoming.content, '')",
-    "fts_thinking = incoming.context_text || COALESCE(incoming.thinking, '')",
+    f"fts_content = {sql_derive_fts('incoming.context_text', 'incoming.content')}",
+    f"fts_thinking = {sql_derive_fts('incoming.context_text', 'incoming.thinking')}",
 )
 
 
@@ -2808,6 +2824,8 @@ def _message_state_change_mask(
     existing_context = cast(str, existing_row[9] or "")
     desired_content = cast(str | None, values[4])
     desired_thinking = cast(str | None, values[5])
+    existing_content = cast(str | None, existing_row[4])
+    existing_thinking = cast(str | None, existing_row[5])
     existing = _canonicalize_scalar_row(
         (
             existing_row[3],
@@ -2817,8 +2835,8 @@ def _message_state_change_mask(
             existing_row[7],
             existing_context,
             existing_row[10],
-            f"{existing_context}{existing_row[4] or ''}",
-            f"{existing_context}{existing_row[5] or ''}",
+            derive_fts_text(existing_context, existing_content),
+            derive_fts_text(existing_context, existing_thinking),
         )
     )
     desired = _canonicalize_scalar_row(
@@ -2830,8 +2848,8 @@ def _message_state_change_mask(
             values[7],
             context_text,
             context_mode,
-            f"{context_text}{desired_content or ''}",
-            f"{context_text}{desired_thinking or ''}",
+            derive_fts_text(context_text, desired_content),
+            derive_fts_text(context_text, desired_thinking),
         )
     )
     return _changed_column_mask(existing, desired)
@@ -2992,8 +3010,8 @@ def _upsert_messages(
         keyword_rows.append(
             (
                 message_id,
-                f"{message_context_text}{message.content or ''}",
-                f"{message_context_text}{message.thinking or ''}",
+                derive_fts_text(message_context_text, message.content),
+                derive_fts_text(message_context_text, message.thinking),
             )
         )
         # Preservation already resolved the complete valid vector pair. Replace
@@ -3211,11 +3229,11 @@ def _preserve_existing_embeddings(
     thinking_candidates: dict[str, list[StoredVector]] = {}
     for row in previous_rows.message_rows:
         prefix = str(row[9] or "")
-        if row[4]:
+        if has_non_whitespace(cast(str | None, row[4])):
             content_candidates.setdefault(prefix + str(row[4]), []).append(
                 cast(StoredVector, row[11])
             )
-        if row[5]:
+        if has_non_whitespace(cast(str | None, row[5])):
             thinking_candidates.setdefault(prefix + str(row[5]), []).append(
                 cast(StoredVector, row[12])
             )
@@ -3232,9 +3250,13 @@ def _preserve_existing_embeddings(
         candidates: dict[str, list[StoredVector]],
     ) -> tuple[list[StoredVector], bool]:
         """The stored fields this input may take, and whether it moves."""
-        if not text:
+        if not has_non_whitespace(text):
             return [], False
-        if own is not None and f"{own[9] or ''}{own[text_index]}" == effective_text:
+        if (
+            own is not None
+            and has_non_whitespace(cast(str | None, own[text_index]))
+            and f"{own[9] or ''}{own[text_index]}" == effective_text
+        ):
             return [cast(StoredVector, own[vector_index])], False
         return candidates.get(effective_text, []), True
 
