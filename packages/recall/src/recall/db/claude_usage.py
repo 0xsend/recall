@@ -6,6 +6,7 @@ these only inside its KeywordTurn transaction, before its acknowledgement.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import duckdb
@@ -32,8 +33,9 @@ class UnprovedClaudeScope(RuntimeError):
 
 
 def response_key(scope_token: str, response_id: str) -> str:
-    """An exact length-framed key, with no delimiter or hash collision."""
-    return f"{len(scope_token)}:{scope_token}{response_id}"
+    """An exact length-framed ASCII key, injective over every Python str including surrogates."""
+    encoded_id = json.dumps(response_id, ensure_ascii=True)
+    return f"{len(scope_token)}:{scope_token}{encoded_id}"
 
 
 def delete_scope(conn: duckdb.DuckDBPyConnection, session_id: str) -> None:

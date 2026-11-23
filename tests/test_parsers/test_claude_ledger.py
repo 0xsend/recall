@@ -277,3 +277,62 @@ def test_batch_index_sessions_publishes_claude_ledger_atomically(tmp_path: Path)
             "output_tokens FROM claude_response_usage WHERE scope_token = ?",
             [scope[1]],
         ).fetchall() == [(100, 500, 200, 40)]
+
+
+def test_batch_index_sessions_preserves_sidecar_mtime_and_skips_unchanged(tmp_path: Path) -> None:
+    import duckdb
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    home = tmp_path / "home"
+    grok_session = home / ".grok" / "sessions" / "s1"
+    grok_session.mkdir(parents=True)
+    (grok_session / "chat_history.jsonl").write_text(
+        json.dumps({"type": "user", "message": "hello", "timestamp": "2026-01-01T00:00:00Z"})
+        + "\n",
+        encoding="utf-8",
+    )
+    (grok_session / "summary.json").write_text(
+        json.dumps(
+            {
+                "created_at": "2026-01-01T00:00:00Z",
+                "last_active_at": "2026-01-01T00:01:00Z",
+                "current_model_id": "grok-4",
+                "info": {"cwd": "/tmp/work"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = replace(
+        AppConfig.load(),
+        data_dir=data_dir,
+        db_path=data_dir / "recall.duckdb",
+        lock_path=data_dir / "recall.lock",
+    )
+    ensure_sidecar(config)
+    with duckdb.connect(str(config.db_path)) as conn:
+        ensure_schema(conn, embed_dim=config.embedding.dimensions)
+        first = index_sessions(
+            source=Source.GROK,
+            full=False,
+            recreate=False,
+            verbose=False,
+            config=config,
+            conn=conn,
+            home_root=home,
+        )
+        assert first.indexed == 1
+        sidecar_row = conn.execute("SELECT sidecar_mtime FROM session_state").fetchone()
+        assert sidecar_row is not None and float(sidecar_row[0]) > 0.0
+
+        second = index_sessions(
+            source=Source.GROK,
+            full=False,
+            recreate=False,
+            verbose=False,
+            config=config,
+            conn=conn,
+            home_root=home,
+        )
+        assert second.indexed == 0
+        assert second.skipped == 1

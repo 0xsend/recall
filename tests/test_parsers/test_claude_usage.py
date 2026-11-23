@@ -382,3 +382,50 @@ def test_claude_counter_and_aggregate_overflow_bounds(
         assert "int64 range" in harness.item.last_error
     finally:
         harness.conn.close()
+
+
+def test_surrogate_and_backslash_response_ids_publish_independently(tmp_path: Path) -> None:
+    """A lone UTF-16 surrogate response ID publishes without UTF-8 error and stays distinct."""
+    surrogate_line = (
+        b'{"type":"assistant","sessionId":"surrogate-ids","timestamp":"2026-01-01T00:00:00Z",'
+        b'"message":{"id":"\\ud800","role":"assistant",'
+        b'"content":[{"type":"text","text":"surrogate block"}],'
+        b'"usage":{"input_tokens":10,"output_tokens":7}}}\n'
+    )
+    backslash_line = (
+        b'{"type":"assistant","sessionId":"surrogate-ids","timestamp":"2026-01-01T00:00:01Z",'
+        b'"message":{"id":"\\\\ud800","role":"assistant",'
+        b'"content":[{"type":"text","text":"backslash block"}],'
+        b'"usage":{"input_tokens":20,"output_tokens":11}}}\n'
+    )
+    surrogate_update = (
+        b'{"type":"assistant","sessionId":"surrogate-ids","timestamp":"2026-01-01T00:00:02Z",'
+        b'"message":{"id":"\\ud800","role":"assistant",'
+        b'"content":[{"type":"text","text":"surrogate update"}],'
+        b'"usage":{"input_tokens":10,"output_tokens":9}}}\n'
+    )
+
+    harness = _first_wins_harness("claude-code", "session.jsonl", AppConfig.load(), tmp_path)
+    try:
+        # Full parse keeps surrogate and literal-backslash IDs distinct (10+20=30, 9+11=20).
+        harness.path.write_bytes(surrogate_line + backslash_line)
+        assert harness.reconcile() is False
+        assert harness.conn.execute(
+            "SELECT input_tokens, output_tokens, message_count FROM session_state"
+        ).fetchone() == (30, 18, 2)
+        assert harness.conn.execute("SELECT count(*) FROM claude_response_usage").fetchone() == (2,)
+
+        # Resumed suffix updates only the surrogate ID, leaving the backslash ID intact.
+        harness.path.write_bytes(surrogate_line + backslash_line + surrogate_update)
+        assert harness.reconcile() is True
+        assert harness.conn.execute(
+            "SELECT input_tokens, output_tokens, message_count FROM session_state"
+        ).fetchone() == (30, 20, 3)
+        assert harness.conn.execute("SELECT count(*) FROM claude_response_usage").fetchone() == (2,)
+
+        harness.reconcile(full=True)
+        assert harness.conn.execute(
+            "SELECT input_tokens, output_tokens, message_count FROM session_state"
+        ).fetchone() == (30, 20, 3)
+    finally:
+        harness.conn.close()

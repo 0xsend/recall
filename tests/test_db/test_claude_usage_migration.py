@@ -106,23 +106,27 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
         tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
         assert "claude_usage_scopes" not in tables
 
-    damaged = tmp_path / "v41_damaged.duckdb"
-    _schema_41_db(damaged)
-    with duckdb.connect(str(damaged)) as conn:
-        conn.execute("DROP TABLE daemon_index_repair")
-        with StandaloneLifetime().lease(conn) as lease:
-            assert migration._upgrade(lease) is False
-        assert get_schema_version(conn) == 41
-        tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
-        assert "claude_usage_scopes" not in tables
-        assert "claude_response_usage" not in tables
-        assert conn.execute(
-            "SELECT count(*) FROM schema_migrations WHERE migration_id = ?",
-            ["0042_claude_response_usage"],
-        ).fetchone() == (0,)
+    for mode in ("table_absent", "column_missing"):
+        damaged = tmp_path / f"v41_damaged_{mode}.duckdb"
+        _schema_41_db(damaged)
+        with duckdb.connect(str(damaged)) as conn:
+            conn.execute("DROP TABLE daemon_index_repair")
+            if mode == "column_missing":
+                conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
+                conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
+            with StandaloneLifetime().lease(conn) as lease:
+                assert migration._upgrade(lease) is False
+            assert get_schema_version(conn) == 41
+            tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+            assert "claude_usage_scopes" not in tables
+            assert "claude_response_usage" not in tables
+            assert conn.execute(
+                "SELECT count(*) FROM schema_migrations WHERE migration_id = ?",
+                ["0042_claude_response_usage"],
+            ).fetchone() == (0,)
 
 
-@pytest.mark.parametrize("damage", ["table_absent", "row_absent", "row_invalid"])
+@pytest.mark.parametrize("damage", ["table_absent", "column_missing", "row_absent", "row_invalid"])
 @pytest.mark.parametrize("lenient", [False, True])
 def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
     tmp_path: Path, damage: str, lenient: bool
@@ -132,6 +136,10 @@ def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
     with duckdb.connect(str(path)) as conn:
         if damage == "table_absent":
             conn.execute("DROP TABLE daemon_index_repair")
+        elif damage == "column_missing":
+            conn.execute("DROP TABLE daemon_index_repair")
+            conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
+            conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
         elif damage == "row_absent":
             conn.execute("DELETE FROM daemon_index_repair")
         else:

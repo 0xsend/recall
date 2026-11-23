@@ -264,9 +264,12 @@ def require_schema_fence(conn: duckdb.DuckDBPyConnection) -> SchemaFence:
 
 
 def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
-    rows = conn.execute(
-        f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
+        ).fetchall()
+    except duckdb.BinderException as error:
+        raise ValueError(f"recovery singleton schema is invalid: {error}") from error
     if len(rows) != 1:
         raise ValueError("recovery singleton is missing or duplicated")
     payload = dict(zip(_COLUMNS, rows[0], strict=True))

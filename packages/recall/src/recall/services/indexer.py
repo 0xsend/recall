@@ -943,7 +943,7 @@ def _index_sessions(
                         )
                     if _write_parsed_session(
                         conn,
-                        result,
+                        replace(result, session=session),
                         turn=turn,
                         host=resolved_host,
                         snapshot=snapshot,

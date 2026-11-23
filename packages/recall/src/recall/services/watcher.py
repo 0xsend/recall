@@ -1500,7 +1500,7 @@ def _index_single_session(
     )
     result = _write_parsed_session(
         conn,
-        parse_result,
+        replace(parse_result, session=session),
         turn=turn,
         host=host,
         snapshot=snapshot,
