@@ -13,6 +13,7 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.poll_reads import (
+    BashFilteredRead,
     BashRead,
     ListRead,
     PollRead,
@@ -22,12 +23,15 @@ from recall.core.poll_reads import (
     SessionListRead,
     ShowRead,
     SkillsRead,
+    StatsFilteredRead,
     StatsRead,
+    UsageFilteredRead,
     UsageRead,
 )
 from recall.core.read_cancellation import check_read_cancelled, read_cancellation
-from recall.core.rpc_types import RpcError
+from recall.core.rpc_types import INVALID_PARAMS, RpcError
 from recall.core.search_filters import normalize_search_filters
+from recall.core.stats_filters import StatsFilters, normalize_stats_filters
 from recall.core.types import SearchMode, parse_search_mode, parse_source
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
@@ -207,6 +211,15 @@ def _search(
     return read
 
 
+def _parse_stats_filters_or_rpc(
+    *, source: str | None = None, since: str | None = None
+) -> StatsFilters:
+    try:
+        return normalize_stats_filters(source=source, since=since)
+    except ValueError as err:
+        raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
+
+
 def _reader(
     config: AppConfig, request: PollRead, execution: _Execution
 ) -> Callable[[duckdb.DuckDBPyConnection], Any]:
@@ -221,10 +234,31 @@ def _reader(
             return lambda conn: selection.read(config, conn)
         case StatsRead(method="recall.stats"):
             return lambda conn: read_overview(config, conn)
+        case StatsFilteredRead(method="recall.stats_filtered"):
+            filters = _parse_stats_filters_or_rpc(
+                source=request.params.source, since=request.params.since
+            )
+            return lambda conn: read_overview(
+                config, conn, source=filters.source, since=filters.since
+            )
         case StatsRead(method="recall.stats_tools"):
             return lambda conn: analytics.tool_usage(config=config, conn=conn)
+        case StatsFilteredRead(method="recall.stats_tools_filtered"):
+            filters = _parse_stats_filters_or_rpc(
+                source=request.params.source, since=request.params.since
+            )
+            return lambda conn: analytics.tool_usage(
+                source=filters.source, since=filters.since, config=config, conn=conn
+            )
         case StatsRead(method="recall.stats_tokens"):
             return lambda conn: analytics.token_usage(config=config, conn=conn)
+        case StatsFilteredRead(method="recall.stats_tokens_filtered"):
+            filters = _parse_stats_filters_or_rpc(
+                source=request.params.source, since=request.params.since
+            )
+            return lambda conn: analytics.token_usage(
+                source=filters.source, since=filters.since, config=config, conn=conn
+            )
         case BashRead():
 
             def bash(conn: duckdb.DuckDBPyConnection) -> Any:
@@ -234,13 +268,37 @@ def _reader(
                 return analytics.bash_breakdown(config=config, conn=conn)
 
             return bash
-        case UsageRead():
-            from recall.core.time import parse_since
+        case BashFilteredRead():
+            filters = _parse_stats_filters_or_rpc(
+                source=request.params.source, since=request.params.since
+            )
 
-            since = parse_since(request.params.since) if request.params.since else None
+            def bash_filtered(conn: duckdb.DuckDBPyConnection) -> Any:
+                if request.params.suggest:
+                    suggestions, skipped = analytics.bash_suggestions(
+                        source=filters.source, since=filters.since, config=config, conn=conn
+                    )
+                    return {"suggestions": suggestions, "skipped": skipped}
+                return analytics.bash_breakdown(
+                    source=filters.source, since=filters.since, config=config, conn=conn
+                )
+
+            return bash_filtered
+        case UsageRead():
+            filters = _parse_stats_filters_or_rpc(since=request.params.since)
             return lambda conn: [
                 asdict(row)
-                for row in analytics.usage_by_source(since=since, config=config, conn=conn)
+                for row in analytics.usage_by_source(since=filters.since, config=config, conn=conn)
+            ]
+        case UsageFilteredRead():
+            filters = _parse_stats_filters_or_rpc(
+                source=request.params.source, since=request.params.since
+            )
+            return lambda conn: [
+                asdict(row)
+                for row in analytics.usage_by_source(
+                    source=filters.source, since=filters.since, config=config, conn=conn
+                )
             ]
         case SkillsRead():
             from recall.core.time import parse_since

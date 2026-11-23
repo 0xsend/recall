@@ -7,8 +7,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from recall.core.host_text import HostValue
-from recall.core.rpc_params import UsageStatsParams
+from recall.core.rpc_params import Params, StatsUsageFilteredParams, UsageStatsParams
+from recall.core.stats_filters import normalize_stats_filters
 from recall.core.types import UNATTRIBUTED_HOST, is_attributed_host
+from recall.services.analytics import DEFAULT_USAGE_STATS_LIMIT
 from recall.services.fleet_endpoints import FleetExecutor, FleetOperation
 from recall.services.fleet_query import _arrays, decode_array
 from recall.services.fleet_transport import (
@@ -132,32 +134,112 @@ def merge_usage_rows(
     return merged
 
 
-def _decode_usage(value: Any) -> list[dict[str, Any]]:
+def _require_nonneg_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _require_optional_nonneg_int(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_nonneg_int(value, field_name)
+
+
+def _decode_usage(
+    value: Any,
+    *,
+    expected_source: str | None = None,
+    max_rows: int = DEFAULT_USAGE_STATS_LIMIT,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError(f"unexpected stats usage payload type: {type(value).__name__}")
-    return decode_array(value)
+    if len(value) > max_rows:
+        raise ValueError(f"stats usage reply exceeds per-host limit of {max_rows} rows")
+    rows = decode_array(value)
+    validated: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str | None, str | None]] = set()
+    for index, row in enumerate(rows):
+        source = row.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError(f"rows[{index}].source must be a non-empty string")
+        if expected_source is not None and source != expected_source:
+            raise ValueError(
+                f"rows[{index}].source {source!r} violated --source {expected_source!r} filter"
+            )
+        model = row.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError(f"rows[{index}].model must be a string or null")
+        host = row.get("host")
+        if host is not None and not isinstance(host, (str, HostValue)):
+            raise ValueError(f"rows[{index}].host must be a string or null")
+        host_key = (
+            host.raw() if isinstance(host, HostValue) else (host if isinstance(host, str) else None)
+        )
+        group_key = (source, model, host_key)
+        if group_key in seen_keys:
+            raise ValueError(f"duplicate usage group key {group_key!r} at rows[{index}]")
+        seen_keys.add(group_key)
+        input_tokens = _require_nonneg_int(row.get("input_tokens"), f"rows[{index}].input_tokens")
+        output_tokens = _require_nonneg_int(
+            row.get("output_tokens"), f"rows[{index}].output_tokens"
+        )
+        session_count = _require_nonneg_int(
+            row.get("session_count"), f"rows[{index}].session_count"
+        )
+        cached_input_tokens = _require_nonneg_int(
+            row.get("cached_input_tokens"), f"rows[{index}].cached_input_tokens"
+        )
+        fresh_input_tokens = _require_optional_nonneg_int(
+            row.get("fresh_input_tokens"), f"rows[{index}].fresh_input_tokens"
+        )
+        validated.append(
+            {
+                "source": source,
+                "model": model,
+                "host": host,
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "output_tokens": output_tokens,
+                "fresh_input_tokens": fresh_input_tokens,
+                "session_count": session_count,
+            }
+        )
+    return validated
 
 
 def fleet_stats_usage(
     executor: FleetExecutor,
     *,
+    source: str | None = None,
     since: str | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetUsageResult:
+    filters = normalize_stats_filters(source=source, since=since)
+    source_value = filters.source.value if filters.source is not None else None
     argv = ["recall", "stats", "usage", "--json"]
-    if since:
-        argv.extend(["--since", since])
+    if source_value is not None:
+        argv.extend(["--source", source_value])
+    if filters.since_iso is not None:
+        argv.extend(["--since", filters.since_iso])
+    if source_value is not None:
+        method = "recall.stats_usage_filtered"
+        params: Params = StatsUsageFilteredParams(source=source_value, since=filters.since_iso)
+    else:
+        method = "recall.stats_usage"
+        params = UsageStatsParams(since=filters.since_iso)
     result = _arrays(
         executor,
         FleetOperation(
-            "recall.stats_usage",
-            UsageStatsParams(since=since),
+            method,
+            params,
             argv,
-            _decode_usage,
+            lambda value: _decode_usage(value, expected_source=source_value),
             local_seconds=timeout,
             remote_seconds=timeout,
             invalid_reply_prefix="invalid stats usage JSON: ",
+            allow_blank_reply=False,
         ),
         concurrency,
     )

@@ -72,8 +72,23 @@ class BashStatsParams(Params):
     suggest: bool = False
 
 
+class StatsFilteredParams(Params):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+    source: str | None = None
+    since: str | None = None
+
+
+class StatsBashFilteredParams(StatsFilteredParams):
+    suggest: bool = False
+
+
 class UsageStatsParams(Params):
     since: str | None = None
+
+
+class StatsUsageFilteredParams(UsageStatsParams):
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+    source: str | None = None
 
 
 class SkillStatsParams(UsageStatsParams):

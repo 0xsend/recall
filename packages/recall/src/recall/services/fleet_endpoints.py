@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from recall.core.host_text import HostDiagnostic, HostMessageError, HostValue
 from recall.core.read_scope import AggregateRead, current_invocation
 from recall.core.rpc_client import RpcCallError, RpcConnectionError
 from recall.core.rpc_params import Params
-from recall.core.rpc_types import APP_NOT_FOUND, RpcAdmissionBusyError
+from recall.core.rpc_types import APP_NOT_FOUND, METHOD_NOT_FOUND, RpcAdmissionBusyError
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import default_session_host
 from recall.services import fleet_transport
@@ -68,6 +69,9 @@ class FleetOperation:
     # Whether decoding drops the whitespace around the reply, which also fixes the
     # character position a JSON error reports.
     strip_reply: bool = True
+    # Whether empty/whitespace-only SSH stdout decodes as `[]` (legacy behavior)
+    # or fails closed as an invalid reply.
+    allow_blank_reply: bool = True
 
 
 def _repair_notice(config: AppConfig) -> str | None:
@@ -139,11 +143,32 @@ class FleetExecutor:
                 error = result.error or "remote failed"
                 if operation.not_found and "not found" in error.lower():
                     return EndpointNotFound(endpoint.name, error)
-                return EndpointFailure(endpoint.name, extract_remote_error("", error, 1))
+                extracted = extract_remote_error("", error, 1)
+                if (
+                    operation.method.endswith("_filtered")
+                    and "no such option:" in extracted.lower()
+                ):
+                    match = re.search(r"No such option:\s*([^\s│|;]+)", extracted, re.IGNORECASE)
+                    opt = match.group(1) if match else "filter option"
+                    extracted = f"remote recall does not support {opt}; upgrade recall on this host"
+                return EndpointFailure(endpoint.name, extracted)
             return EndpointSuccess(endpoint.name, _decode_remote(result.stdout, operation))
         except RpcCallError as error:
             if operation.not_found and error.code == APP_NOT_FOUND:
                 return EndpointNotFound(endpoint.name, error.message)
+            if (
+                isinstance(endpoint, LocalEndpoint)
+                and operation.method.endswith("_filtered")
+                and (
+                    error.code == METHOD_NOT_FOUND
+                    or f"method not found: {operation.method}" in error.message
+                )
+            ):
+                return EndpointFailure(
+                    endpoint.name,
+                    f"running recall daemon does not support {operation.method} "
+                    f"({_endpoint_error(error)}); upgrade or run `recall daemon restart`",
+                )
             return EndpointFailure(endpoint.name, _endpoint_error(error))
         except (
             RpcConnectionError,
@@ -158,7 +183,12 @@ class FleetExecutor:
 def _decode_remote(stdout: str, operation: FleetOperation) -> Any:
     try:
         text = stdout.strip()
-        value = json.loads(text if operation.strip_reply else stdout) if text else []
+        if not text:
+            if not operation.allow_blank_reply:
+                raise ValueError("empty JSON reply")
+            value: Any = []
+        else:
+            value = json.loads(text if operation.strip_reply else stdout)
         if isinstance(value, dict) and "data" in value:
             value = value["data"]
         return operation.decode(value)

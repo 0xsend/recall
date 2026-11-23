@@ -1163,6 +1163,20 @@ COMMANDS: dict[str, dict[str, Any]] = {
         ),
         "args": [],
         "options": [
+            _source_option(),
+            {
+                "name": "since",
+                "type": "string",
+                "description": "Time window e.g. 30d, 12h or ISO-8601 UTC.",
+            },
+            {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
+            {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -1191,13 +1205,34 @@ COMMANDS: dict[str, dict[str, Any]] = {
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
-        "examples": ["recall stats", "recall stats --format json"],
+        "examples": [
+            "recall stats",
+            "recall stats --source agy --since 7d",
+            "recall stats --fleet --format json",
+        ],
     },
     "stats tools": {
         "command": "stats tools",
         "description": "Show tool usage counts.",
+        "notes": [
+            "With --fleet, merges each answering host's top 50 tools and returns the top 50."
+        ],
         "args": [],
         "options": [
+            _source_option(),
+            {
+                "name": "since",
+                "type": "string",
+                "description": "Time window e.g. 30d, 12h or ISO-8601 UTC.",
+            },
+            {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
+            {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -1207,7 +1242,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "env": GLOBAL_ENV,
         "output": _with_cta_envelope({"type": "array", "fields": ["tool_name", "count"]}),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
-        "examples": ["recall stats tools"],
+        "examples": [
+            "recall stats tools",
+            "recall stats tools --source agy --since 7d",
+            "recall stats tools --fleet --json",
+        ],
     },
     "stats skills": {
         "command": "stats skills",
@@ -1266,9 +1305,28 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "stats bash": {
         "command": "stats bash",
         "description": "Show bash command usage or permission suggestions.",
+        "notes": [
+            "With --fleet, merges each answering host's top 100 bash patterns (or top 500 "
+            "patterns for --suggest), combining counts and compound flags before returning the "
+            "top 100 or re-classifying --suggest tiers."
+        ],
         "args": [],
         "options": [
             {"name": "suggest", "type": "boolean", "default": False},
+            _source_option(),
+            {
+                "name": "since",
+                "type": "string",
+                "description": "Time window e.g. 30d, 12h or ISO-8601 UTC.",
+            },
+            {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
+            {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -1308,13 +1366,34 @@ COMMANDS: dict[str, dict[str, Any]] = {
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
-        "examples": ["recall stats bash", "recall stats bash --suggest"],
+        "examples": [
+            "recall stats bash",
+            "recall stats bash --suggest",
+            "recall stats bash --source codex --fleet --suggest",
+        ],
     },
     "stats tokens": {
         "command": "stats tokens",
         "description": "Show token usage grouped by repository.",
+        "notes": [
+            "With --fleet, merges each answering host's top 50 repositories and returns the top 50."
+        ],
         "args": [],
         "options": [
+            _source_option(),
+            {
+                "name": "since",
+                "type": "string",
+                "description": "Time window e.g. 30d, 12h or ISO-8601 UTC.",
+            },
+            {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
+            {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -1326,14 +1405,24 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"type": "array", "fields": ["repo", "input_tokens", "output_tokens"]},
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
-        "examples": ["recall stats tokens"],
+        "examples": [
+            "recall stats tokens",
+            "recall stats tokens --source agy --since 30d",
+            "recall stats tokens --fleet --json",
+        ],
     },
     "stats usage": {
         "command": "stats usage",
         "description": "Show token usage by source, model, and host.",
+        "notes": ["With --fleet, merges each answering host's top 200 usage rows."],
         "args": [],
         "options": [
-            {"name": "since", "type": "string"},
+            _source_option(),
+            {
+                "name": "since",
+                "type": "string",
+                "description": "Time window e.g. 30d, 12h or ISO-8601 UTC.",
+            },
             {"name": "fleet", "type": "boolean", "default": False},
             {
                 "name": "fleet_inventory_only",
@@ -1367,14 +1456,24 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
         "examples": [
             "recall stats usage",
-            "recall stats usage --since 30d",
+            "recall stats usage --source agy --since 30d",
             "recall stats usage --fleet --since 7d",
         ],
     },
 }
 
 
-for _fleet_command in ("list", "search", "show", "live", "stats usage"):
+for _fleet_command in (
+    "list",
+    "search",
+    "show",
+    "live",
+    "stats",
+    "stats tools",
+    "stats bash",
+    "stats tokens",
+    "stats usage",
+):
     COMMANDS[_fleet_command]["description"] += (
         " Fleet includes the calling daemon by default; "
         "partial endpoint failures are reported on stderr."

@@ -9,10 +9,17 @@ from typing import Any, Final, cast
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.time import to_naive_utc
 from recall.core.types import Source, default_session_host
 from recall.db.lease import DbLease
 from recall.db.ownership import standalone_read_lease
 from recall.parsers.skills import derive_skill_names, is_skill_candidate
+
+DEFAULT_TOOL_STATS_LIMIT = 50
+DEFAULT_BASH_STATS_LIMIT = 100
+DEFAULT_BASH_SUGGESTIONS_LIMIT = 500
+DEFAULT_TOKEN_STATS_LIMIT = 50
+DEFAULT_USAGE_STATS_LIMIT = 200
 
 DANGEROUS_BASES = {
     "rm",
@@ -120,98 +127,229 @@ class SkillUsageResult:
     coverage: SkillCoverage
 
 
+def _session_filter_cte(
+    source: Source | None,
+    since: datetime | None,
+) -> tuple[str, list[object]]:
+    """Build a narrow materialized session-ID filter CTE when source or since is active."""
+    where: list[str] = []
+    params: list[object] = []
+    if source is not None:
+        where.append("s.source = ?")
+        params.append(source.value)
+    if since is not None:
+        where.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
+        params.append(to_naive_utc(since))
+    assert where, "_session_filter_cte requires at least one filter"
+    where_sql = " AND ".join(where)
+    cte = f"""
+        WITH filtered AS MATERIALIZED (
+            SELECT s.id
+            FROM sessions s
+            JOIN session_state ss ON ss.session_id = s.id
+            WHERE {where_sql}
+        )
+    """
+    return cte, params
+
+
 def overview(
-    *, config: AppConfig | None = None, conn: duckdb.DuckDBPyConnection | None = None
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig | None = None,
+    conn: duckdb.DuckDBPyConnection | None = None,
 ) -> OverviewStats:
     config = config or AppConfig.load()
     with standalone_read_lease(config, conn) as lease:
-        return overview_on(lease, config=config)
+        return overview_on(lease, source=source, since=since, config=config)
 
 
-def overview_on(lease: DbLease, *, config: AppConfig) -> OverviewStats:
-    return lease.call("analytics:overview", lambda conn: _overview(conn, config=config))
+def overview_on(
+    lease: DbLease,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> OverviewStats:
+    return lease.call(
+        "analytics:overview",
+        lambda conn: _overview(conn, source=source, since=since, config=config),
+    )
 
 
-def _overview(conn: duckdb.DuckDBPyConnection, *, config: AppConfig) -> OverviewStats:
-    sessions = _count(conn, "sessions")
-    messages = _count(conn, "messages")
-    tool_calls = _count(conn, "tool_calls")
-    bash_row = conn.execute(
-        "SELECT COUNT(*) FROM tool_calls WHERE bash_command IS NOT NULL"
+def _overview(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> OverviewStats:
+    if source is None and since is None:
+        sessions = _count(conn, "sessions")
+        messages = _count(conn, "messages")
+        tool_calls = _count(conn, "tool_calls")
+        bash_row = conn.execute(
+            "SELECT COUNT(*) FROM tool_calls WHERE bash_command IS NOT NULL"
+        ).fetchone()
+        bash_calls = int(bash_row[0]) if bash_row else 0
+        return OverviewStats(
+            sessions=sessions,
+            messages=messages,
+            tool_calls=tool_calls,
+            bash_calls=bash_calls,
+        )
+
+    cte, params = _session_filter_cte(source, since)
+    sessions_row = conn.execute(f"{cte} SELECT COUNT(*) FROM filtered", params).fetchone()
+    messages_row = conn.execute(
+        f"{cte} SELECT COUNT(*) FROM messages m JOIN filtered f ON f.id = m.session_id",
+        params,
     ).fetchone()
-    bash_calls = int(bash_row[0]) if bash_row else 0
+    tools_row = conn.execute(
+        f"""
+        {cte}
+        SELECT
+            COUNT(*),
+            COUNT(*) FILTER (WHERE tc.bash_command IS NOT NULL)
+        FROM tool_calls tc
+        JOIN filtered f ON f.id = tc.session_id
+        """,
+        params,
+    ).fetchone()
     return OverviewStats(
-        sessions=sessions,
-        messages=messages,
-        tool_calls=tool_calls,
-        bash_calls=bash_calls,
+        sessions=int(sessions_row[0]) if sessions_row else 0,
+        messages=int(messages_row[0]) if messages_row else 0,
+        tool_calls=int(tools_row[0]) if tools_row else 0,
+        bash_calls=int(tools_row[1]) if tools_row else 0,
     )
 
 
 def tool_usage(
-    limit: int = 50,
+    limit: int = DEFAULT_TOOL_STATS_LIMIT,
     *,
+    source: Source | None = None,
+    since: datetime | None = None,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[ToolStat]:
     config = config or AppConfig.load()
     with standalone_read_lease(config, conn) as lease:
-        return tool_usage_on(lease, limit=limit, config=config)
+        return tool_usage_on(lease, limit=limit, source=source, since=since, config=config)
 
 
-def tool_usage_on(lease: DbLease, limit: int = 50, *, config: AppConfig) -> list[ToolStat]:
+def tool_usage_on(
+    lease: DbLease,
+    limit: int = DEFAULT_TOOL_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> list[ToolStat]:
     return lease.call(
-        "analytics:tool_usage", lambda conn: _tool_usage(conn, limit=limit, config=config)
+        "analytics:tool_usage",
+        lambda conn: _tool_usage(conn, limit=limit, source=source, since=since, config=config),
     )
 
 
 def _tool_usage(
-    conn: duckdb.DuckDBPyConnection, limit: int = 50, *, config: AppConfig
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = DEFAULT_TOOL_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
 ) -> list[ToolStat]:
-    rows = conn.execute(
-        """
-        SELECT tool_name, COUNT(*) AS count
-        FROM tool_calls
-        GROUP BY tool_name
-        ORDER BY count DESC
-        LIMIT ?
-        """,
-        [limit],
-    ).fetchall()
+    if source is None and since is None:
+        rows = conn.execute(
+            """
+            SELECT tool_name, COUNT(*) AS count
+            FROM tool_calls
+            GROUP BY tool_name
+            ORDER BY count DESC, tool_name ASC NULLS LAST
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+    else:
+        cte, params = _session_filter_cte(source, since)
+        rows = conn.execute(
+            f"""
+            {cte}
+            SELECT tc.tool_name, COUNT(*) AS count
+            FROM tool_calls tc
+            JOIN filtered f ON f.id = tc.session_id
+            GROUP BY tc.tool_name
+            ORDER BY count DESC, tc.tool_name ASC NULLS LAST
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
     return [ToolStat(tool_name=row[0], count=int(row[1])) for row in rows]
 
 
 def bash_breakdown(
-    limit: int = 100,
+    limit: int = DEFAULT_BASH_STATS_LIMIT,
     *,
+    source: Source | None = None,
+    since: datetime | None = None,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[BashStat]:
     config = config or AppConfig.load()
     with standalone_read_lease(config, conn) as lease:
-        return bash_breakdown_on(lease, limit=limit, config=config)
+        return bash_breakdown_on(lease, limit=limit, source=source, since=since, config=config)
 
 
-def bash_breakdown_on(lease: DbLease, limit: int = 100, *, config: AppConfig) -> list[BashStat]:
+def bash_breakdown_on(
+    lease: DbLease,
+    limit: int = DEFAULT_BASH_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> list[BashStat]:
     return lease.call(
-        "analytics:bash_breakdown", lambda conn: _bash_breakdown(conn, limit=limit, config=config)
+        "analytics:bash_breakdown",
+        lambda conn: _bash_breakdown(conn, limit=limit, source=source, since=since, config=config),
     )
 
 
 def _bash_breakdown(
-    conn: duckdb.DuckDBPyConnection, limit: int = 100, *, config: AppConfig
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = DEFAULT_BASH_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
 ) -> list[BashStat]:
-    rows = conn.execute(
-        """
-        SELECT bash_base, bash_sub, COUNT(*) AS count, MAX(is_compound) AS is_compound
-        FROM tool_calls
-        WHERE bash_command IS NOT NULL
-        GROUP BY bash_base, bash_sub
-        ORDER BY count DESC
-        LIMIT ?
-        """,
-        [limit],
-    ).fetchall()
+    if source is None and since is None:
+        rows = conn.execute(
+            """
+            SELECT bash_base, bash_sub, COUNT(*) AS count, MAX(is_compound) AS is_compound
+            FROM tool_calls
+            WHERE bash_command IS NOT NULL
+            GROUP BY bash_base, bash_sub
+            ORDER BY count DESC, bash_base ASC NULLS LAST, bash_sub ASC NULLS LAST
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+    else:
+        cte, params = _session_filter_cte(source, since)
+        rows = conn.execute(
+            f"""
+            {cte}
+            SELECT tc.bash_base, tc.bash_sub, COUNT(*) AS count, MAX(tc.is_compound) AS is_compound
+            FROM tool_calls tc
+            JOIN filtered f ON f.id = tc.session_id
+            WHERE tc.bash_command IS NOT NULL
+            GROUP BY tc.bash_base, tc.bash_sub
+            ORDER BY count DESC, tc.bash_base ASC NULLS LAST, tc.bash_sub ASC NULLS LAST
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
     return [
         BashStat(
             bash_base=row[0],
@@ -223,74 +361,56 @@ def _bash_breakdown(
     ]
 
 
-def bash_suggestions(
+def classify_bash_suggestions(
+    stats: Sequence[BashStat],
+    *,
     high_threshold: int = 50,
     medium_threshold: int = 10,
-    *,
-    config: AppConfig | None = None,
-    conn: duckdb.DuckDBPyConnection | None = None,
 ) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
-    config = config or AppConfig.load()
-    with standalone_read_lease(config, conn) as lease:
-        return bash_suggestions_on(lease, high_threshold, medium_threshold, config=config)
-
-
-def bash_suggestions_on(
-    lease: DbLease,
-    high_threshold: int = 50,
-    medium_threshold: int = 10,
-    *,
-    config: AppConfig,
-) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
-    return lease.call(
-        "analytics:bash_suggestions",
-        lambda conn: _bash_suggestions(high_threshold, medium_threshold, config=config, conn=conn),
-    )
-
-
-def _bash_suggestions(
-    high_threshold: int = 50,
-    medium_threshold: int = 10,
-    *,
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection,
-) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
-    suggestions: list[PermissionSuggestion] = []
-    skipped: list[PermissionSkipped] = []
-    for stat in _bash_breakdown(conn, limit=500, config=config):
+    """Classify bash command breakdown rows into permission suggestions and skipped commands."""
+    suggestion_buckets: dict[str, tuple[int, bool]] = {}
+    skipped_buckets: dict[str, int] = {}
+    for stat in stats:
         base = (stat.bash_base or "").strip()
         if not base:
             continue
         pattern = _format_pattern(base, stat.bash_sub)
         if base in DANGEROUS_BASES:
-            skipped.append(
-                PermissionSkipped(pattern=pattern, count=stat.count, reason="Destructive command")
-            )
+            skipped_buckets[pattern] = skipped_buckets.get(pattern, 0) + stat.count
             continue
-        if stat.is_compound:
+        prev_count, prev_compound = suggestion_buckets.get(pattern, (0, False))
+        suggestion_buckets[pattern] = (
+            prev_count + stat.count,
+            prev_compound or stat.is_compound,
+        )
+
+    suggestions: list[PermissionSuggestion] = []
+    for pattern, (count, is_compound) in sorted(
+        suggestion_buckets.items(), key=lambda item: (-item[1][0], item[0])
+    ):
+        if is_compound:
             suggestions.append(
                 PermissionSuggestion(
                     pattern=pattern,
-                    count=stat.count,
+                    count=count,
                     confidence="review",
                     reason="Contains compound operators",
                 )
             )
-            continue
-        if stat.count >= high_threshold:
+        elif count >= high_threshold:
             suggestions.append(
                 PermissionSuggestion(
                     pattern=pattern,
-                    count=stat.count,
+                    count=count,
                     confidence="high",
                     reason="No dangerous patterns detected",
                 )
             )
-        elif stat.count >= medium_threshold:
+        elif count >= medium_threshold:
             suggestions.append(
                 PermissionSuggestion(
                     pattern=pattern,
-                    count=stat.count,
+                    count=count,
                     confidence="medium",
                     reason="No dangerous patterns detected",
                 )
@@ -299,45 +419,145 @@ def _bash_suggestions(
             suggestions.append(
                 PermissionSuggestion(
                     pattern=pattern,
-                    count=stat.count,
+                    count=count,
                     confidence="review",
                     reason="Low usage volume",
                 )
             )
+
+    skipped = [
+        PermissionSkipped(pattern=pattern, count=count, reason="Destructive command")
+        for pattern, count in sorted(skipped_buckets.items(), key=lambda item: (-item[1], item[0]))
+    ]
     return suggestions, skipped
 
 
-def token_usage(
-    limit: int = 50,
+def bash_suggestions(
+    high_threshold: int = 50,
+    medium_threshold: int = 10,
     *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig | None = None,
+    conn: duckdb.DuckDBPyConnection | None = None,
+) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
+    config = config or AppConfig.load()
+    with standalone_read_lease(config, conn) as lease:
+        return bash_suggestions_on(
+            lease,
+            high_threshold,
+            medium_threshold,
+            source=source,
+            since=since,
+            config=config,
+        )
+
+
+def bash_suggestions_on(
+    lease: DbLease,
+    high_threshold: int = 50,
+    medium_threshold: int = 10,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
+    return lease.call(
+        "analytics:bash_suggestions",
+        lambda conn: _bash_suggestions(
+            high_threshold,
+            medium_threshold,
+            source=source,
+            since=since,
+            config=config,
+            conn=conn,
+        ),
+    )
+
+
+def _bash_suggestions(
+    high_threshold: int = 50,
+    medium_threshold: int = 10,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[list[PermissionSuggestion], list[PermissionSkipped]]:
+    stats = _bash_breakdown(
+        conn,
+        limit=DEFAULT_BASH_SUGGESTIONS_LIMIT,
+        source=source,
+        since=since,
+        config=config,
+    )
+    return classify_bash_suggestions(
+        stats,
+        high_threshold=high_threshold,
+        medium_threshold=medium_threshold,
+    )
+
+
+def token_usage(
+    limit: int = DEFAULT_TOKEN_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[TokenStat]:
     config = config or AppConfig.load()
     with standalone_read_lease(config, conn) as lease:
-        return token_usage_on(lease, limit=limit, config=config)
+        return token_usage_on(lease, limit=limit, source=source, since=since, config=config)
 
 
-def token_usage_on(lease: DbLease, limit: int = 50, *, config: AppConfig) -> list[TokenStat]:
+def token_usage_on(
+    lease: DbLease,
+    limit: int = DEFAULT_TOKEN_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
+) -> list[TokenStat]:
     return lease.call(
-        "analytics:token_usage", lambda conn: _token_usage(conn, limit=limit, config=config)
+        "analytics:token_usage",
+        lambda conn: _token_usage(conn, limit=limit, source=source, since=since, config=config),
     )
 
 
 def _token_usage(
-    conn: duckdb.DuckDBPyConnection, limit: int = 50, *, config: AppConfig
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = DEFAULT_TOKEN_STATS_LIMIT,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    config: AppConfig,
 ) -> list[TokenStat]:
+    where: list[str] = []
+    params: list[object] = []
+    join_sql = ""
+    if source is not None:
+        join_sql = "JOIN sessions s ON s.id = ss.session_id"
+        where.append("s.source = ?")
+        params.append(source.value)
+    if since is not None:
+        where.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
+        params.append(to_naive_utc(since))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT ss.git_repo, SUM(COALESCE(ss.input_tokens, 0)) AS input_tokens,
                SUM(COALESCE(ss.output_tokens, 0)) AS output_tokens
         FROM session_state ss
+        {join_sql}
+        {where_sql}
         GROUP BY ss.git_repo
         ORDER BY
-            SUM(COALESCE(ss.input_tokens, 0)) + SUM(COALESCE(ss.output_tokens, 0)) DESC
+            SUM(COALESCE(ss.input_tokens, 0)) + SUM(COALESCE(ss.output_tokens, 0)) DESC,
+            ss.git_repo ASC NULLS LAST
         LIMIT ?
         """,
-        [limit],
+        [*params, limit],
     ).fetchall()
     return [
         TokenStat(
@@ -351,8 +571,9 @@ def _token_usage(
 
 def usage_by_source(
     *,
+    source: Source | None = None,
     since: datetime | None = None,
-    limit: int = 200,
+    limit: int = DEFAULT_USAGE_STATS_LIMIT,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[UsageStat]:
@@ -363,23 +584,29 @@ def usage_by_source(
     """
     config = config or AppConfig.load()
     with standalone_read_lease(config, conn) as lease:
-        return usage_by_source_on(lease, since=since, limit=limit, config=config)
+        return usage_by_source_on(lease, source=source, since=since, limit=limit, config=config)
 
 
 def usage_by_source_on(
-    lease: DbLease, *, since: datetime | None = None, limit: int = 200, config: AppConfig
+    lease: DbLease,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+    limit: int = DEFAULT_USAGE_STATS_LIMIT,
+    config: AppConfig,
 ) -> list[UsageStat]:
     return lease.call(
         "analytics:usage_by_source",
-        lambda conn: _usage_by_source(conn, since=since, limit=limit, config=config),
+        lambda conn: _usage_by_source(conn, source=source, since=since, limit=limit, config=config),
     )
 
 
 def _usage_by_source(
     conn: duckdb.DuckDBPyConnection,
     *,
+    source: Source | None = None,
     since: datetime | None = None,
-    limit: int = 200,
+    limit: int = DEFAULT_USAGE_STATS_LIMIT,
     config: AppConfig,
 ) -> list[UsageStat]:
     has_host = _column_exists(conn, "session_state", "host")
@@ -392,9 +619,12 @@ def _usage_by_source(
         "NOT (ss.input_tokens IS NULL AND ss.output_tokens IS NULL)",
     ]
     params: list[object] = []
+    if source is not None:
+        where.append("s.source = ?")
+        params.append(source.value)
     if since is not None:
         where.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
-        params.append(since)
+        params.append(to_naive_utc(since))
     where_sql = " AND ".join(where)
     rows = conn.execute(
         f"""
@@ -411,7 +641,10 @@ def _usage_by_source(
         WHERE {where_sql}
         GROUP BY s.source, ss.model, {host_expr}
         ORDER BY
-            SUM(COALESCE(ss.input_tokens, 0)) + SUM(COALESCE(ss.output_tokens, 0)) DESC
+            SUM(COALESCE(ss.input_tokens, 0)) + SUM(COALESCE(ss.output_tokens, 0)) DESC,
+            s.source ASC NULLS LAST,
+            ss.model ASC NULLS LAST,
+            {host_expr} ASC NULLS LAST
         LIMIT ?
         """,
         [*params, limit],
@@ -535,7 +768,7 @@ def _skill_population(
     params: list[object] = list(source_values)
     if since is not None:
         time_clause = " AND COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?"
-        params.append(since)
+        params.append(to_naive_utc(since))
 
     # One row per transcript: a moved transcript is indexed once per path it
     # was seen at, and counting every row counts its history once per move.

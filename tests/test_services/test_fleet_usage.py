@@ -96,6 +96,7 @@ def test_fleet_stats_usage_stamps_inventory_name_over_sentinel(
                 "model": "gpt-5",
                 "host": "local",
                 "input_tokens": 7,
+                "cached_input_tokens": 0,
                 "output_tokens": 3,
                 "session_count": 1,
             }
