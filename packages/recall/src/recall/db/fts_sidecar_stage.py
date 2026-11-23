@@ -93,12 +93,16 @@ class KeywordStage:
         if not self._writes_intents or not rows:
             return
         ids = list(rows)
+        from recall.core.time import utcnow_naive
+
+        queued_at = utcnow_naive()
         with _registered(self._unit, "_recall_keyword_intents", kind=[kind] * len(ids), id=ids):
             self._unit.call(
                 "keyword:stage_intents",
                 lambda conn: conn.execute(
-                    "INSERT INTO fts_sidecar_pending(kind, id, op) "
-                    "SELECT kind, id, 'upsert' FROM _recall_keyword_intents"
+                    "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at) "
+                    "SELECT kind, id, 'upsert', ? FROM _recall_keyword_intents",
+                    [queued_at],
                 ).fetchall(),
             )
         for key, row in rows.items():

@@ -4581,7 +4581,9 @@ class RpcServer:
         refresh = FreshReadResult(completed=True)
 
         def read(conn: Any, *, probe: bool = False) -> Any:
-            now = datetime.now()
+            from datetime import UTC
+
+            now = datetime.now(UTC)
             session_id = (
                 resolve_session_identifier(conn, params["session"], source=source, host=host).id
                 if params.get("session") is not None
@@ -4671,10 +4673,10 @@ class RpcServer:
             raise RpcError(code=INVALID_PARAMS, message="pid must be an integer") from err
         if pid <= 0:
             raise RpcError(code=INVALID_PARAMS, message="pid must be positive")
+        from recall.core.time import utcnow_naive
+
         host = default_session_host()
-        # Naive local, the same wall clock every other timestamp in this
-        # database is stored in (see the DuckDB TIMESTAMP down-conversion).
-        marked_at = datetime.now()
+        marked_at = utcnow_naive()
 
         @self._database.unit("_write")
         def _write(conn: duckdb.DuckDBPyConnection) -> tuple[str, str, str | None]:

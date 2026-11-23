@@ -107,7 +107,9 @@ def test_storage_interruption_resumes_original_backup(
     assert status.storage_version == "v1.2.0+"
     assert status.storage_attempt >= max(1, receipt["attempt"])
     assert status.backup_path == receipt["backup_path"]
-    assert status.applied_version == 1
+    from recall.db.schema import INDEX_MIGRATION_VERSION
+
+    assert status.applied_version == INDEX_MIGRATION_VERSION
     assert status.captured == 0
     assert server._database.call(
         "fixture", lambda conn: conn.execute("SELECT value FROM owned_marker").fetchone()

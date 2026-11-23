@@ -123,11 +123,13 @@ def consistent_backup(
         with path.open("rb") as handle:
             os.fsync(handle.fileno())
     manifest = backup / "manifest.json"
+    from recall.core.time import format_utc_iso
+
     payload = json.dumps(
         {
             "kind": kind,
             "complete": True,
-            "created_at": datetime.now(UTC).isoformat(),
+            "created_at": format_utc_iso(datetime.now(UTC)),
             "files": files,
             "checksums": {path.name: _hash(path) for path in copied},
             **({"recovery": recovery_set} if recovery else {}),

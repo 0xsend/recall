@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from functools import partial
 from itertools import batched
@@ -40,6 +40,7 @@ from recall.core.models import (
 from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
+from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.tool_format import derive_tool_call_fts_text
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
@@ -1726,7 +1727,7 @@ def _load_context_recompute_groups(
     params: list[object] = []
     if since is not None:
         session_where_parts.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
-        params.append(since)
+        params.append(to_naive_utc(since))
     if only_mode is not None:
         target_exists += " AND COALESCE(target_ms.context_mode, 'off') = ?"
         params.append(only_mode)
@@ -2145,7 +2146,9 @@ class _SessionIndexedFields:
                 existing
             ):
                 assignments.append(f"{column} = ?,")
-                parameters.append(desired)
+                parameters.append(
+                    to_naive_utc(desired) if isinstance(desired, datetime) else desired
+                )
         return "\n".join(assignments), parameters
 
 
@@ -2293,12 +2296,12 @@ def _incremental_write_session(
                 file_size = ?,
                 sidecar_mtime = ?,
                 last_byte_offset = ?,
-                indexed_at = CURRENT_TIMESTAMP
+                indexed_at = ?
             WHERE session_id = ?
             """,
             [
                 *parameters,
-                session.ended_at,
+                to_naive_utc(session.ended_at) if session.ended_at is not None else None,
                 session.duration_seconds,
                 session.model,
                 session.git_branch,
@@ -2325,6 +2328,7 @@ def _incremental_write_session(
                 session.file_size if reached_end else last_byte_offset,
                 session.sidecar_mtime,
                 last_byte_offset,
+                utcnow_naive(),
                 session.id,
             ],
         )
@@ -2453,6 +2457,8 @@ def _write_tail_facts(
     session_id: str,
     tool_calls: list[ToolCall],
     tail_facts: TailFacts,
+    *,
+    update_completed_at: bool = False,
 ) -> None:
     """Persist the harness id mapping and any results it lets us pair.
 
@@ -2505,6 +2511,7 @@ def _write_tail_facts(
             for tool_result in tail_facts.tool_results
             if tool_result.tool_use_id in resolved
         ),
+        update_completed_at=update_completed_at,
     )
 
 
@@ -2642,7 +2649,13 @@ def _sync_existing_session(
         # This parse replaces the session, so positions its predecessor left
         # behind go with the messages `_delete_removed_rows` just retired.
         retire_stop_markers(conn, session.id, tail_facts.stop_markers)
-        _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+        _write_tail_facts(
+            conn,
+            session.id,
+            list(desired_tool_calls.values()),
+            tail_facts,
+            update_completed_at=True,
+        )
         _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
@@ -2874,7 +2887,6 @@ class _MessageStateUpdate(TypedDict):
     content: str | None
     thinking: str | None
     timestamp: datetime | None
-    timestamp_utc: datetime | None
     has_thinking: bool
     context_text: str
     context_mode: str
@@ -2887,7 +2899,7 @@ _MESSAGE_STATE_UPDATE_ASSIGNMENTS = (
     "role = incoming.role",
     "content = incoming.content",
     "thinking = incoming.thinking",
-    "timestamp = COALESCE(CAST(incoming.timestamp_utc AS TIMESTAMP), incoming.timestamp)",
+    "timestamp = incoming.timestamp",
     "has_thinking = incoming.has_thinking",
     "context_text = incoming.context_text",
     "context_mode = incoming.context_mode",
@@ -2967,7 +2979,6 @@ def _update_message_states(
             ("content", pa.string()),
             ("thinking", pa.string()),
             ("timestamp", pa.timestamp("us")),
-            ("timestamp_utc", pa.timestamp("us", tz="UTC")),
             ("has_thinking", pa.bool_()),
             ("context_text", pa.string()),
             ("context_mode", pa.string()),
@@ -3074,17 +3085,13 @@ def _upsert_messages(
                 )
             continue
         timestamp = message.timestamp
-        aware = timestamp is not None and timestamp.utcoffset() is not None
-        # Keep naive and aware timestamps distinct until DuckDB performs the
-        # same TIMESTAMP conversion as its per-value parameter binding.
         state_updates.append(
             {
                 "message_id": message_id,
                 "role": message.role.value,
                 "content": message.content,
                 "thinking": message.thinking,
-                "timestamp": None if aware else timestamp,
-                "timestamp_utc": timestamp if aware else None,
+                "timestamp": to_naive_utc(timestamp) if timestamp is not None else None,
                 "has_thinking": message.has_thinking,
                 "context_text": message_context_text,
                 "context_mode": message_context_mode,
@@ -3475,8 +3482,8 @@ def _session_identity_values(session: Session) -> tuple[object, ...]:
 def _session_row_values(session: Session, *, last_byte_offset: int = 0) -> tuple[object, ...]:
     return (
         session.id,
-        session.started_at,
-        session.ended_at,
+        to_naive_utc(session.started_at) if session.started_at is not None else None,
+        to_naive_utc(session.ended_at) if session.ended_at is not None else None,
         session.duration_seconds,
         session.model,
         session.cwd,
@@ -3490,7 +3497,7 @@ def _session_row_values(session: Session, *, last_byte_offset: int = 0) -> tuple
         session.file_mtime,
         session.file_size,
         last_byte_offset,
-        session.indexed_at or datetime.now(UTC),
+        to_naive_utc(session.indexed_at) if session.indexed_at is not None else utcnow_naive(),
         # Index 17 lines up with cached_input_tokens in the persisted SELECT.
         session.cached_input_tokens,
     )
@@ -3548,18 +3555,14 @@ _SESSION_CHANGE_INDICES = (*range(16), 17)
 
 
 def _normalize_timestamp_for_compare(value: object) -> object:
-    """Match a parsed timestamp to how DuckDB round-trips it, for equality.
+    """Match a parsed timestamp to how DuckDB stores it (naive UTC), for equality.
 
-    ``session_state`` timestamp columns are naive ``TIMESTAMP``: DuckDB stores a
-    timezone-aware datetime as its *local* wall-clock with ``tzinfo`` dropped, so
-    the value read back is naive-local. Parsers supply aware datetimes, so an
-    aware value must be down-converted to local-naive before comparing — otherwise
-    every real session (with a ``started_at``/``ended_at``) looks changed on a
-    non-UTC host and the no-op guard never fires. Naive datetimes round-trip
-    unchanged; non-datetimes pass through.
+    Every ``TIMESTAMP`` column stores naive UTC. Parsers supply aware datetimes,
+    so aware values normalize to naive UTC before comparing. Naive datetimes
+    are already naive UTC and pass through unchanged; non-datetimes pass through.
     """
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
+    if isinstance(value, datetime):
+        return to_naive_utc(value)
     return value
 
 

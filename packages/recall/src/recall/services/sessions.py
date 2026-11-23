@@ -9,6 +9,7 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.models import Message, Session, SessionSummary, ToolCall
+from recall.core.time import to_naive_utc
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
 from recall.db.lease import DbLease
@@ -100,7 +101,7 @@ def _list_sessions(
         params.append(source.value)
     if since is not None:
         where_parts.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
-        params.append(since)
+        params.append(to_naive_utc(since))
     if project:
         where_parts.append("ss.git_repo ILIKE ?")
         params.append(f"%{project}%")
@@ -113,7 +114,7 @@ def _list_sessions(
                ss.cwd, ss.git_repo, ss.git_branch,
                ss.model, ss.message_count, ss.tool_count, ss.input_tokens, ss.output_tokens,
                ss.is_complete, ss.host, ss.file_mtime, ss.file_size, ss.indexed_at,
-               GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP))
+               GREATEST(ss.ended_at, to_timestamp(ss.file_mtime) AT TIME ZONE 'UTC')
                  AS last_activity_at
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id

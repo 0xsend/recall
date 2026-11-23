@@ -482,11 +482,14 @@ def test_text_live_names_unreadable_transcript(
 def test_text_live_readable_transcript_keeps_output(
     monkeypatch: pytest.MonkeyPatch, current: bool, label: str
 ) -> None:
+    from recall.cli.utils import format_datetime
+
     _install_rpc(monkeypatch, {"sessions": [_current() if current else _stale()]})
     result = CliRunner().invoke(app, ["live", "--all", "--format", "text"])
     assert result.exit_code == 0, result.output
+    expected_ts = format_datetime("2026-09-08T12:00:00Z")
     assert result.stdout == (
-        "[2026-09-08 12:00] active abc123 (claude_code) /home/a/work/recall "
+        f"[{expected_ts}] active abc123 (claude_code) /home/a/work/recall "
         f"turn=working tool=Bash {label}\n"
     )
     assert result.stderr == ""

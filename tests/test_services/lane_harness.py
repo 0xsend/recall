@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,7 +34,7 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 # The newest timestamp inside the fixtures is 2026-09-07T18:00Z; every installed
 # transcript is stamped after that and inside live.idle_window (24h). A calendar
 # date here aged out of the idle roster on hosted CI the next day.
-LANE_NOW = datetime.now().replace(microsecond=0)
+LANE_NOW = datetime.now(UTC).replace(microsecond=0)
 
 # Session ids the two fixture transcripts declare.
 WATCHED_SESSION = "live-mid-tool"

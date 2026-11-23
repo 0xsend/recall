@@ -87,8 +87,10 @@ class IndexDivergenceReport:
 
     def to_payload(self) -> dict[str, Any]:
         """JSON-ready shape shared by the RPC, `daemon status`, and the CLI."""
+        from recall.core.time import format_utc_iso
+
         payload = asdict(self)
-        payload["checked_at"] = self.checked_at.isoformat()
+        payload["checked_at"] = format_utc_iso(self.checked_at)
         payload["diverged"] = [asdict(key) for key in self.diverged]
         payload["diverged_count"] = self.diverged_count
         return payload

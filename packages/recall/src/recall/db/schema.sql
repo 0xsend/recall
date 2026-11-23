@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    applied_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
 );
 
 -- schema_migrations records every applied migration (idempotent via INSERT OR IGNORE).
@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- See SPEC "Migration Policy" (REQ-MIG-003) and db/migrations/ package.
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id TEXT PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    applied_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
 );
 
 -- schema_migration_undo holds the pre-image of rows a data-mutating migration
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS schema_migration_undo (
     row_key TEXT NOT NULL,
     column_name TEXT NOT NULL,
     old_value TEXT,
-    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    recorded_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
     PRIMARY KEY (migration_id, table_name, row_key, column_name)
 );
 
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS session_state (
     -- column and must re-index once to pick up sidecar-sourced metadata.
     sidecar_mtime DOUBLE DEFAULT 0,
     last_byte_offset BIGINT DEFAULT 0,
-    indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    indexed_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
 );
 
 -- Fleet usage ledger (REQ-USAGE-016): per-inference events + log cursors.
@@ -264,14 +264,14 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     embedding FLOAT[__EMBED_DIM__] NOT NULL,
     normalization_version INTEGER NOT NULL DEFAULT 1,
     context_version INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
 );
 
 CREATE TABLE IF NOT EXISTS fts_sidecar_pending (
     kind TEXT NOT NULL,
     id TEXT NOT NULL,
     op TEXT NOT NULL,
-    queued_at TIMESTAMP NOT NULL DEFAULT now()
+    queued_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
 );
 
 CREATE TABLE IF NOT EXISTS runtime_state (

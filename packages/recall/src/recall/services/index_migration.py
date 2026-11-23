@@ -17,6 +17,7 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.core.failure_observation import FailureObserver, rollback_on_failure
+from recall.core.time import utcnow_naive
 from recall.db.connection import (
     STORAGE_VERSION,
     connect_existing_owned,
@@ -200,10 +201,10 @@ def begin_migration(
         conn.execute(
             """UPDATE index_migration_jobs
                SET phase = 'running', backup_path = ?, captured_count = ?, completed_count = 0,
-                   error = NULL, target_version = ?, started_at = CURRENT_TIMESTAMP,
+                   error = NULL, target_version = ?, started_at = ?,
                    storage_target = ?, storage_attempt = 0
                WHERE singleton""",
-            [str(backup), captured_count, INDEX_MIGRATION_VERSION, target],
+            [str(backup), captured_count, INDEX_MIGRATION_VERSION, utcnow_naive(), target],
         )
         conn.execute("COMMIT")
     return migration_status(conn)
@@ -229,9 +230,9 @@ def begin_storage_migration(
     conn.execute(
         """UPDATE index_migration_jobs SET target_version = ?, phase = 'verifying',
                backup_path = ?, captured_count = 0, completed_count = 0,
-               started_at = CURRENT_TIMESTAMP, error = NULL,
+               started_at = ?, error = NULL,
                storage_target = ?, storage_attempt = 0 WHERE singleton""",
-        [applied_version(conn), str(backup), STORAGE_VERSION],
+        [applied_version(conn), str(backup), utcnow_naive(), STORAGE_VERSION],
     )
     return migration_status(conn)
 
@@ -276,7 +277,14 @@ def perform_storage_transition_owned(config: AppConfig, *, lifetime: DbLifetime)
         )
 
 
-def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:
+def mark_captured_complete_in_tx(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:
+    """Mark one captured migration source complete inside an already-open transaction.
+
+    Refreshes ``session_state.indexed_at`` to naive UTC on the ``FALSE -> TRUE``
+    transition so even legacy sessions whose other columns hit the no-op guard
+    (e.g. timestamp-less sessions) finish version-2 migration with UTC
+    ``indexed_at`` without touching any secondary ART index.
+    """
     result = conn.execute(
         """UPDATE index_migration_scope SET completed = TRUE
            WHERE source_key = ? AND completed = FALSE
@@ -286,12 +294,30 @@ def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> 
     if result is None:
         return
     conn.execute(
+        """UPDATE session_state SET indexed_at = ?
+           WHERE session_id = (
+               SELECT session_id FROM source_files WHERE source_key = ?
+           )""",
+        [utcnow_naive(), source_key],
+    )
+    conn.execute(
         """UPDATE index_migration_jobs
            SET completed_count = (
                SELECT COUNT(*) FROM index_migration_scope WHERE completed
            )
            WHERE singleton"""
     )
+
+
+def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:
+    """Atomically mark one captured migration source complete for standalone callers."""
+    conn.execute("BEGIN")
+    try:
+        mark_captured_complete_in_tx(conn, source_key)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def verify_and_complete(
@@ -321,9 +347,14 @@ def verify_and_complete(
     conn.execute("BEGIN")
     with rollback_on_failure(observer, "index_migration", lambda: conn.execute("ROLLBACK")):
         if not storage_only:
+            completed_target = int(job["target_version"])
+            if completed_target <= 0:
+                raise RuntimeError("active index migration has no valid target version")
             conn.execute(
-                "UPDATE runtime_state SET index_migration_version = ? WHERE singleton",
-                [INDEX_MIGRATION_VERSION],
+                """UPDATE runtime_state
+                   SET index_migration_version = GREATEST(COALESCE(index_migration_version, 0), ?)
+                   WHERE singleton""",
+                [completed_target],
             )
             conn.execute("DELETE FROM index_migration_scope")
         conn.execute(

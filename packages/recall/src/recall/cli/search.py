@@ -650,7 +650,13 @@ def command(
             safe_path = sanitize_snippet(str(result["source_path"]), max_chars=1024)
             typer.echo(f"  source: {safe_path}")
         if result.get("timestamp"):
-            safe_ts = sanitize_snippet(str(result["timestamp"]), max_chars=128)
+            from recall.cli.utils import format_datetime
+
+            ts_raw = result["timestamp"]
+            formatted_ts = format_datetime(
+                ts_raw if isinstance(ts_raw, (str, type(None))) else str(ts_raw)
+            )
+            safe_ts = sanitize_snippet(formatted_ts, max_chars=128)
             typer.echo(f"  time: {safe_ts}")
         typer.echo("")
 

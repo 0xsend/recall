@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
+from recall.core.time import format_utc_iso as format_utc_iso
 from recall.core.time import parse_since
 from recall.core.types import Source, parse_source
 
@@ -20,12 +21,6 @@ class StatsFilters:
     @property
     def active(self) -> bool:
         return self.source is not None or self.since is not None
-
-
-def format_utc_iso(value: datetime) -> str:
-    """Format an aware datetime as a canonical RFC3339 UTC timestamp (`...Z`)."""
-    utc = value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
-    return utc.isoformat().replace("+00:00", "Z")
 
 
 def normalize_stats_filters(

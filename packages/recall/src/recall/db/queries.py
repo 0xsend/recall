@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from itertools import batched
 from typing import TYPE_CHECKING, Literal
 
@@ -16,6 +16,7 @@ from recall.core.config import FtsConfig
 from recall.core.failure_observation import FailureObserver, observe_failure
 from recall.core.fts_text import sql_derive_fts
 from recall.core.models import Message, Session, StopMarker, ToolCall
+from recall.core.time import to_naive_utc, utcnow_naive
 from recall.db.mutations import execute_count
 
 if TYPE_CHECKING:
@@ -324,14 +325,17 @@ def enqueue_sidecar_pending(
     ids: Iterable[str],
     op: SidecarPendingOp,
 ) -> None:
+    from recall.core.time import utcnow_naive
+
     _validate_sidecar_pending(kind, op)
-    rows = [(kind, pending_id, op) for pending_id in dict.fromkeys(ids)]
+    queued_at = utcnow_naive()
+    rows = [(kind, pending_id, op, queued_at) for pending_id in dict.fromkeys(ids)]
     if not rows:
         return
     conn.executemany(
         """
-        INSERT INTO fts_sidecar_pending(kind, id, op)
-        VALUES (?, ?, ?)
+        INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)
+        VALUES (?, ?, ?, ?)
         """,
         rows,
     )
@@ -344,11 +348,14 @@ def enqueue_session_sidecar_deletes(conn: duckdb.DuckDBPyConnection, session_id:
     parameter, so queueing a large session one bound id at a time costs
     seconds of CPU inside the writer's transaction.
     """
+    from recall.core.time import utcnow_naive
+
+    queued_at = utcnow_naive()
     for kind, table in (("message", "messages"), ("tool_call", "tool_calls")):
         conn.execute(
-            f"INSERT INTO fts_sidecar_pending(kind, id, op)"
-            f" SELECT '{kind}', id, 'delete' FROM {table} WHERE session_id = ?",
-            [session_id],
+            f"INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)"
+            f" SELECT '{kind}', id, 'delete', ? FROM {table} WHERE session_id = ?",
+            [queued_at, session_id],
         )
 
 
@@ -413,8 +420,8 @@ def insert_session(
         """,
         [
             session.id,
-            session.started_at,
-            session.ended_at,
+            to_naive_utc(session.started_at) if session.started_at is not None else None,
+            to_naive_utc(session.ended_at) if session.ended_at is not None else None,
             session.duration_seconds,
             session.model,
             session.cwd,
@@ -430,7 +437,7 @@ def insert_session(
             session.file_size,
             session.sidecar_mtime,
             last_byte_offset,
-            session.indexed_at or datetime.now(UTC),
+            to_naive_utc(session.indexed_at) if session.indexed_at is not None else utcnow_naive(),
         ],
     )
 
@@ -533,7 +540,6 @@ def insert_messages(
             ("content", pa.string()),
             ("thinking", pa.string()),
             ("timestamp", pa.timestamp("us")),
-            ("timestamp_utc", pa.timestamp("us", tz="UTC")),
             ("has_thinking", pa.bool_()),
             ("context_text", pa.string()),
             ("context_mode", pa.string()),
@@ -548,7 +554,6 @@ def insert_messages(
                 else (context_text, context_mode)
             )
             stamp = message.timestamp
-            aware = stamp is not None and stamp.utcoffset() is not None
             rows.append(
                 (
                     message.id,
@@ -558,8 +563,7 @@ def insert_messages(
                     message.role.value,
                     message.content,
                     message.thinking,
-                    None if aware else stamp,
-                    stamp if aware else None,
+                    to_naive_utc(stamp) if stamp is not None else None,
                     message.has_thinking,
                     text,
                     mode,
@@ -585,7 +589,7 @@ def insert_messages(
                     context_text, context_mode, fts_content, fts_thinking
                 )
                 SELECT id, role, content, thinking,
-                    COALESCE(CAST(timestamp_utc AS TIMESTAMP), timestamp), has_thinking,
+                    timestamp, has_thinking,
                     context_text, context_mode,
                     {sql_derive_fts("context_text", "content")},
                     {sql_derive_fts("context_text", "thinking")}
@@ -720,35 +724,56 @@ def insert_tool_use_ids(
 def insert_tool_results(
     conn: duckdb.DuckDBPyConnection,
     rows: Iterable[tuple[str, str, bool, datetime | None]],
+    *,
+    update_completed_at: bool = False,
 ) -> None:
     """Record tool results against their recall tool_call id (REQ-LIVE-006).
 
-    Insert-only for the same reason as the mapping above: a result that is
-    already stored is the same result, and re-presenting it must be a no-op.
+    Ordinary/suffix writes stay insert-only (`INSERT OR IGNORE`) so first-wins
+    semantics hold across append batches. Full reparses pass
+    `update_completed_at=True`: the batch is first-wins deduplicated in Python
+    and an existing row updates ONLY `completed_at` when distinct (so version-2
+    UTC migration repairs historical timestamps without overwriting result
+    content or churning unchanged rows, REQ-INDEX-017).
     """
     import pyarrow as pa
 
-    def split_timestamps() -> Iterable[Sequence[object]]:
+    def normalized_rows() -> Iterable[Sequence[object]]:
+        seen: set[str] | None = set() if update_completed_at else None
         for tool_id, summary, is_error, stamp in rows:
-            aware = stamp is not None and stamp.utcoffset() is not None
-            yield (tool_id, summary, is_error, None if aware else stamp, stamp if aware else None)
+            if seen is not None:
+                if tool_id in seen:
+                    continue
+                seen.add(tool_id)
+            yield (
+                tool_id,
+                summary,
+                is_error,
+                to_naive_utc(stamp) if stamp is not None else None,
+            )
 
+    sql = (
+        "INSERT INTO tool_results (tool_call_id, result_summary, is_error, completed_at) "
+        "SELECT tool_call_id, result_summary, is_error, completed_at FROM _recall_insert_rows "
+        "ON CONFLICT (tool_call_id) DO UPDATE SET completed_at = excluded.completed_at "
+        "WHERE tool_results.completed_at IS DISTINCT FROM excluded.completed_at"
+        if update_completed_at
+        else "INSERT OR IGNORE INTO tool_results "
+        "(tool_call_id, result_summary, is_error, completed_at) "
+        "SELECT tool_call_id, result_summary, is_error, completed_at FROM _recall_insert_rows"
+    )
     _insert_arrow_rows(
         conn,
-        split_timestamps(),
+        normalized_rows(),
         pa.schema(
             [
                 ("tool_call_id", pa.string()),
                 ("result_summary", pa.string()),
                 ("is_error", pa.bool_()),
                 ("completed_at", pa.timestamp("us")),
-                ("completed_at_utc", pa.timestamp("us", tz="UTC")),
             ]
         ),
-        "INSERT OR IGNORE INTO tool_results "
-        "(tool_call_id, result_summary, is_error, completed_at) "
-        "SELECT tool_call_id, result_summary, is_error, "
-        "COALESCE(CAST(completed_at_utc AS TIMESTAMP), completed_at) FROM _recall_insert_rows",
+        sql,
     )
 
 

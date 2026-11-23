@@ -23,6 +23,7 @@ import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.source_path import SourcePath
+from recall.core.time import to_naive_utc, to_utc
 from recall.core.transcripts import transcript_file
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate, path_set_relation
@@ -544,7 +545,7 @@ def derive_liveness(
         return Liveness.ENDED
     if last_activity_at is None:
         return Liveness.UNKNOWN
-    if (now - last_activity_at).total_seconds() <= idle_window_seconds:
+    if (to_naive_utc(now) - to_naive_utc(last_activity_at)).total_seconds() <= idle_window_seconds:
         return Liveness.IDLE
     return Liveness.UNKNOWN
 
@@ -1162,8 +1163,8 @@ def live_roster_query(
     watched_relation, watched_binding = path_set_relation(watched_paths.paths, parameter="$watched")
     params: dict[str, object] = {
         "watched": watched_binding,
-        "active_cutoff": now.timestamp() - active_window_seconds,
-        "idle_cutoff": now - timedelta(seconds=idle_window_seconds),
+        "active_cutoff": to_utc(now).timestamp() - active_window_seconds,
+        "idle_cutoff": to_naive_utc(now) - timedelta(seconds=idle_window_seconds),
         "include_idle": include_idle,
         "source": source,
         "project": f"%{project}%" if project else None,
@@ -1176,8 +1177,8 @@ def live_roster_query(
             SELECT s.id, s.source, s.source_path, s.source_session_id,
                    ss.cwd, ss.git_repo, ss.git_branch, ss.model, ss.host,
                    ss.file_mtime, ss.file_size,
-                   GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP),
-                            CAST(to_timestamp(sf.mtime_ns / 1e9) AS TIMESTAMP))
+                   GREATEST(ss.ended_at, to_timestamp(ss.file_mtime) AT TIME ZONE 'UTC',
+                            to_timestamp(sf.mtime_ns / 1e9) AT TIME ZONE 'UTC')
                        AS last_activity_at,
                    lm.pid,
                    (s.source_path IN (SELECT source_path FROM watched)
@@ -1190,7 +1191,7 @@ def live_roster_query(
             UNION ALL
             SELECT NULL, sf.source, sf.source_path, NULL, NULL, NULL, NULL, NULL, NULL,
                    sf.mtime_ns / 1e9, sf.size,
-                   CAST(to_timestamp(sf.mtime_ns / 1e9) AS TIMESTAMP), NULL,
+                   to_timestamp(sf.mtime_ns / 1e9) AT TIME ZONE 'UTC', NULL,
                    (sf.source_path IN (SELECT source_path FROM watched)
                     OR sf.mtime_ns / 1e9 >= $active_cutoff)
             FROM source_files sf WHERE NOT sf.missing

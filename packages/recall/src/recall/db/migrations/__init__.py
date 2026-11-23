@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import duckdb
 
+from recall.core.time import utcnow_naive
 from recall.db.lease import DbLease, StandaloneLifetime
 
 logger = logging.getLogger("recall.schema")
@@ -76,6 +77,29 @@ def table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
     return bool(row and row[0])
 
 
+def record_migration_audit(conn: duckdb.DuckDBPyConnection, migration_id: str) -> None:
+    """Record a migration in ``schema_migrations`` with naive-UTC ``applied_at`` when present."""
+    has_applied_at = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = 'main'
+          AND table_name = 'schema_migrations'
+          AND column_name = 'applied_at'
+        """
+    ).fetchone()
+    if has_applied_at and has_applied_at[0]:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+            [migration_id, utcnow_naive()],
+        )
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
+            [migration_id],
+        )
+
+
 # Auto-discover and import all 00NN_*.py modules when this package is loaded.
 # This populates _MIGRATIONS without explicit imports in schema.py.
 def _discover_migrations() -> None:
@@ -94,7 +118,7 @@ def _ensure_migrations_table(conn: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
             migration_id TEXT PRIMARY KEY,
-            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            applied_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
         )
         """
     )
@@ -158,10 +182,7 @@ def run_pending_migrations_on(lease: DbLease, current_version: int) -> None:
         elif success:
             lease.call(
                 f"migration_audit:{m.id}",
-                lambda conn, m=m: conn.execute(
-                    "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
-                    [m.id],
-                ).fetchone(),
+                lambda conn, m=m: record_migration_audit(conn, m.id),
             )
             logger.info("Migration %s applied successfully", m.id)
         else:

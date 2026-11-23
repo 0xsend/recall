@@ -23,6 +23,8 @@ def db_with_sessions(tmp_path):
     conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
 
+    from recall.core.time import to_naive_utc
+
     now = datetime.now(UTC)
 
     # Session A: started 3h ago, ended 10min ago (recently active)
@@ -35,7 +37,16 @@ def db_with_sessions(tmp_path):
            (session_id, started_at, ended_at, message_count, tool_count,
             is_complete, file_mtime, file_size)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ["sess_a", now - timedelta(hours=3), now - timedelta(minutes=10), 50, 20, True, 0.0, 100],
+        [
+            "sess_a",
+            to_naive_utc(now - timedelta(hours=3)),
+            to_naive_utc(now - timedelta(minutes=10)),
+            50,
+            20,
+            True,
+            0.0,
+            100,
+        ],
     )
 
     # Session B: started 30min ago, ended 20min ago
@@ -48,7 +59,16 @@ def db_with_sessions(tmp_path):
            (session_id, started_at, ended_at, message_count, tool_count,
             is_complete, file_mtime, file_size)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ["sess_b", now - timedelta(minutes=30), now - timedelta(minutes=20), 10, 5, True, 0.0, 100],
+        [
+            "sess_b",
+            to_naive_utc(now - timedelta(minutes=30)),
+            to_naive_utc(now - timedelta(minutes=20)),
+            10,
+            5,
+            True,
+            0.0,
+            100,
+        ],
     )
 
     # Session C: started 5h ago, ended 4h ago (old)
@@ -61,7 +81,16 @@ def db_with_sessions(tmp_path):
            (session_id, started_at, ended_at, message_count, tool_count,
             is_complete, file_mtime, file_size)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ["sess_c", now - timedelta(hours=5), now - timedelta(hours=4), 5, 2, True, 0.0, 100],
+        [
+            "sess_c",
+            to_naive_utc(now - timedelta(hours=5)),
+            to_naive_utc(now - timedelta(hours=4)),
+            5,
+            2,
+            True,
+            0.0,
+            100,
+        ],
     )
 
     conn.execute("CHECKPOINT")
@@ -104,6 +133,8 @@ def test_since_with_no_ended_at_falls_back_to_started_at(tmp_path):
     db_path = tmp_path / "recall.duckdb"
     conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
+    from recall.core.time import to_naive_utc
+
     now = datetime.now(UTC)
 
     # In-progress session, started 30min ago, no ended_at
@@ -116,7 +147,7 @@ def test_since_with_no_ended_at_falls_back_to_started_at(tmp_path):
            (session_id, started_at, ended_at, message_count, tool_count,
             is_complete, file_mtime, file_size)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ["sess_active", now - timedelta(minutes=30), None, 10, 5, False, 0.0, 100],
+        ["sess_active", to_naive_utc(now - timedelta(minutes=30)), None, 10, 5, False, 0.0, 100],
     )
     conn.execute("CHECKPOINT")
     conn.close()

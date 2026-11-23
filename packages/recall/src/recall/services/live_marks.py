@@ -35,6 +35,8 @@ def upsert_live_mark(
     transcript, and each firing carries a *new* pid. The mark is the current
     fact about the session, not a log of them, so the latest write wins.
     """
+    from recall.core.time import to_naive_utc
+
     conn.execute(
         """
         INSERT INTO live_marks (source, source_session_id, host, pid, marked_at)
@@ -43,7 +45,7 @@ def upsert_live_mark(
             pid = excluded.pid,
             marked_at = excluded.marked_at
         """,
-        [source, source_session_id, host, pid, marked_at],
+        [source, source_session_id, host, pid, to_naive_utc(marked_at)],
     )
 
 

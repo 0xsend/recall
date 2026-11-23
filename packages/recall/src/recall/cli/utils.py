@@ -11,11 +11,12 @@ import typer
 from pydantic import BaseModel
 
 from recall.core.host_text import format_host as format_host
+from recall.core.time import format_utc_iso, to_utc
 
 
 def json_default(value: Any):
     if isinstance(value, datetime):
-        return value.isoformat()
+        return format_utc_iso(value)
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, BaseModel):
@@ -34,11 +35,11 @@ def format_datetime(value: datetime | str | None) -> str:
         return "unknown"
     if isinstance(value, str):
         try:
-            dt = datetime.fromisoformat(value)
-            return dt.strftime("%Y-%m-%d %H:%M")
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return value
-    return value.strftime("%Y-%m-%d %H:%M")
+        return to_utc(dt).astimezone().strftime("%Y-%m-%d %H:%M")
+    return to_utc(value).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def source_unreadable_note(session: dict[str, Any]) -> str | None:

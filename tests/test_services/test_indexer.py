@@ -296,7 +296,7 @@ def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
 
 @pytest.mark.parametrize(
     ("connection_zone", "stored_hour"),
-    [("UTC", 9), ("Europe/Berlin", 10)],
+    [("UTC", 9), ("Europe/Berlin", 9)],
 )
 def test_aware_timestamp_update_uses_the_connection_timezone(
     tmp_path: Path,
@@ -1285,12 +1285,13 @@ def _insert_recompute_fixture(
 
 
 def test_recompute_context_rewrites_message_rows_and_embeddings_only() -> None:
+    from recall.core.time import utcnow_naive
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     _insert_recompute_fixture(
         conn,
         session_id="session-recall",
@@ -1373,12 +1374,13 @@ def test_recompute_context_rewrites_message_rows_and_embeddings_only() -> None:
 
 
 def test_recompute_context_filters_since_and_only_mode() -> None:
+    from recall.core.time import utcnow_naive
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     _insert_recompute_fixture(
         conn,
         session_id="recent-off",
@@ -1437,12 +1439,13 @@ def test_recompute_context_filters_since_and_only_mode() -> None:
 def test_recompute_uses_full_session_history_for_selected_targets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from recall.core.time import utcnow_naive
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     conn.execute(
         "INSERT INTO sessions (id, source, source_path, source_session_id) VALUES (?, ?, ?, ?)",
         ["recompute-session", "codex", "/tmp/recompute.jsonl", None],
@@ -1536,6 +1539,7 @@ def test_recompute_uses_full_session_history_for_selected_targets(
 
 
 def test_recompute_context_improves_keyword_rank_for_repo_name() -> None:
+    from recall.core.time import utcnow_naive
     from recall.db.queries import create_fts_indexes
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
@@ -1543,7 +1547,7 @@ def test_recompute_context_improves_keyword_rank_for_repo_name() -> None:
 
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     _insert_recompute_fixture(
         conn,
         session_id="session-recall",
@@ -2015,9 +2019,11 @@ def test_recompute_context_batches_codex_context(tmp_path: Path) -> None:
     from recall.services.indexer import recompute_context_for_rows
 
     executable, log_path = _write_batch_codex_stub(tmp_path)
+    from recall.core.time import utcnow_naive
+
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     conn.execute(
         "INSERT INTO sessions (id, source, source_path, source_session_id) VALUES (?, ?, ?, ?)",
         ["recompute-codex-batch", "codex", "/tmp/recompute-codex-batch.jsonl", None],
@@ -2866,7 +2872,7 @@ def test_rewrite_removes_empty_processed_marker_when_embedding_input_changes() -
 
 
 @pytest.mark.parametrize("existing", [False, True])
-@pytest.mark.parametrize("zone, stored_aware_hour", [("UTC", 9), ("Europe/Berlin", 10)])
+@pytest.mark.parametrize("zone, stored_aware_hour", [("UTC", 9), ("Europe/Berlin", 9)])
 def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
     existing: bool, zone: str, stored_aware_hour: int
 ) -> None:

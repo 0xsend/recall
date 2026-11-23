@@ -63,6 +63,22 @@ def utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def to_utc(value: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC.
+
+    Aware inputs are converted to UTC; naive inputs are assumed already-UTC
+    (the invariant for all DuckDB TIMESTAMP columns and internal timestamps).
+    """
+    if value.tzinfo is not None:
+        return value.astimezone(UTC)
+    return value.replace(tzinfo=UTC)
+
+
+def format_utc_iso(value: datetime) -> str:
+    """Format a datetime as canonical RFC3339 UTC (`...Z`)."""
+    return to_utc(value).isoformat().replace("+00:00", "Z")
+
+
 def to_naive_utc(value: datetime) -> datetime:
     """Normalize a datetime to naive UTC for DuckDB TIMESTAMP storage.
 
@@ -70,6 +86,4 @@ def to_naive_utc(value: datetime) -> datetime:
     way tzinfo is stripped so the value stores verbatim — see ``utcnow_naive`` for
     why aware datetimes must never reach a naive TIMESTAMP column.
     """
-    if value.tzinfo is not None:
-        value = value.astimezone(UTC)
-    return value.replace(tzinfo=None)
+    return to_utc(value).replace(tzinfo=None)

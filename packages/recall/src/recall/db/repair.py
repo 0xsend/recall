@@ -323,11 +323,11 @@ def initialize_repair_in(transaction: TransactionCapability) -> None:
             "INSERT OR IGNORE INTO daemon_index_repair (singleton) VALUES (TRUE)"
         ).fetchone(),
     )
+    from recall.db.migrations import record_migration_audit
+
     transaction.call(
         "repair:audit",
-        lambda conn: conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
-        ).fetchone(),
+        lambda conn: record_migration_audit(conn, MIGRATION_ID),
     )
 
 

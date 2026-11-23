@@ -16,7 +16,7 @@ from recall.core.embeddings import EmbeddingBackend
 from recall.core.fts_text import sql_is_non_blank
 from recall.core.read_cancellation import check_read_cancelled
 from recall.core.snippets import build_search_snippet
-from recall.core.time import to_naive_utc
+from recall.core.time import format_utc_iso, to_naive_utc
 from recall.core.types import UNATTRIBUTED_HOST, Role, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, load_fts_extension
 from recall.db.fts_sidecar import (
@@ -1110,7 +1110,11 @@ def _vector_search_messages(
             role=row[2],
             content=row[3],
             thinking=row[4],
-            timestamp=str(row[5]) if row[5] is not None else None,
+            timestamp=(
+                format_utc_iso(row[5])
+                if isinstance(row[5], datetime)
+                else (str(row[5]) if row[5] is not None else None)
+            ),
             tool_name=None,
             bash_command=None,
         )
@@ -1380,7 +1384,11 @@ def _search_messages(
             role=row[2],
             content=row[3],
             thinking=row[4],
-            timestamp=str(row[5]) if row[5] is not None else None,
+            timestamp=(
+                format_utc_iso(row[5])
+                if isinstance(row[5], datetime)
+                else (str(row[5]) if row[5] is not None else None)
+            ),
             tool_name=None,
             bash_command=None,
         )
@@ -1727,7 +1735,11 @@ def _hydrate_message_sidecar_hits(
             role=row[2],
             content=row[3],
             thinking=row[4],
-            timestamp=str(row[5]) if row[5] is not None else None,
+            timestamp=(
+                format_utc_iso(row[5])
+                if isinstance(row[5], datetime)
+                else (str(row[5]) if row[5] is not None else None)
+            ),
             tool_name=None,
             bash_command=None,
         )
