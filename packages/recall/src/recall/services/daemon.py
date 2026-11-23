@@ -50,11 +50,15 @@ from recall.db import (
 from recall.db.fts_sidecar import (
     KEYWORD_SYNC_LOCK_WAIT_S,
     KeywordIndexFailure,
+    complete_rescope,
     fts_fields_signature,
     get_fts_fields_signature,
+    get_rescope_in_progress,
     initialize_sidecar,
     is_lock_contention,
+    rescope_kinds_needed,
     set_fts_fields_signature,
+    set_rescope_in_progress,
 )
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.ownership import DatabaseOwnershipBusyError, SnapshotUnavailable, read_offline
@@ -822,23 +826,29 @@ def _rescope_sidecar_fields_if_needed(
 ) -> None:
     current_signature = fts_fields_signature(fts_fields)
     stored_signature = get_fts_fields_signature(sidecar_conn)
-    if stored_signature == current_signature:
+    in_progress = get_rescope_in_progress(sidecar_conn)
+    if stored_signature == current_signature and not in_progress:
         return
 
-    if stored_signature is None and not sidecar_existed:
+    if stored_signature is None and not sidecar_existed and not in_progress:
         set_fts_fields_signature(sidecar_conn, fts_fields)
         return
 
+    kinds = rescope_kinds_needed(stored_signature, fts_fields, in_progress=in_progress)
+    set_rescope_in_progress(sidecar_conn, kinds)
     stats = rescope_sidecar_for_fields_on(
         lease,
         sidecar_conn,
         fts_fields=fts_fields,
+        kinds=kinds,
     )
-    set_fts_fields_signature(sidecar_conn, fts_fields)
+    complete_rescope(sidecar_conn, fts_fields)
     logger.info(
-        "FTS sidecar field scope changed from %r to %r; rewrote %d messages and %d tool calls",
+        "FTS sidecar field scope changed from %r to %r (kinds=%s); "
+        "rewrote %d messages and %d tool calls",
         stored_signature,
         current_signature,
+        ",".join(sorted(kinds)),
         stats.messages_rewritten,
         stats.tool_calls_rewritten,
     )

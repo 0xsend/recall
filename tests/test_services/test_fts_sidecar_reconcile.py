@@ -99,7 +99,7 @@ def test_reconcile_backfills_orphans(tmp_path: Path) -> None:
         duckdb_conn.close()
 
 
-def test_reconcile_skips_tool_calls_with_null_bash_command(tmp_path: Path) -> None:
+def test_reconcile_indexes_tool_calls_with_null_bash_command(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema()
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
@@ -107,8 +107,8 @@ def test_reconcile_skips_tool_calls_with_null_bash_command(tmp_path: Path) -> No
 
         stats = reconcile_sidecar(duckdb_conn, sidecar_conn, batch_size=2)
 
-        assert _tool_call_ids(sidecar_conn) == ["tc-000", "tc-002", "tc-004"]
-        assert stats.orphans_backfilled["tool_call"] == 3
+        assert _tool_call_ids(sidecar_conn) == ["tc-000", "tc-001", "tc-002", "tc-003", "tc-004"]
+        assert stats.orphans_backfilled["tool_call"] == 5
     finally:
         sidecar_conn.close()
         duckdb_conn.close()
@@ -277,8 +277,7 @@ def test_reconcile_large_existing_documents_with_bounded_memory(tmp_path: Path, 
                 upsert_tool_call_fts_batch(sidecar, batch)
             conn.execute(
                 """INSERT INTO tool_calls (id, session_id, idx, tool_name, bash_command)
-                   VALUES ('missing', 'session', 2048, 'bash', 'echo restored'),
-                          ('ghost', 'session', 2049, 'Read', NULL)"""
+                   VALUES ('missing', 'session', 2048, 'bash', 'echo restored')"""
             )
             upsert_tool_call_fts(sidecar, "ghost", "obsolete")
         conn.close()
@@ -465,7 +464,7 @@ def test_pending_repair_preserves_mixed_page_order_and_payloads(
             assert _message_ids(sidecar) == sorted(
                 ["shared", "empty", "unrelated", *[f"bulk-{i}" for i in range(260)]]
             )
-            assert _tool_call_ids(sidecar) == (["shared"] if fields is None else [])
+            assert _tool_call_ids(sidecar) == (["shared", "tc-001"] if fields is None else [])
             assert _matches(sidecar, "message_fts", "obsolete") == []
             assert _matches(sidecar, "tool_calls_fts", "obsolete") == []
             assert _matches(sidecar, "message_fts", "preserved") == ["unrelated"]

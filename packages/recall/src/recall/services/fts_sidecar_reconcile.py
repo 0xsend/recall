@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -10,6 +11,11 @@ import duckdb
 
 from recall.core.failure_observation import FailureObserver
 from recall.core.fts_text import sql_derive_fts
+from recall.core.tool_format import (
+    TOOL_INPUT_MAX_PARSE_BYTES,
+    TOOL_NAME_TRIM_CHARS,
+    derive_tool_call_fts_text,
+)
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     KeywordIndexFailure,
@@ -35,6 +41,9 @@ _UPSERT_OP = "upsert"
 _DELETE_OP = "delete"
 _DEFAULT_RECONCILE_BATCH_SIZE = 10_000
 _MAX_BATCH_SIZE = 10_000
+_TOOL_PAYLOAD_PAGE_MAX_BYTES = 16 * 1024 * 1024
+_TOOL_ID_LOOKUP_CHUNK = 500
+_ALL_RESCOPE_KINDS = frozenset({_MESSAGE_KIND, _TOOL_CALL_KIND})
 
 _ReconcileKind = Literal["message", "tool_call"]
 
@@ -51,6 +60,15 @@ class ReconcileStats:
 class RescopeStats:
     messages_rewritten: int
     tool_calls_rewritten: int
+
+
+@dataclass(frozen=True)
+class _PendingEntry:
+    rowid: int
+    kind: str
+    entity_id: str
+    op: str
+    queued_at: datetime
 
 
 @dataclass(frozen=True)
@@ -140,9 +158,11 @@ def _repair_pending_batch(
     """
     if not 1 <= limit <= 256:
         raise ValueError("pending repair limit must be between 1 and 256")
-    rows = _fetch_pending_rows_after(
+    entries = _fetch_pending_entries_after(
         duckdb_conn, cursor[0] if cursor else None, cursor[1] if cursor else -1, limit
     )
+    page_entries = next(_partition_pending_entries(duckdb_conn, entries), [])
+    rows = _hydrate_pending_entries(duckdb_conn, page_entries)
     applied: list[int] = []
     error = None
     try:
@@ -162,7 +182,8 @@ def _repair_pending_batch(
             error = f"{row.kind} {row.op} {row.entity_id}: {failure}"
             logger.warning("pending keyword repair failed: %s", error)
     _delete_pending_rowids(duckdb_conn, applied, batch_size=limit)
-    next_cursor = (rows[-1].queued_at, rows[-1].rowid) if len(rows) == limit else None
+    has_more = len(page_entries) < len(entries) or len(entries) == limit
+    next_cursor = (rows[-1].queued_at, rows[-1].rowid) if (rows and has_more) else None
     return PendingRepair(next_cursor, len(rows), len(applied), pending_count(duckdb_conn), error)
 
 
@@ -266,10 +287,15 @@ def rescope_sidecar_for_fields(
     *,
     fts_fields: tuple[str, ...] | None,
     batch_size: int = 10000,
+    kinds: frozenset[str] | None = None,
 ) -> RescopeStats:
     with StandaloneLifetime().lease(duckdb_conn) as lease:
         return rescope_sidecar_for_fields_on(
-            lease, sidecar_conn=sidecar_conn, fts_fields=fts_fields, batch_size=batch_size
+            lease,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+            kinds=kinds,
         )
 
 
@@ -279,6 +305,7 @@ def rescope_sidecar_for_fields_on(
     *,
     fts_fields: tuple[str, ...] | None,
     batch_size: int = 10000,
+    kinds: frozenset[str] | None = None,
 ) -> RescopeStats:
     return lease.call(
         "rescope_sidecar_for_fields",
@@ -288,6 +315,7 @@ def rescope_sidecar_for_fields_on(
             sidecar_conn=sidecar_conn,
             fts_fields=fts_fields,
             batch_size=batch_size,
+            kinds=kinds,
         ),
     )
 
@@ -299,6 +327,7 @@ def _rescope_sidecar_for_fields(
     *,
     fts_fields: tuple[str, ...] | None,
     batch_size: int = 10000,
+    kinds: frozenset[str] | None = None,
 ) -> RescopeStats:
     """Rewrite sidecar FTS rows so existing indexed content matches `fts_fields`.
 
@@ -308,17 +337,26 @@ def _rescope_sidecar_for_fields(
     if batch_size <= 0 or batch_size > _MAX_BATCH_SIZE:
         raise ValueError("batch_size must be between 1 and 10_000")
 
-    messages_rewritten = _rescope_message_rows(
-        duckdb_conn,
-        sidecar_conn,
-        fts_fields=fts_fields,
-        batch_size=batch_size,
+    target_kinds = _ALL_RESCOPE_KINDS if kinds is None else kinds
+    messages_rewritten = (
+        _rescope_message_rows(
+            duckdb_conn,
+            sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+        )
+        if _MESSAGE_KIND in target_kinds
+        else 0
     )
-    tool_calls_rewritten = _rescope_tool_call_rows(
-        duckdb_conn,
-        sidecar_conn,
-        fts_fields=fts_fields,
-        batch_size=batch_size,
+    tool_calls_rewritten = (
+        _rescope_tool_call_rows(
+            duckdb_conn,
+            sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+        )
+        if _TOOL_CALL_KIND in target_kinds
+        else 0
     )
     return RescopeStats(
         messages_rewritten=messages_rewritten,
@@ -369,6 +407,277 @@ def _rescope_message_rows(
         last_id = str(batch[-1][0])
 
 
+def _partition_by_byte_budget(
+    id_sizes: Sequence[tuple[object, object]],
+    max_bytes: int,
+) -> Iterator[list[str]]:
+    """Split `(id, payload_bytes)` into sub-chunks within `max_bytes` (always advancing >= 1).
+
+    # WAIVER(bounded-chunk-memory): A single pre-existing bash_command larger than
+    # _TOOL_PAYLOAD_PAGE_MAX_BYTES (16 MiB) is isolated as its own 1-row batch rather
+    # than truncated or dropped, because SQLite FTS5 requires the full document in one
+    # bind parameter and capping bash_command would alter historical content_fingerprint
+    # hashes. Permanent — SQLite FTS5 has no chunked document insert and Scenario 3
+    # requires preserving existing Bash fingerprints verbatim. Non-bash tool_input rows
+    # are capped at TOOL_INPUT_MAX_PARSE_BYTES (4 MiB) in SQL so every non-bash chunk
+    # and every multi-row chunk stays strictly <= max_bytes.
+    """
+    chunk: list[str] = []
+    used = 0
+    for raw_id, raw_size in id_sizes:
+        item_id = str(raw_id)
+        item_bytes = max(0, raw_size) if isinstance(raw_size, int) else 0
+        if chunk and used + item_bytes > max_bytes:
+            yield chunk
+            chunk = [item_id]
+            used = item_bytes
+        else:
+            chunk.append(item_id)
+            used += item_bytes
+    if chunk:
+        yield chunk
+
+
+# Longest special-dispatch tool name in `core.tool_format` (`invoke_subagent` is 15 chars);
+# bounding the SQL projection of `tool_name` prevents pathological multi-MiB names from
+# crossing DuckDB into Python while preserving exact formatter dispatch semantics.
+_TOOL_NAME_DISPATCH_MAX_BYTES = 64
+
+
+def _fetch_tool_call_fts_chunk(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    tool_call_ids: Sequence[str],
+) -> dict[str, str]:
+    if not tool_call_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in tool_call_ids)
+    rows = duckdb_conn.execute(
+        f"""
+        SELECT
+            id,
+            CASE
+                WHEN bash_command IS NOT NULL THEN NULL
+                WHEN COALESCE(strlen(trim(tool_name, ?)), 0) > ? THEN ''
+                ELSE trim(tool_name, ?)
+            END,
+            CASE
+                WHEN bash_command IS NOT NULL THEN NULL
+                WHEN COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) > ? THEN NULL
+                ELSE tool_input
+            END,
+            bash_command
+        FROM tool_calls
+        WHERE id IN ({placeholders})
+        """,
+        [
+            TOOL_NAME_TRIM_CHARS,
+            _TOOL_NAME_DISPATCH_MAX_BYTES,
+            TOOL_NAME_TRIM_CHARS,
+            TOOL_INPUT_MAX_PARSE_BYTES,
+            *tool_call_ids,
+        ],
+    ).fetchall()
+    return {
+        str(tc_id): derive_tool_call_fts_text(
+            None if tool_name is None else str(tool_name),
+            None if tool_input is None else str(tool_input),
+            None if bash_command is None else str(bash_command),
+        )
+        for tc_id, tool_name, tool_input, bash_command in rows
+    }
+
+
+def _measure_tool_call_payload_bytes(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    tool_call_ids: Sequence[str],
+) -> dict[str, int]:
+    unique_ids = list(dict.fromkeys(str(tc_id) for tc_id in tool_call_ids))
+    if not unique_ids:
+        return {}
+    sizes: dict[str, int] = {}
+    for lookup_chunk in _chunks(unique_ids, _TOOL_ID_LOOKUP_CHUNK):
+        placeholders = ", ".join("?" for _ in lookup_chunk)
+        for tc_id, payload_bytes in duckdb_conn.execute(
+            f"""
+            SELECT
+                id,
+                CASE
+                    WHEN bash_command IS NOT NULL THEN COALESCE(strlen(bash_command), 0)
+                    ELSE (
+                        CASE
+                            WHEN COALESCE(strlen(trim(tool_name, ?)), 0) > ? THEN 0
+                            ELSE COALESCE(strlen(trim(tool_name, ?)), 0)
+                        END
+                        + CASE
+                            WHEN COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) > ? THEN 0
+                            ELSE COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0)
+                        END
+                    )
+                END AS payload_bytes
+            FROM tool_calls
+            WHERE id IN ({placeholders})
+            """,
+            [
+                TOOL_NAME_TRIM_CHARS,
+                _TOOL_NAME_DISPATCH_MAX_BYTES,
+                TOOL_NAME_TRIM_CHARS,
+                TOOL_INPUT_MAX_PARSE_BYTES,
+                *lookup_chunk,
+            ],
+        ).fetchall():
+            sizes[str(tc_id)] = max(0, int(payload_bytes or 0))
+    return sizes
+
+
+def _measure_message_payload_bytes(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    message_ids: Sequence[str],
+) -> dict[str, int]:
+    unique_ids = list(dict.fromkeys(str(message_id) for message_id in message_ids))
+    if not unique_ids:
+        return {}
+    sizes: dict[str, int] = {}
+    for lookup_chunk in _chunks(unique_ids, _TOOL_ID_LOOKUP_CHUNK):
+        placeholders = ", ".join("?" for _ in lookup_chunk)
+        for message_id, payload_bytes in duckdb_conn.execute(
+            f"""
+            SELECT
+                message_id,
+                COALESCE(strlen(context_text), 0)
+                + COALESCE(strlen(content), 0)
+                + COALESCE(strlen(thinking), 0) AS payload_bytes
+            FROM message_state
+            WHERE message_id IN ({placeholders})
+            """,
+            lookup_chunk,
+        ).fetchall():
+            sizes[str(message_id)] = max(0, int(payload_bytes or 0))
+    return sizes
+
+
+def iter_tool_call_fts_chunks_for_ids(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    tool_call_ids: Sequence[str],
+    *,
+    max_bytes: int | None = None,
+) -> Iterator[list[tuple[str, str]]]:
+    """Stream derived tool-call FTS text in byte-bounded chunks without retaining prior chunks."""
+    limit_bytes = _TOOL_PAYLOAD_PAGE_MAX_BYTES if max_bytes is None else max_bytes
+    unique_ids = list(dict.fromkeys(str(tc_id) for tc_id in tool_call_ids))
+    if not unique_ids:
+        return
+    sizes = _measure_tool_call_payload_bytes(duckdb_conn, unique_ids)
+    ordered_sizes = [(tc_id, sizes[tc_id]) for tc_id in unique_ids if tc_id in sizes]
+    for sub_ids in _partition_by_byte_budget(ordered_sizes, limit_bytes):
+        fetched = _fetch_tool_call_fts_chunk(duckdb_conn, sub_ids)
+        chunk = [(tc_id, fetched[tc_id]) for tc_id in sub_ids if tc_id in fetched]
+        del fetched
+        if chunk:
+            yield chunk
+        del chunk
+
+
+def iter_tool_call_inputs_bounded(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    tool_call_ids: Sequence[str],
+    *,
+    max_bytes: int | None = None,
+) -> Iterator[dict[str, str]]:
+    """Stream bounded non-bash `tool_input` JSON chunks so callers retain only bounded snippets."""
+    limit_bytes = _TOOL_PAYLOAD_PAGE_MAX_BYTES if max_bytes is None else max_bytes
+    unique_ids = list(dict.fromkeys(str(tc_id) for tc_id in tool_call_ids))
+    if not unique_ids:
+        return
+    sized_rows: list[tuple[object, object]] = []
+    for lookup_chunk in _chunks(unique_ids, _TOOL_ID_LOOKUP_CHUNK):
+        placeholders = ", ".join("?" for _ in lookup_chunk)
+        sized_rows.extend(
+            duckdb_conn.execute(
+                f"""
+                SELECT id, COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) AS payload_bytes
+                FROM tool_calls
+                WHERE id IN ({placeholders})
+                  AND bash_command IS NULL
+                  AND tool_input IS NOT NULL
+                  AND COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) <= ?
+                """,
+                [*lookup_chunk, TOOL_INPUT_MAX_PARSE_BYTES],
+            ).fetchall()
+        )
+    for sub_ids in _partition_by_byte_budget(sized_rows, limit_bytes):
+        placeholders = ", ".join("?" for _ in sub_ids)
+        rows = duckdb_conn.execute(
+            f"""
+            SELECT id, tool_input
+            FROM tool_calls
+            WHERE id IN ({placeholders})
+              AND bash_command IS NULL
+              AND tool_input IS NOT NULL
+              AND COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) <= ?
+            """,
+            [*sub_ids, TOOL_INPUT_MAX_PARSE_BYTES],
+        ).fetchall()
+        chunk = {
+            str(tc_id): str(tool_input) for tc_id, tool_input in rows if tool_input is not None
+        }
+        del rows
+        if chunk:
+            yield chunk
+        del chunk
+
+
+def iter_tool_call_fts_batches(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    *,
+    start_after: str = "",
+    batch_size: int = _DEFAULT_RECONCILE_BATCH_SIZE,
+) -> Iterator[list[tuple[str, str]]]:
+    """Walk all `tool_calls` in key order without sorting wide JSON or exceeding byte bounds."""
+    last_id = start_after
+    while True:
+        id_rows = duckdb_conn.execute(
+            """
+            SELECT
+                id,
+                CASE
+                    WHEN bash_command IS NOT NULL THEN COALESCE(strlen(bash_command), 0)
+                    ELSE (
+                        CASE
+                            WHEN COALESCE(strlen(trim(tool_name, ?)), 0) > ? THEN 0
+                            ELSE COALESCE(strlen(trim(tool_name, ?)), 0)
+                        END
+                        + CASE
+                            WHEN COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0) > ? THEN 0
+                            ELSE COALESCE(strlen(CAST(tool_input AS VARCHAR)), 0)
+                        END
+                    )
+                END AS payload_bytes
+            FROM tool_calls
+            WHERE id > ?
+            ORDER BY id
+            LIMIT ?
+            """,
+            [
+                TOOL_NAME_TRIM_CHARS,
+                _TOOL_NAME_DISPATCH_MAX_BYTES,
+                TOOL_NAME_TRIM_CHARS,
+                TOOL_INPUT_MAX_PARSE_BYTES,
+                last_id,
+                batch_size,
+            ],
+        ).fetchall()
+        if not id_rows:
+            return
+        for sub_ids in _partition_by_byte_budget(id_rows, _TOOL_PAYLOAD_PAGE_MAX_BYTES):
+            fetched = _fetch_tool_call_fts_chunk(duckdb_conn, sub_ids)
+            batch = [(tc_id, fetched[tc_id]) for tc_id in sub_ids if tc_id in fetched]
+            del fetched
+            if batch:
+                yield batch
+            del batch
+        last_id = str(id_rows[-1][0])
+
+
 def _rescope_tool_call_rows(
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
@@ -380,31 +689,15 @@ def _rescope_tool_call_rows(
         return _delete_all_tool_call_rows(sidecar_conn, batch_size=batch_size)
 
     processed = 0
-    last_id = ""
-
-    while True:
-        batch = duckdb_conn.execute(
-            """
-            SELECT id, bash_command
-            FROM tool_calls
-            WHERE bash_command IS NOT NULL
-              AND id > ?
-            ORDER BY id
-            LIMIT ?
-            """,
-            [last_id, batch_size],
-        ).fetchall()
-        if not batch:
-            return processed
-
+    for batch in iter_tool_call_fts_batches(duckdb_conn, batch_size=batch_size):
         processed += upsert_tool_call_fts_batch(
             sidecar_conn,
-            [(str(key), str(command)) for key, command in batch],
+            batch,
             fields=fts_fields,
             batch_size=batch_size,
         )
-
-        last_id = str(batch[-1][0])
+        batch.clear()
+    return processed
 
 
 def _delete_all_tool_call_rows(
@@ -439,6 +732,43 @@ def _zero_counts() -> dict[str, int]:
     return {_MESSAGE_KIND: 0, _TOOL_CALL_KIND: 0}
 
 
+def _drain_pending_sub_page(
+    lease: DbLease,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection,
+    sub_entries: Sequence[_PendingEntry],
+    pending_drained: dict[str, int],
+    *,
+    fts_fields: tuple[str, ...] | None,
+    batch_size: int,
+) -> None:
+    """Hydrate, publish, and retire one byte-bounded sub-page so its frame releases on return."""
+    rows = _hydrate_pending_entries(duckdb_conn, sub_entries)
+    drained_rowids: list[int] = []
+    try:
+        outcomes = _publish_pending_page(lease.observer, sidecar_conn, rows, fts_fields=fts_fields)
+    except sqlite3.Error as err:
+        if lease.observe(err, "sidecar:drain_pending"):
+            raise
+        logger.warning("sidecar reconcile failed to publish %d pending rows: %s", len(rows), err)
+        outcomes = []
+    for row, failure in outcomes:
+        if failure is not None:
+            logger.warning(
+                "sidecar reconcile failed for pending %s %s %s: %s",
+                row.kind,
+                row.op,
+                row.entity_id,
+                failure,
+            )
+            continue
+        drained_rowids.append(row.rowid)
+        if row.kind in pending_drained:
+            pending_drained[row.kind] += 1
+
+    _delete_pending_rowids(duckdb_conn, drained_rowids, batch_size=batch_size)
+
+
 def _drain_pending(
     lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
@@ -452,54 +782,37 @@ def _drain_pending(
     last_rowid = -1
 
     while True:
-        rows = _fetch_pending_rows_after(
+        entries = _fetch_pending_entries_after(
             duckdb_conn,
             last_queued_at,
             last_rowid,
             batch_size,
         )
-        if not rows:
+        if not entries:
             return
 
-        drained_rowids: list[int] = []
-        try:
-            outcomes = _publish_pending_page(
-                lease.observer, sidecar_conn, rows, fts_fields=fts_fields
+        for sub_entries in _partition_pending_entries(duckdb_conn, entries):
+            _drain_pending_sub_page(
+                lease,
+                duckdb_conn,
+                sidecar_conn,
+                sub_entries,
+                pending_drained,
+                fts_fields=fts_fields,
+                batch_size=batch_size,
             )
-        except sqlite3.Error as err:
-            if lease.observe(err, "sidecar:drain_pending"):
-                raise
-            logger.warning(
-                "sidecar reconcile failed to publish %d pending rows: %s", len(rows), err
-            )
-            outcomes = []
-        for row, failure in outcomes:
-            if failure is not None:
-                logger.warning(
-                    "sidecar reconcile failed for pending %s %s %s: %s",
-                    row.kind,
-                    row.op,
-                    row.entity_id,
-                    failure,
-                )
-                continue
-            drained_rowids.append(row.rowid)
-            if row.kind in pending_drained:
-                pending_drained[row.kind] += 1
-
-        _delete_pending_rowids(duckdb_conn, drained_rowids, batch_size=batch_size)
-        last_queued_at = rows[-1].queued_at
-        last_rowid = rows[-1].rowid
-        if len(rows) < batch_size:
+        last_queued_at = entries[-1].queued_at
+        last_rowid = entries[-1].rowid
+        if len(entries) < batch_size:
             return
 
 
-def _fetch_pending_rows_after(
+def _fetch_pending_entries_after(
     duckdb_conn: duckdb.DuckDBPyConnection,
     last_queued_at: datetime | None,
     last_rowid: int,
     batch_size: int,
-) -> list[_PendingRow]:
+) -> list[_PendingEntry]:
     if last_queued_at is None:
         predicate = ""
         parameters = [batch_size]
@@ -516,54 +829,118 @@ def _fetch_pending_rows_after(
         """,
         parameters,
     ).fetchall()
-    message_ids = [str(row[2]) for row in rows if row[1] == _MESSAGE_KIND and row[3] == _UPSERT_OP]
-    tool_call_ids = [
-        str(row[2]) for row in rows if row[1] == _TOOL_CALL_KIND and row[3] == _UPSERT_OP
-    ]
-    # Scalar IN parameters retain index scans for scattered IDs on DuckDB 1.5.5;
-    # binding lists or relations instead scans the populated primary tables.
-    message_placeholders = ", ".join("?" for _ in message_ids) or "NULL"
-    tool_call_placeholders = ", ".join("?" for _ in tool_call_ids) or "NULL"
-    fts_content_expr = sql_derive_fts("context_text", "content")
-    fts_thinking_expr = sql_derive_fts("context_text", "thinking")
-    payloads = (
-        duckdb_conn.execute(
-            f"""
-            SELECT 'message', message_id, {fts_content_expr}, {fts_thinking_expr}
-            FROM message_state
-            WHERE message_id IN ({message_placeholders})
-            UNION ALL
-            SELECT 'tool_call', id, bash_command, NULL
-            FROM tool_calls
-            WHERE id IN ({tool_call_placeholders})
-            """,
-            message_ids + tool_call_ids,
-        ).fetchall()
-        if message_ids or tool_call_ids
-        else []
-    )
-    messages = {
-        str(key): (str(content), str(thinking))
-        for kind, key, content, thinking in payloads
-        if kind == _MESSAGE_KIND
-    }
-    tools = {
-        str(key): str(command) if command is not None else None
-        for kind, key, command, _thinking in payloads
-        if kind == _TOOL_CALL_KIND
-    }
-
     return [
-        _PendingRow(
+        _PendingEntry(
             rowid=int(row[0]),
             kind=str(row[1]),
             entity_id=str(row[2]),
             op=str(row[3]),
             queued_at=row[4],
-            message_columns=messages.get(str(row[2])) if row[1] == _MESSAGE_KIND else None,
-            bash_command=tools.get(str(row[2])) if row[1] == _TOOL_CALL_KIND else None,
         )
         for row in rows
+    ]
+
+
+def _partition_pending_entries(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    entries: Sequence[_PendingEntry],
+    *,
+    max_bytes: int | None = None,
+) -> Iterator[list[_PendingEntry]]:
+    """Split pending entries in queue order so hydrated payloads stay within `max_bytes`."""
+    if not entries:
+        return
+    limit_bytes = _TOOL_PAYLOAD_PAGE_MAX_BYTES if max_bytes is None else max_bytes
+    message_ids = [
+        entry.entity_id
+        for entry in entries
+        if entry.kind == _MESSAGE_KIND and entry.op == _UPSERT_OP
+    ]
+    tool_call_ids = [
+        entry.entity_id
+        for entry in entries
+        if entry.kind == _TOOL_CALL_KIND and entry.op == _UPSERT_OP
+    ]
+    message_sizes = _measure_message_payload_bytes(duckdb_conn, message_ids) if message_ids else {}
+    tool_sizes = (
+        _measure_tool_call_payload_bytes(duckdb_conn, tool_call_ids) if tool_call_ids else {}
+    )
+    chunk: list[_PendingEntry] = []
+    used = 0
+    for entry in entries:
+        if entry.op != _UPSERT_OP:
+            entry_bytes = 0
+        elif entry.kind == _TOOL_CALL_KIND:
+            entry_bytes = tool_sizes.get(entry.entity_id, 0)
+        elif entry.kind == _MESSAGE_KIND:
+            entry_bytes = message_sizes.get(entry.entity_id, 0)
+        else:
+            entry_bytes = 0
+        if chunk and used + entry_bytes > limit_bytes:
+            yield chunk
+            chunk = [entry]
+            used = entry_bytes
+        else:
+            chunk.append(entry)
+            used += entry_bytes
+    if chunk:
+        yield chunk
+
+
+def _hydrate_pending_entries(
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    entries: Sequence[_PendingEntry],
+) -> list[_PendingRow]:
+    if not entries:
+        return []
+    message_ids = list(
+        dict.fromkeys(
+            entry.entity_id
+            for entry in entries
+            if entry.kind == _MESSAGE_KIND and entry.op == _UPSERT_OP
+        )
+    )
+    tool_call_ids = list(
+        dict.fromkeys(
+            entry.entity_id
+            for entry in entries
+            if entry.kind == _TOOL_CALL_KIND and entry.op == _UPSERT_OP
+        )
+    )
+    # Scalar IN parameters retain index scans for scattered IDs on DuckDB 1.5.5;
+    # binding lists or relations instead scans the populated primary tables.
+    messages: dict[str, tuple[str, str]] = {}
+    if message_ids:
+        fts_content_expr = sql_derive_fts("context_text", "content")
+        fts_thinking_expr = sql_derive_fts("context_text", "thinking")
+        for lookup_chunk in _chunks(message_ids, _TOOL_ID_LOOKUP_CHUNK):
+            message_placeholders = ", ".join("?" for _ in lookup_chunk)
+            msg_payloads = duckdb_conn.execute(
+                f"""
+                SELECT message_id, {fts_content_expr}, {fts_thinking_expr}
+                FROM message_state
+                WHERE message_id IN ({message_placeholders})
+                """,
+                lookup_chunk,
+            ).fetchall()
+            for key, content, thinking in msg_payloads:
+                messages[str(key)] = (str(content), str(thinking))
+    tools: dict[str, str] = {}
+    if tool_call_ids:
+        for lookup_chunk in _chunks(tool_call_ids, _TOOL_ID_LOOKUP_CHUNK):
+            tools.update(_fetch_tool_call_fts_chunk(duckdb_conn, lookup_chunk))
+
+    return [
+        _PendingRow(
+            rowid=entry.rowid,
+            kind=entry.kind,
+            entity_id=entry.entity_id,
+            op=entry.op,
+            queued_at=entry.queued_at,
+            message_columns=messages.get(entry.entity_id) if entry.kind == _MESSAGE_KIND else None,
+            bash_command=tools.get(entry.entity_id) if entry.kind == _TOOL_CALL_KIND else None,
+        )
+        for entry in entries
     ]
 
 
@@ -837,7 +1214,7 @@ def _reconcile_tool_call_differences(
     batch_size: int,
 ) -> tuple[int, int]:
     primary_sql = (
-        "SELECT id FROM tool_calls WHERE bash_command IS NOT NULL ORDER BY id"
+        "SELECT id FROM tool_calls ORDER BY id"
         if should_index_bash_fts(fts_fields)
         else "SELECT id FROM tool_calls WHERE FALSE"
     )
@@ -978,8 +1355,7 @@ def _fetch_tool_call_ids_after(
             """
             SELECT id
             FROM tool_calls
-            WHERE bash_command IS NOT NULL
-              AND id > ?
+            WHERE id > ?
             ORDER BY id
             LIMIT ?
             """,
@@ -1016,16 +1392,17 @@ def _upsert_missing_tool_calls(
     fts_fields: tuple[str, ...] | None,
     batch_size: int,
 ) -> int:
-    rows = _fetch_tool_call_payloads(duckdb_conn, tool_call_ids)
-    if not rows:
-        return 0
-    upsert_tool_call_fts_batch(
-        sidecar_conn,
-        rows,
-        fields=fts_fields,
-        batch_size=batch_size,
-    )
-    return len(rows)
+    written = 0
+    for chunk in iter_tool_call_fts_chunks_for_ids(duckdb_conn, tool_call_ids):
+        upsert_tool_call_fts_batch(
+            sidecar_conn,
+            chunk,
+            fields=fts_fields,
+            batch_size=batch_size,
+        )
+        written += len(chunk)
+        chunk.clear()
+    return written
 
 
 def _fetch_message_payloads(
@@ -1049,28 +1426,6 @@ def _fetch_message_payloads(
         ).fetchall()
     }
     return [fetched[message_id] for message_id in message_ids if message_id in fetched]
-
-
-def _fetch_tool_call_payloads(
-    duckdb_conn: duckdb.DuckDBPyConnection,
-    tool_call_ids: list[str],
-) -> list[tuple[str, str | None]]:
-    if not tool_call_ids:
-        return []
-    placeholders = ", ".join("?" for _ in tool_call_ids)
-    fetched = {
-        str(tool_call_id): (str(tool_call_id), None if bash_command is None else str(bash_command))
-        for tool_call_id, bash_command in duckdb_conn.execute(
-            f"""
-            SELECT id, bash_command
-            FROM tool_calls
-            WHERE id IN ({placeholders})
-              AND bash_command IS NOT NULL
-            """,
-            tool_call_ids,
-        ).fetchall()
-    }
-    return [fetched[tool_call_id] for tool_call_id in tool_call_ids if tool_call_id in fetched]
 
 
 def _fetch_sidecar_ids_after(

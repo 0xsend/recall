@@ -31,6 +31,7 @@ from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCal
 from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
+from recall.core.tool_format import derive_tool_call_fts_text
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
@@ -3197,7 +3198,17 @@ def _update_tool_calls(
 
 
 def _stage_tool_calls(stage: KeywordStage, tool_calls: Iterable[ToolCall]) -> None:
-    stage.tool_calls((tool_call.id, tool_call.bash_command) for tool_call in tool_calls)
+    stage.tool_calls(
+        (
+            tool_call.id,
+            derive_tool_call_fts_text(
+                tool_call.tool_name,
+                tool_call.tool_input,
+                tool_call.bash_command,
+            ),
+        )
+        for tool_call in tool_calls
+    )
 
 
 def _preserve_existing_embeddings(
@@ -3625,8 +3636,16 @@ def _persisted_searchable_signature(rows: PersistedSessionRows) -> tuple[tuple[s
         for row in rows.message_rows
         if row[4] or row[5]
     )
-    tool_signature = tuple(f"{row[0]!s}|{row[6] or ''}" for row in rows.tool_call_rows if row[6])
-    return (message_signature, tool_signature)
+    tool_parts: list[str] = []
+    for row in rows.tool_call_rows:
+        derived = derive_tool_call_fts_text(
+            None if row[4] is None else str(row[4]),
+            None if row[5] is None else str(row[5]),
+            None if row[6] is None else str(row[6]),
+        )
+        if derived:
+            tool_parts.append(f"{row[0]!s}|{derived}")
+    return (message_signature, tuple(tool_parts))
 
 
 def _session_searchable_signature(
@@ -3649,12 +3668,16 @@ def _session_searchable_signature(
             f"{message.content or ''}|{message.thinking or ''}"
         )
     message_signature = tuple(message_parts)
-    tool_signature = tuple(
-        f"{tool_call.id}|{tool_call.bash_command or ''}"
-        for tool_call in _collect_tool_calls(session)
-        if tool_call.bash_command
-    )
-    return (message_signature, tool_signature)
+    tool_parts: list[str] = []
+    for tool_call in _collect_tool_calls(session):
+        derived = derive_tool_call_fts_text(
+            tool_call.tool_name,
+            tool_call.tool_input,
+            tool_call.bash_command,
+        )
+        if derived:
+            tool_parts.append(f"{tool_call.id}|{derived}")
+    return (message_signature, tuple(tool_parts))
 
 
 def _collect_tool_calls(session: Session) -> Iterable[ToolCall]:

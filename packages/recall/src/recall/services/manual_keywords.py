@@ -11,6 +11,7 @@ from recall import _native
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.db.fts_sidecar import (
+    RESCOPE_IN_PROGRESS_META_KEY,
     open_sidecar,
     open_sidecar_for_publication,
     set_fts_fields_signature,
@@ -70,7 +71,12 @@ def require_replaceable_sidecar(config: AppConfig, *, lifetime: DbLifetime) -> N
                 "('message','tool_call'))"
             ).fetchone() != (0,):
                 raise OracleUnavailable("unsupported sidecar progress requires matched restore")
-            keys = tuple(row[0] for row in supported.execute("SELECT key FROM fts_sidecar_meta"))
+            keys = tuple(
+                {
+                    *(row[0] for row in supported.execute("SELECT key FROM fts_sidecar_meta")),
+                    RESCOPE_IN_PROGRESS_META_KEY,
+                }
+            )
             parameters = ",".join("?" for _ in keys)
             if source.execute(
                 f"SELECT EXISTS(SELECT 1 FROM fts_sidecar_meta WHERE key NOT IN ({parameters}))",

@@ -33,6 +33,7 @@ from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     fts_fields_signature,
     get_fts_fields_signature,
+    get_rescope_in_progress,
     open_existing_sidecar_readonly,
 )
 from recall.db.ownership import read_existing_snapshot
@@ -169,6 +170,11 @@ def _search(
                     "use an authorized writer for initialization or repair"
                 ) from err
             try:
+                if get_rescope_in_progress(sidecar):
+                    raise RuntimeError(
+                        "keyword index rescope is incomplete; "
+                        "finish rescoping with an authorized writer before a local lexical read"
+                    )
                 if get_fts_fields_signature(sidecar) != fts_fields_signature(config.fts.fields):
                     raise RuntimeError(
                         "keyword field signature differs; "

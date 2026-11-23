@@ -38,12 +38,17 @@ _FTS_TABLES: dict[_FtsKind, tuple[str, str]] = {
 }
 
 SIDECAR_SCHEMA_VERSION = 2
-FTS_DERIVATION_VERSION = 2
+FTS_DERIVATION_VERSION = 3
 FINGERPRINT_FORMAT = "sha256-length-prefixed-utf8-v1"
 
 _TOKENIZER = "porter unicode61"
 _ALL_FTS_FIELDS = ("bash", "content", "thinking")
+_MESSAGE_FTS_FIELDS = frozenset({"content", "thinking"})
+_TOOL_FTS_FIELDS = frozenset({"bash"})
+_RESCOPE_VALID_KINDS = frozenset({"message", "tool_call"})
 _FTS_FIELDS_SIGNATURE_KEY = "fts_fields_signature"
+RESCOPE_IN_PROGRESS_META_KEY = "rescope_in_progress"
+_RESCOPE_IN_PROGRESS_KEY = RESCOPE_IN_PROGRESS_META_KEY
 logger = logging.getLogger(__name__)
 
 
@@ -421,6 +426,105 @@ def fts_fields_signature(fields: Iterable[str] | None) -> str:
     else:
         normalized = tuple(dict.fromkeys(field for field in fields if field))
     return f"{','.join(sorted(normalized))}|v{FTS_DERIVATION_VERSION}"
+
+
+def parse_fts_fields_signature(signature: str | None) -> tuple[frozenset[str] | None, int]:
+    """Parse `<fields>|v<N>` (or legacy unversioned `<fields>`) into `(fields, version)`."""
+    if not signature:
+        return None, 0
+    if "|v" in signature:
+        fields_part, _, version_part = signature.rpartition("|v")
+        try:
+            version = int(version_part)
+        except ValueError:
+            return None, 0
+        if version <= 0:
+            return None, 0
+    else:
+        fields_part = signature
+        version = 1
+    parsed_fields = frozenset(part.strip() for part in fields_part.split(",") if part.strip())
+    return parsed_fields, version
+
+
+def get_rescope_in_progress(sidecar_conn: sqlite3.Connection) -> frozenset[str]:
+    """Return durable in-progress rescope kinds if an earlier rescope did not complete."""
+    row = sidecar_conn.execute(
+        "SELECT value FROM fts_sidecar_meta WHERE key = ?",
+        [_RESCOPE_IN_PROGRESS_KEY],
+    ).fetchone()
+    if row is None or not str(row[0]).strip():
+        return frozenset()
+    parsed = frozenset(part.strip() for part in str(row[0]).split(",") if part.strip())
+    if not parsed.issubset(_RESCOPE_VALID_KINDS):
+        # Unknown/corrupted marker fails closed to full rescope of both kinds.
+        return _RESCOPE_VALID_KINDS
+    return parsed
+
+
+def set_rescope_in_progress(sidecar_conn: sqlite3.Connection, kinds: Iterable[str]) -> None:
+    """Persist rescope kinds before mutating any FTS rows so crashes force recovery."""
+    normalized = sorted(kind for kind in set(kinds) if kind in _RESCOPE_VALID_KINDS)
+    if not normalized:
+        return
+    with sidecar_conn:
+        sidecar_conn.execute(
+            """
+            INSERT INTO fts_sidecar_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            [_RESCOPE_IN_PROGRESS_KEY, ",".join(normalized)],
+        )
+
+
+def complete_rescope(
+    sidecar_conn: sqlite3.Connection,
+    fields: Iterable[str] | None,
+) -> str:
+    """Atomically record the new field signature and clear `rescope_in_progress`."""
+    signature = fts_fields_signature(fields)
+    with sidecar_conn:
+        sidecar_conn.execute(
+            """
+            INSERT INTO fts_sidecar_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            [_FTS_FIELDS_SIGNATURE_KEY, signature],
+        )
+        sidecar_conn.execute(
+            "DELETE FROM fts_sidecar_meta WHERE key = ?",
+            [_RESCOPE_IN_PROGRESS_KEY],
+        )
+    return signature
+
+
+def rescope_kinds_needed(
+    stored_signature: str | None,
+    fields: Iterable[str] | None,
+    *,
+    in_progress: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Union interrupted rescope kinds with every kind affected by the field/version delta."""
+    prev_fields, prev_version = parse_fts_fields_signature(stored_signature)
+    current_fields = frozenset(
+        _ALL_FTS_FIELDS if fields is None else (field for field in fields if field)
+    )
+    needed: set[str] = set(in_progress & _RESCOPE_VALID_KINDS)
+    if (
+        prev_fields is None
+        or prev_version < 2
+        or (prev_fields & _MESSAGE_FTS_FIELDS) != (current_fields & _MESSAGE_FTS_FIELDS)
+    ):
+        needed.add("message")
+    if (
+        prev_fields is None
+        or prev_version < FTS_DERIVATION_VERSION
+        or (prev_fields & _TOOL_FTS_FIELDS) != (current_fields & _TOOL_FTS_FIELDS)
+    ):
+        needed.add("tool_call")
+    return frozenset(needed)
 
 
 def get_fts_fields_signature(sidecar_conn: sqlite3.Connection) -> str | None:

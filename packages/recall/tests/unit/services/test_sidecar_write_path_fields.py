@@ -69,7 +69,9 @@ def _create_sidecar_source_tables(conn: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE TABLE tool_calls (
             id TEXT PRIMARY KEY,
-            bash_command TEXT
+            bash_command TEXT,
+            tool_name TEXT GENERATED ALWAYS AS ('Bash'),
+            tool_input JSON GENERATED ALWAYS AS (NULL)
         )
         """
     )
@@ -252,7 +254,7 @@ def test_reconcile_sidecar_streams_differences_without_full_id_sets(
         )
 
         assert stats.pending_drained == {"message": 1, "tool_call": 1}
-        assert stats.orphans_backfilled == {"message": 1, "tool_call": 1}
+        assert stats.orphans_backfilled == {"message": 1, "tool_call": 2}
         assert stats.ghosts_deleted == {"message": 1, "tool_call": 1}
         assert stats.pending_remaining == {"message": 0, "tool_call": 0}
         assert sidecar_conn.execute(
@@ -260,7 +262,12 @@ def test_reconcile_sidecar_streams_differences_without_full_id_sets(
         ).fetchall() == [("msg-consistent",), ("msg-orphan",), ("msg-pending",)]
         assert sidecar_conn.execute(
             "SELECT tool_call_id FROM tool_calls_fts_rowid ORDER BY tool_call_id"
-        ).fetchall() == [("tool-consistent",), ("tool-orphan",), ("tool-pending",)]
+        ).fetchall() == [
+            ("tool-consistent",),
+            ("tool-null",),
+            ("tool-orphan",),
+            ("tool-pending",),
+        ]
         assert _message_ids(sidecar_conn, "ghostcontentterm", ["content"]) == []
         assert _message_ids(sidecar_conn, "orphancontentterm", ["content"]) == ["msg-orphan"]
         assert _message_ids(sidecar_conn, "pendingcontentterm", ["content"]) == ["msg-pending"]
