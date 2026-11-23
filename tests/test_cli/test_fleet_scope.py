@@ -605,7 +605,7 @@ TEXT_ROWS = {
 }
 ORDINARY_TEXT = {
     "list": "[2026-11-10 12:00] caller-item (codex) unknown messages=0 tools=0\n",
-    "search": "[2.00] caller-item (codex)\n  [tool] \n\n",
+    "search": "[2.00] caller-item (codex)\n  [tool]\n\n",
     "show": (
         "[2026-11-10 12:00] Session caller-item (codex)\nDuration: 0s | Messages: 0 | Tools: 0\n\n"
     ),
@@ -919,13 +919,22 @@ def test_host_text_encoding_public_cli(fleet_fixture, monkeypatch, command, orig
         text = CliRunner().invoke(app, [*args, "--format", "text"])
         structured = CliRunner().invoke(app, [*args, "--json"])
     assert text.exit_code == structured.exit_code == 0, text.output
+    # The answering inventory endpoint in fleet_fixture is always `edge`, even when
+    # the stored origin (`origin`) has different casing or control characters.
     expected_stderr = {
-        "list": "\n  Next: recall show caller-item -- View most recent session\n"
-        "  Next: recall search '<query>' -- Search across sessions\n",
-        "search": "\n  Next: recall show caller-item --tools -- View top result session\n",
-        "show": "\n  Next: recall search '<query>' -- Search across all sessions\n",
+        "list": (
+            "\n  Next: recall show caller-item --fleet --host edge"
+            " -- View most recent session\n"
+            "  Next: recall search '<query>' --fleet -- Search across sessions\n"
+        ),
+        "search": (
+            "\n  Next: recall show caller-item --tools --fleet --host edge"
+            " -- View top result session\n"
+        ),
+        "show": "\n  Next: recall search '<query>' --fleet -- Search across all sessions\n",
     }.get(command, "")
     assert text.stderr == expected_stderr
+    assert b"\x1b" not in text.stderr_bytes
     assert structured.stderr == ""
     value = json.loads(structured.stdout)
     rows = (

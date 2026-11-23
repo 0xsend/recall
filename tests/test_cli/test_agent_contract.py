@@ -1008,3 +1008,37 @@ def test_fleet_introspection_exposes_membership(command, surface):
 
 def test_fleet_group_help_describes_ssh_route_diagnostics():
     assert "Diagnose inventory SSH routes to edge daemons" in help_text(["fleet"])
+
+
+@pytest.mark.parametrize(
+    "command", ["index", "search", "list", "live", "live mark", "daemon", "stats skills"]
+)
+@pytest.mark.parametrize("surface", ["llms", "schema"])
+def test_source_option_exposes_canonical_enum_and_aliases(command, surface):
+    args = ["--llms"] if surface == "llms" else ["schema", *command.split()]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    metadata = data["commands"][command] if surface == "llms" else data
+    option = next(item for item in metadata["options"] if item["name"] == "source")
+    assert option["enum"] == [
+        "claude-code",
+        "codex",
+        "pi-agent",
+        "grok",
+        "kimi-code",
+        "antigravity-cli",
+    ]
+    assert option["aliases"]["agy"] == "antigravity-cli"
+    assert option["aliases"]["antigravity_cli"] == "antigravity-cli"
+    assert option["aliases"]["pi"] == "pi-agent"
+    assert option["aliases"]["kimi"] == "kimi-code"
+
+
+def test_validate_source_accepts_case_insensitive_aliases():
+    from recall.cli.contract import validate_source
+
+    for value in ("agy", "AGY", "antigravity-cli", "antigravity_cli", "pi", "kimi"):
+        validate_source(value)
+    with pytest.raises(ValueError, match="unsupported source"):
+        validate_source("nonexistent")

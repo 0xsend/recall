@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import socket
+from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 
 
 class Source(StrEnum):
@@ -11,6 +13,70 @@ class Source(StrEnum):
     GROK = "grok"
     KIMI_CODE = "kimi_code"
     ANTIGRAVITY_CLI = "antigravity_cli"
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """Canonical CLI and storage names for one agent source."""
+
+    source: Source
+    cli_name: str
+    aliases: tuple[str, ...] = ()
+    short_alias: str | None = None
+
+
+SOURCE_SPECS: tuple[SourceSpec, ...] = (
+    SourceSpec(Source.CLAUDE_CODE, "claude-code", aliases=("claude_code",)),
+    SourceSpec(Source.CODEX, "codex"),
+    SourceSpec(Source.PI_AGENT, "pi-agent", aliases=("pi_agent", "pi"), short_alias="pi"),
+    SourceSpec(Source.GROK, "grok", aliases=("grok-build", "grok_build", "grokbuild")),
+    SourceSpec(Source.KIMI_CODE, "kimi-code", aliases=("kimi_code", "kimi"), short_alias="kimi"),
+    SourceSpec(
+        Source.ANTIGRAVITY_CLI,
+        "antigravity-cli",
+        aliases=("antigravity_cli", "antigravity", "agy"),
+        short_alias="agy",
+    ),
+)
+
+
+def _build_source_tables() -> tuple[
+    dict[str, Source],
+    tuple[str, ...],
+    MappingProxyType[str, str],
+    frozenset[str],
+    str,
+]:
+    lookup: dict[str, Source] = {}
+    aliases: dict[str, str] = {}
+    help_parts: list[str] = []
+    seen_sources: set[Source] = set()
+    for spec in SOURCE_SPECS:
+        assert spec.source not in seen_sources, f"duplicate SourceSpec for {spec.source}"
+        seen_sources.add(spec.source)
+        for token in (spec.cli_name, *spec.aliases):
+            normalized = token.strip().lower()
+            assert normalized not in lookup, f"conflicting source alias {normalized!r}"
+            lookup[normalized] = spec.source
+            if normalized != spec.cli_name:
+                aliases[normalized] = spec.cli_name
+        help_parts.append(
+            f"{spec.cli_name} ({spec.short_alias})" if spec.short_alias else spec.cli_name
+        )
+    assert seen_sources == set(Source), "SOURCE_SPECS must cover every Source enum member"
+    cli_names = tuple(spec.cli_name for spec in SOURCE_SPECS)
+    return (
+        lookup,
+        cli_names,
+        MappingProxyType(aliases),
+        frozenset(lookup),
+        ", ".join(help_parts),
+    )
+
+
+_SOURCE_LOOKUP, SOURCE_CLI_NAMES, SOURCE_ALIASES, VALID_SOURCE_VALUES, SOURCE_HELP = (
+    _build_source_tables()
+)
 
 
 ABSOLUTE_TOKEN_SOURCES = frozenset({Source.CODEX})
@@ -107,21 +173,11 @@ def parse_search_mode(value: str) -> SearchMode:
 
 def parse_source(value: str) -> Source:
     normalized = value.strip().lower()
-    match normalized:
-        case "claude-code" | "claude_code":
-            return Source.CLAUDE_CODE
-        case "codex":
-            return Source.CODEX
-        case "pi" | "pi-agent" | "pi_agent":
-            return Source.PI_AGENT
-        case "grok" | "grok-build" | "grok_build" | "grokbuild":
-            return Source.GROK
-        case "kimi" | "kimi-code" | "kimi_code":
-            return Source.KIMI_CODE
-        case "antigravity-cli" | "antigravity_cli" | "antigravity" | "agy":
-            return Source.ANTIGRAVITY_CLI
-        case _:
-            raise ValueError(f"unsupported source: {value}")
+    source = _SOURCE_LOOKUP.get(normalized)
+    if source is None:
+        expected = ", ".join(SOURCE_CLI_NAMES)
+        raise ValueError(f"unsupported source: {value} (expected one of: {expected})")
+    return source
 
 
 def parse_scheduler_kind(value: str) -> SchedulerKind:

@@ -148,7 +148,7 @@ def run_fleet_list(
     limit: int,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str | None]:
     from recall.services.fleet_query import fleet_list
 
     executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
@@ -161,7 +161,8 @@ def run_fleet_list(
     )
     _emit_skips(result.errors)
     _require_any_ok(result.hosts_ok, verb="list")
-    return result.rows  # type: ignore[return-value]
+    top_endpoint = result.endpoints[0].raw() if result.endpoints else None
+    return result.rows, top_endpoint  # type: ignore[return-value]
 
 
 def run_fleet_live(
@@ -204,7 +205,7 @@ def run_fleet_search(
     limit: int,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str | None]:
     from recall.services.fleet_query import fleet_search
 
     executor = _query(fleet_config, inventory_only=fleet_inventory_only)
@@ -218,7 +219,8 @@ def run_fleet_search(
     )
     _emit_skips(result.errors)
     _require_any_ok(result.hosts_ok, verb="search")
-    return result.rows  # type: ignore[return-value]
+    top_endpoint = result.endpoints[0].raw() if result.endpoints else None
+    return result.rows, top_endpoint  # type: ignore[return-value]
 
 
 def run_fleet_show(
@@ -229,7 +231,7 @@ def run_fleet_show(
     message_limit: int | None,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], str | None]:
     from recall.services.fleet_query import fleet_show
 
     executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
@@ -260,7 +262,8 @@ def run_fleet_show(
             message=f"session not found on fleet: {session_id}",
             exit_code=1,
         )
-    return result.session  # type: ignore[return-value]
+    endpoint = result.endpoint.raw() if result.endpoint is not None else None
+    return result.session, endpoint  # type: ignore[return-value]
 
 
 @app.command("status")

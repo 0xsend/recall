@@ -1481,7 +1481,12 @@ def test_index_rpc_rejects_missing_root_before_database_work(
 @pytest.mark.parametrize(
     ("invalid_params", "message", "before_confirmation"),
     [
-        ({"source": "bananas"}, "unsupported source: bananas", True),
+        (
+            {"source": "bananas"},
+            "unsupported source: bananas "
+            "(expected one of: claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli)",
+            True,
+        ),
         ({"since": "bananas"}, "invalid since value: bananas", True),
         ({"root": "\0"}, _NUL_ROOT_ERROR, True),
         (
@@ -1513,7 +1518,8 @@ def test_index_rpc_rejects_missing_root_before_database_work(
         ),
         (
             {"source": "bananas", "since": "bananas"},
-            "unsupported source: bananas",
+            "unsupported source: bananas "
+            "(expected one of: claude-code, codex, pi-agent, grok, kimi-code, antigravity-cli)",
             True,
         ),
         (

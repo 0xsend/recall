@@ -202,6 +202,33 @@ def test_text_mode_renders_a_collapsed_turn_as_one_line(monkeypatch) -> None:
     assert rendered[0].endswith("assistant: no message text; omitted: tool calls (--tools)")
 
 
+def test_text_mode_renders_non_bash_tool_inputs(monkeypatch) -> None:
+    tool_calls = [
+        {"tool_name": "read_file", "tool_input": {"Path": "/repo/README.md"}, "bash_command": None},
+        {
+            "tool_name": "search_web",
+            "tool_input": {"query": "strong inference"},
+            "bash_command": None,
+        },
+        {
+            "tool_name": "run_command",
+            "tool_input": {"CommandLine": "pytest -q"},
+            "bash_command": "pytest -q",
+        },
+        {"tool_name": "noop", "tool_input": {}, "bash_command": None},
+    ]
+    _install_rpc(monkeypatch, [_message(tool_calls=tool_calls)])
+
+    result = CliRunner().invoke(app, ["show", "abc123", "--tools", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert "  [read_file] /repo/README.md" in lines
+    assert "  [search_web] strong inference" in lines
+    assert "  [run_command] pytest -q" in lines
+    assert "  [noop]" in lines
+
+
 # --- the same view applies to the follow stream --------------------------
 
 
