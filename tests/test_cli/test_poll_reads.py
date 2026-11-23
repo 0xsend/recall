@@ -277,8 +277,9 @@ def test_each_read_command_keeps_coverage(
     with connect(poll_index) as conn:
         conn.execute(
             "INSERT INTO source_files(source_key,source,source_path,root_path,ctime_ns,mtime_ns,"
-            "size,observed_at,desired_generation,committed_generation,first_pending_at,last_error) "
-            "VALUES ('pending-key','codex',?,?,0,0,0,0,2,1,0,'unsupported')",
+            "size,observed_at,desired_generation,committed_generation,first_pending_at,"
+            "next_retry_at,last_error) "
+            "VALUES ('pending-key','codex',?,?,0,0,0,0,2,1,0,1e308,'unsupported')",
             [str(root / "fixture.jsonl"), str(root)],
         )
     result = cli_process([*command, "--json"])
@@ -329,8 +330,9 @@ def test_empty_search_unready_has_one_notice_and_owned_coverage(
     with connect(poll_index) as conn:
         conn.execute(
             "INSERT INTO source_files(source_key,source,source_path,root_path,ctime_ns,mtime_ns,"
-            "size,observed_at,desired_generation,committed_generation,first_pending_at,last_error) "
-            "VALUES ('pending-key','codex',?,?,0,0,0,0,2,1,0,'unsupported')",
+            "size,observed_at,desired_generation,committed_generation,first_pending_at,"
+            "next_retry_at,last_error) "
+            "VALUES ('pending-key','codex',?,?,0,0,0,0,2,1,0,1e308,'unsupported')",
             [str(root / "fixture.jsonl"), str(root)],
         )
     sidecar = open_sidecar(sidecar_path(poll_index.data_dir))
