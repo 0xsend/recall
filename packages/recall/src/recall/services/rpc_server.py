@@ -273,6 +273,17 @@ def _is_oom_error(err: BaseException) -> bool:
     return str(err).startswith("Out of Memory Error")
 
 
+def _startup_verification_reason(probe: IndexDivergenceReport | None) -> str | None:
+    """Summarize why an inconclusive non-diverged startup probe could not clear verification."""
+    if probe is None or probe.diverged or probe.coverage_verified:
+        return None
+    if not probe.complete:
+        return "startup probe did not complete within budget"
+    if probe.samples_unverifiable > 0:
+        return f"startup probe left {probe.samples_unverifiable} sampled key(s) unverifiable"
+    return "startup probe could not certify all indexes"
+
+
 def _resolve_probe_sample(value: object) -> int:
     from recall.db.maintenance import PROBE_SAMPLE_DEFAULT, PROBE_SAMPLE_MAX
 
@@ -1055,6 +1066,11 @@ class RpcServer:
         # Most recent index/table divergence probe (startup, then any
         # `recall.check_indexes` call), exposed by `daemon status` (REQ-RESIL-018).
         self._last_index_probe: IndexDivergenceReport | None = None
+        # Immutable summary of this daemon's startup probe when it ran without
+        # divergence yet could not certify all indexes; cleared on mid-run
+        # disk-full and never overwritten by live `recall.check_indexes`.
+        self._index_verification_probe_reason: str | None = None
+        self._disk_full_epoch: int = 0
         self._read_slots = asyncio.BoundedSemaphore(_READ_WORKERS)
         self._read_executions: set[ReadToken] = set()
         self._reader_drained = asyncio.Event()
@@ -1174,6 +1190,9 @@ class RpcServer:
             return
         from recall.services import self_repair
 
+        self._disk_full_epoch += 1
+        self._last_index_probe = None
+        self._index_verification_probe_reason = None
         self._jobs.observe(err, label)
         # Durable publication is already observed at the inner failure boundary.
         # This optional display flag runs only after the writer has rolled back;
@@ -3382,6 +3401,7 @@ class RpcServer:
             "index_divergence": (
                 self._last_index_probe.to_payload() if self._last_index_probe is not None else None
             ),
+            "index_verification_probe_reason": self._index_verification_probe_reason,
             "live_fresh_requests": self.live_fresh_requests,
             "live_fresh_timeouts": self.live_fresh_timeouts,
             "follow_subscriptions": self._session_indexed.total_subscriptions,
@@ -3470,7 +3490,8 @@ class RpcServer:
             and not self._keyword_dirty
             and self._fts_repair_error is None
             and self._keyword_read_gate.error is None
-            and not self._keyword_sync_owed,
+            and not self._keyword_sync_owed
+            and not self._keyword_startup_failed,
             "keyword_repair_error": self._fts_repair_error
             or _optional_text(self._keyword_read_gate.error),
             "keyword_publish_error": _optional_text(self._keyword_gate.error),
@@ -3877,6 +3898,19 @@ class RpcServer:
         from recall.services.daemon import FtsSidecarSyncDeferred
 
         return isinstance(self._fts_sidecar_startup, FtsSidecarSyncDeferred)
+
+    @property
+    def _keyword_startup_failed(self) -> bool:
+        from recall.services.daemon import FtsSidecarStartupResult
+
+        outcome = self._fts_sidecar_startup
+        return isinstance(outcome, FtsSidecarStartupResult) and (
+            outcome.error is not None
+            or (
+                outcome.enabled
+                and not (outcome.bootstrap_messages_done and outcome.bootstrap_tool_calls_done)
+            )
+        )
 
     def _acknowledge_run_keywords(self, scope: RunScope) -> None:
         from recall.services.daemon import FtsSidecarStartupResult
@@ -4893,8 +4927,10 @@ class RpcServer:
         from recall.db.maintenance import probe_index_divergence
 
         sample = _resolve_probe_sample(params.get("sample"))
+        epoch = self._disk_full_epoch
         report = await self._run_readonly(lambda conn: probe_index_divergence(conn, sample=sample))
-        self._last_index_probe = report
+        if self._disk_full_epoch == epoch:
+            self._last_index_probe = report
         return report.to_payload()
 
     # ---- Connection handling ----
@@ -6124,6 +6160,7 @@ class RpcServer:
         # The repair is verified and retired; a status reader must not see it in progress.
         self._progress.end()
         self._last_index_probe = outcome.probe
+        self._index_verification_probe_reason = _startup_verification_reason(outcome.probe)
         if outcome.rebuild is not None:
             logger.warning(
                 "startup index rebuild dropped=%d created=%d healed=%s elapsed=%.3fs",

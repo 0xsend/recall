@@ -32,6 +32,8 @@ from recall.db.fts_sidecar_stage import OwnedKeywordTurn, Publication
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.source_files import (
     SOURCE_CURRENT,
+    SOURCE_PARKED_UNSUPPORTED,
+    SOURCE_PARKED_UNSUPPORTED_LIMIT,
     CatalogCursor,
     SourceCatalog,
     SourceFile,
@@ -41,6 +43,7 @@ from recall.db.source_files import (
 from recall.db.source_keywords import PendingKeywords
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import ChunkTarget, UnsupportedResumeState
+from recall.parsers.compressed import CompressedCaptureLimitError
 from recall.parsers.discovery import DiscoveryScope, current_scope
 from recall.parsers.revision import parser_revision
 from recall.services.moves import (
@@ -231,11 +234,17 @@ def reconciliation_status(
     rows = conn.execute(f"""
         SELECT source, root_path, COUNT(*),
           COUNT(*) FILTER (WHERE {SOURCE_CURRENT}),
-          COUNT(*) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT})),
+          COUNT(*) FILTER (
+              WHERE NOT missing AND NOT ({SOURCE_CURRENT})
+                AND NOT ({SOURCE_PARKED_UNSUPPORTED_LIMIT})
+          ),
           COUNT(*) FILTER (WHERE retry_count > 0),
-          COUNT(*) FILTER (WHERE NOT missing AND last_error = 'unsupported'),
+          COUNT(*) FILTER (WHERE {SOURCE_PARKED_UNSUPPORTED}),
           COUNT(*) FILTER (WHERE missing),
-          MIN(first_pending_at) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT}))
+          MIN(first_pending_at) FILTER (
+              WHERE NOT missing AND NOT ({SOURCE_CURRENT})
+                AND NOT ({SOURCE_PARKED_UNSUPPORTED_LIMIT})
+          )
         FROM source_files GROUP BY source, root_path
     """).fetchall()
     counts = {(row[0], row[1]): row[2:] for row in rows}
@@ -285,7 +294,7 @@ def reconciliation_status(
         ),
         "catalog_scan_complete": scan_complete,
         "raw_indexing_ready": scan_complete and pending == 0,
-        "keyword_search_ready": scan_complete and pending == 0 and sidecar_pending[0] == 0,
+        "keyword_search_ready": scan_complete and sidecar_pending[0] == 0,
         **page,
         "index_only_sessions": index_only_sessions(conn),
         "unsupported_summary": unsupported_summary(conn),
@@ -344,6 +353,7 @@ class PreparedRawSource:
     result: ParseResult | None
     error: str | None = None
     observed: tuple[str, str, SourceSignature] | None = None
+    unsupported_limit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -956,6 +966,7 @@ def prepare_raw_sources_on(
     ready: list[PreparedRawSource] = []
     for item in selected[:2]:
         parser = parser_by_source[item.source]
+        before = None
         observed = None
         try:
             path = Path(item.source_path)
@@ -965,6 +976,17 @@ def prepare_raw_sources_on(
             if before[2].sidecar_signature != observed[2].sidecar_signature:
                 raise RuntimeError("source sidecars changed during preparation")
             ready.append(PreparedRawSource(item, parser, result, observed=observed))
+        except CompressedCaptureLimitError as err:
+            ready.append(
+                PreparedRawSource(
+                    item,
+                    parser,
+                    None,
+                    str(err),
+                    observed=before,
+                    unsupported_limit=str(err),
+                )
+            )
         except Exception as err:
             if observer.observe(err, "prepare_raw_sources"):
                 raise
@@ -1252,6 +1274,42 @@ def _commit_raw_content(
                 or current.content_epoch != item.content_epoch
             ):
                 raise RuntimeError("committed source generation changed during preparation")
+            if capture.unsupported_limit is not None:
+                if current.desired_generation != item.desired_generation:
+                    continue
+                try:
+                    after = capture_path(capture.parser, Path(item.source_path))
+                except OSError:
+                    catalog.fail(item.source, item.source_path, capture.unsupported_limit, {})
+                    continue
+                if capture.observed is not None and after[2] != capture.observed[2]:
+                    observe_path(capture.parser, after, conn=conn)
+                    continue
+                # If the file grew/changed before preparation and before a catalog
+                # observation (e.g. a reopened unsupported_record park that later
+                # crossed the 96 MiB ceiling), record the observed physical
+                # signature first so desired_generation advances above
+                # committed_generation and the row never reads as SOURCE_CURRENT.
+                park_generation = item.desired_generation
+                if current.signature != after[2]:
+                    current = observe_path(capture.parser, after, conn=conn)
+                    park_generation = current.desired_generation
+                catalog.defer_unsupported(
+                    item.source,
+                    item.source_path,
+                    {
+                        "records": [
+                            {
+                                "kind": "unsupported_limit",
+                                "detail": capture.unsupported_limit,
+                                "byte_offset": 0,
+                            }
+                        ]
+                    },
+                    parser_revision=parser_revision(type(capture.parser)),
+                    expected_generation=park_generation,
+                )
+                continue
             if (
                 capture.observed is not None
                 and current.desired_generation == item.desired_generation

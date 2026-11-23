@@ -1,4 +1,4 @@
-"""Traversing unsupported samples never clears the durable verification request."""
+"""Probe-only unverifiable samples retain verification memory; verified full rebuilds clear it."""
 
 from pathlib import Path
 
@@ -45,4 +45,4 @@ def test_unverifiable_coverage_retains_verification_memory(tmp_path: Path, flow:
     assert protocol.last_probe is not None
     assert protocol.last_probe.complete and protocol.last_probe.samples_unverifiable == 2
     with duckdb.connect(str(config.db_path), read_only=True) as conn:
-        assert load_runtime_status_from_conn(conn).needs_index_verification
+        assert load_runtime_status_from_conn(conn).needs_index_verification is (flow == "normal")

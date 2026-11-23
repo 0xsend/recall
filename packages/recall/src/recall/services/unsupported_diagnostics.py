@@ -16,6 +16,7 @@ import duckdb
 
 from recall.core.models import ParseDiagnostic
 from recall.db.mutations import execute_count
+from recall.db.source_files import SOURCE_PARKED_UNSUPPORTED
 from recall.parsers import all_parsers
 from recall.parsers.revision import parser_revision
 
@@ -99,9 +100,9 @@ def reopen_unsupported_parks(conn: duckdb.DuckDBPyConnection, now: float) -> int
 def unsupported_summary(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:
     """Aggregate parked unsupported files into a bounded filing summary."""
     rows = conn.execute(
-        """SELECT source, source_path, CAST(diagnostics AS VARCHAR)
+        f"""SELECT source, source_path, CAST(diagnostics AS VARCHAR)
              FROM source_files
-            WHERE last_error = 'unsupported' AND NOT missing
+            WHERE {SOURCE_PARKED_UNSUPPORTED}
             ORDER BY source, source_path
             LIMIT ?""",
         [UNSUPPORTED_SUMMARY_FILE_LIMIT + 1],

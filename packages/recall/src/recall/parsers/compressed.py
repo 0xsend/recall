@@ -22,6 +22,10 @@ from recall.core.transcripts import MAX_COMPRESSED_CAPTURE_BYTES
 from recall.parsers.capture import HASH_BUFFER_BYTES, JsonlCapture
 
 
+class CompressedCaptureLimitError(ValueError):
+    """Deterministic REQ-PARSE-035 ceiling violation (compressed/decoded size or frame count)."""
+
+
 class CompressedCapture(JsonlCapture):
     """A compressed file is acknowledged only as one complete physical capture.
 
@@ -42,8 +46,10 @@ class CompressedCapture(JsonlCapture):
             with open_source(self.path) as source:
                 self._physical_stat = os.fstat(source.fileno())
                 remaining = self._physical_stat.st_size
-                if not 0 < remaining <= MAX_COMPRESSED_CAPTURE_BYTES:
-                    raise ValueError("compressed rollout input exceeds 96 MiB or is empty")
+                if remaining <= 0:
+                    raise ValueError("compressed rollout input is empty")
+                if remaining > MAX_COMPRESSED_CAPTURE_BYTES:
+                    raise CompressedCaptureLimitError("compressed rollout input exceeds 96 MiB")
                 decoder = zstd.ZstdDecompressor(
                     options={zstd.DecompressionParameter.window_log_max: 26}
                 )
@@ -59,13 +65,17 @@ class CompressedCapture(JsonlCapture):
                         output = decoder.decompress(chunk, max_length=HASH_BUFFER_BYTES)
                         total += len(output)
                         if total > MAX_COMPRESSED_CAPTURE_BYTES:
-                            raise ValueError("compressed rollout decoded content exceeds 96 MiB")
+                            raise CompressedCaptureLimitError(
+                                "compressed rollout decoded content exceeds 96 MiB"
+                            )
                         decoded.write(output)
                         chunk = b""
                         if decoder.eof:
                             frames += 1
                             if frames > 4096:
-                                raise ValueError("compressed rollout exceeds 4096 frames")
+                                raise CompressedCaptureLimitError(
+                                    "compressed rollout exceeds 4096 frames"
+                                )
                             chunk = decoder.unused_data
                             if chunk or remaining:
                                 decoder = zstd.ZstdDecompressor(

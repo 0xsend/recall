@@ -430,6 +430,13 @@ def _index_divergence_notice(status: dict[str, Any]) -> str | None:
         )
     runtime = status.get("runtime_status")
     if isinstance(runtime, dict) and runtime.get("needs_index_verification"):
+        reason = status.get("index_verification_probe_reason")
+        if isinstance(reason, str) and reason:
+            return (
+                "Warning: the database still needs index verification after a disk-full error "
+                f"({reason}); run `recall daemon stop`, then `recall db rebuild-indexes`, "
+                "then `recall daemon start`."
+            )
         return (
             "Warning: the database needs index verification after a disk-full error; "
             "the daemon probes and repairs at its next start (`recall daemon restart`)."

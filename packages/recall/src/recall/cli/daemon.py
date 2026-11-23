@@ -1812,7 +1812,13 @@ def _print_index_health_text(s: dict[str, Any], runtime: dict[str, Any]) -> None
     if runtime.get("last_index_repair_at") is not None:
         typer.echo(f"Index repair: {runtime['last_index_repair_at']}")
     if runtime.get("needs_index_verification"):
-        typer.echo("Index verification: needs verification at next daemon start (disk-full seen)")
+        reason = s.get("index_verification_probe_reason")
+        if isinstance(reason, str) and reason:
+            typer.echo(f"Index verification: still needed ({reason}; disk-full seen)")
+        else:
+            typer.echo(
+                "Index verification: needs verification at next daemon start (disk-full seen)"
+            )
     refusal = s.get("startup_refusal")
     if isinstance(refusal, str) and refusal:
         typer.echo(f"Startup refused: {refusal}")

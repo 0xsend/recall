@@ -1576,7 +1576,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         status = reconciliation_status(config, conn=conn)
         assert status["pending"] == int(torn)
         assert status["raw_indexing_ready"] is (not torn)
-        assert status["keyword_search_ready"] is (not torn)
+        assert status["keyword_search_ready"] is True
         coverage_rows = status["coverage"]
         coverage = next(row for row in coverage_rows if row["source"] == harness.source)
         assert coverage["current"] == int(not torn)
@@ -1603,7 +1603,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         pending = reconciliation_status(config, conn=conn)
         assert pending["pending"] == 1
         assert pending["raw_indexing_ready"] is False
-        assert pending["keyword_search_ready"] is False
+        assert pending["keyword_search_ready"] is True
 
 
 @pytest.mark.parametrize("case", ADAPTER_CASES)

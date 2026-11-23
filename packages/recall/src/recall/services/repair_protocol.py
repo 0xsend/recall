@@ -645,11 +645,14 @@ class RepairProtocol:
                 ),
             )
             transaction.call("verified_instruction", lambda conn: save_repair_row(conn, verified))
-            if probe.coverage_verified:
-                transaction.call(
-                    "verified_negative_probe",
-                    lambda conn: set_needs_index_verification(conn, False),
-                )
+            # Every saved ART index was just rebuilt from table rows and verified
+            # (exact content + FTS oracle + non-diverged probe), so any prior
+            # disk-full verification obligation is satisfied even when compound or
+            # high-cardinality indexes leave probe samples unverifiable.
+            transaction.call(
+                "verified_negative_probe",
+                lambda conn: set_needs_index_verification(conn, False),
+            )
         self._barrier("after_verified_commit")
         return verified
 

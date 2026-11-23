@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -53,6 +56,24 @@ _SOURCE_FILE_COLUMNS = (
 _PENDING_NOW = (
     "(desired_generation > committed_generation OR committed_offset < size"
     " OR last_error IS NOT NULL) AND missing = FALSE AND next_retry_at <= ?"
+)
+
+# Sentinel retry deadline for sources parked until bytes or parser revision change.
+PARKED_RETRY_AT = 1e308
+_PARKED_RETRY_FLOOR = 1e300
+
+# Actively parked unsupported rows (not missing, not reopened for retry).
+SOURCE_PARKED_UNSUPPORTED = (
+    f"NOT missing AND last_error = 'unsupported' AND next_retry_at >= {_PARKED_RETRY_FLOOR}"
+)
+
+# Null-safe predicate for deterministic capture-limit parks (REQ-PARSE-035).
+# Narrowly scoped so legacy unsupported_record parks with unacknowledged bytes
+# still keep pending/raw_indexing_ready truthful per REQ-RECON-029.
+SOURCE_PARKED_UNSUPPORTED_LIMIT = (
+    f"{SOURCE_PARKED_UNSUPPORTED}"
+    " AND COALESCE(json_extract_string(diagnostics, '$.records[0].kind'), '') "
+    "= 'unsupported_limit'"
 )
 
 # Coverage and inventory share the committed-boundary definition. Unsupported
@@ -158,13 +179,19 @@ class PendingSource:
         return source_key(self.source, self.source_path)
 
 
+_CURSOR_V2_PREFIX = "v2:"
+_CURSOR_B64_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 @dataclass(frozen=True)
 class CatalogCursor:
     """The position after one catalogued source, in `source_key` order.
 
-    The token is the source key itself. A string becomes a position only
-    through `SourceCatalog.issued_cursor`: an arbitrary string would otherwise
-    be a valid keyset position and silently skip or end the listing.
+    Wire tokens emit printable ASCII (`v2:<urlsafe-b64-no-pad>` over the internal
+    `<source>\\x1f<source_path>` key) so JSON output contains no control characters.
+    Legacy `<source>\\x1f<source_path>` tokens remain accepted on input. A string
+    becomes a position only through `SourceCatalog.issued_cursor`: a malformed,
+    non-canonical, or absent-row token is rejected before paging.
     """
 
     source: Source
@@ -172,7 +199,30 @@ class CatalogCursor:
 
     @classmethod
     def parse(cls, token: str) -> CatalogCursor:
-        source, separator, source_path = token.partition("\x1f")
+        if token.startswith(_CURSOR_V2_PREFIX):
+            encoded = token[len(_CURSOR_V2_PREFIX) :]
+            if not encoded or _CURSOR_B64_RE.fullmatch(encoded) is None:
+                raise ValueError(
+                    "malformed source page cursor; pass next_cursor exactly as it was returned"
+                )
+            padded = encoded + ("=" * ((4 - (len(encoded) % 4)) % 4))
+            try:
+                raw_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
+                decoded = raw_bytes.decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError, ValueError) as err:
+                raise ValueError(
+                    "malformed source page cursor; pass next_cursor exactly as it was returned"
+                ) from err
+            canonical = _CURSOR_V2_PREFIX + base64.urlsafe_b64encode(raw_bytes).decode(
+                "ascii"
+            ).rstrip("=")
+            if canonical != token:
+                raise ValueError(
+                    "malformed source page cursor; pass next_cursor exactly as it was returned"
+                )
+            source, separator, source_path = decoded.partition("\x1f")
+        else:
+            source, separator, source_path = token.partition("\x1f")
         if not separator or not source_path:
             raise ValueError(
                 "malformed source page cursor; pass next_cursor exactly as it was returned"
@@ -183,8 +233,13 @@ class CatalogCursor:
             raise ValueError(f"source page cursor names an unknown source: {source!r}") from err
 
     @property
-    def token(self) -> str:
+    def db_key(self) -> str:
         return source_key(self.source, self.source_path)
+
+    @property
+    def token(self) -> str:
+        encoded = base64.urlsafe_b64encode(self.db_key.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"{_CURSOR_V2_PREFIX}{encoded}"
 
 
 @dataclass(frozen=True)
@@ -513,28 +568,52 @@ class SourceCatalog:
         diagnostics: dict[str, object],
         *,
         parser_revision: str,
-    ) -> None:
+        expected_generation: int | None = None,
+    ) -> bool:
         """Keep unsupported content visible until its source/parser changes or an explicit retry."""
         assert parser_revision
-        self.defer_until_changed(
-            source, source_path, "unsupported", {**diagnostics, "parser_revision": parser_revision}
+        return self.defer_until_changed(
+            source,
+            source_path,
+            "unsupported",
+            {**diagnostics, "parser_revision": parser_revision},
+            expected_generation=expected_generation,
         )
 
     def defer_until_changed(
-        self, source: str, source_path: str, error: str, diagnostics: dict[str, object]
-    ) -> None:
-        """A stable incomplete input needs changed bytes/parser or an explicit retry."""
+        self,
+        source: str,
+        source_path: str,
+        error: str,
+        diagnostics: dict[str, object],
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """A stable incomplete/unsupported input needs changed bytes/parser or an explicit retry."""
+        where = "WHERE source_key = ?"
+        params: list[object] = [
+            error,
+            json.dumps(diagnostics),
+            self._clock(),
+            PARKED_RETRY_AT,
+            source_key(source, source_path),
+        ]
+        if expected_generation is not None:
+            where += " AND desired_generation = ?"
+            params.append(expected_generation)
         count = execute_count(
             self._conn,
-            """UPDATE source_files SET last_error = ?, diagnostics = ?,
-                   first_pending_at = COALESCE(first_pending_at, ?), next_retry_at = 1e308,
+            f"""UPDATE source_files SET last_error = ?, diagnostics = ?,
+                   retry_count = 0,
+                   first_pending_at = COALESCE(first_pending_at, ?), next_retry_at = ?,
                    last_serviced_seq = (SELECT COALESCE(MAX(last_serviced_seq), 0) + 1
                                         FROM source_files)
-               WHERE source_key = ?""",
-            [error, json.dumps(diagnostics), self._clock(), source_key(source, source_path)],
+               {where}""",
+            params,
         )
-        if count == 0:
+        if expected_generation is None and count == 0:
             raise KeyError(source_key(source, source_path))
+        return count > 0
 
     def force_reconcile(self, source: str, source_path: str) -> None:
         """Record an explicit full reparse as a new desired generation."""
@@ -899,7 +978,7 @@ class SourceCatalog:
         """
         cursor = CatalogCursor.parse(token)
         row = self._conn.execute(
-            "SELECT 1 FROM source_files WHERE source_key = ?", [cursor.token]
+            "SELECT 1 FROM source_files WHERE source_key = ?", [cursor.db_key]
         ).fetchone()
         if row is None:
             raise ValueError(
@@ -924,7 +1003,7 @@ class SourceCatalog:
                SELECT {_SOURCE_FILE_COLUMNS}
                FROM page JOIN source_files USING (source_key)
                ORDER BY source_key""",
-            [cursor.token if cursor is not None else None, limit + 1],
+            [cursor.db_key if cursor is not None else None, limit + 1],
         ).fetchall()
         page = tuple(self._file(row) for row in rows[:limit])
         next_cursor = (
