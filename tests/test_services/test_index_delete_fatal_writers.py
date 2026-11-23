@@ -14,7 +14,7 @@ from typing import Any, cast
 import duckdb
 import pytest
 from recall import _native
-from recall.core.models import Message, Session, TailFacts
+from recall.core.models import Message, ParseResult, Session, TailFacts
 from recall.core.source_path import SourcePath
 from recall.core.types import Role, Source
 from recall.db.lease import StandaloneLifetime
@@ -122,13 +122,15 @@ def test_host_stamp_inside_an_incremental_append_stops_the_transaction() -> None
     conn, inner, events = _seeded()
     conn.fail_on[HOST_STAMP] = duckdb.FatalException(INDEX_DELETE)
 
+    session = _session()
     with pytest.raises(duckdb.FatalException, match=INDEX_DELETE):
         _incremental_write_session(
             cast("duckdb.DuckDBPyConnection", conn),
-            _session(),
+            session,
             turn=without_keyword_index(),
             last_byte_offset=1,
             tail_facts=TailFacts(),
+            capture=ParseResult(session=session, next_byte_offset=1, is_full_parse=False),
             host="beta",
         )
 

@@ -139,8 +139,12 @@ def test_supported_v13_chain_reaches_the_committed_fence_with_literal_rows(
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+    from recall.db.schema import SCHEMA_VERSION
+
     with duckdb.connect(str(database), read_only=True) as fresh:
-        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert fresh.execute(
             "SELECT content FROM message_state WHERE message_id='m1'"
         ).fetchone() == ("hello",)

@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from recall.db.repair import load_repair_row
-from recall.db.schema import ensure_schema
+from recall.db.schema import SCHEMA_VERSION, ensure_schema
 from recall.services import compaction
 
 from tests.test_services.test_run_completion import _config
@@ -66,7 +66,9 @@ def test_pre_fence_compaction_upgrades_through_owned_schema_admission(tmp_path: 
         conn.execute("DELETE FROM schema_migrations WHERE migration_id='0041_daemon_index_repair'")
     assert compaction.compact(config).replaced
     with duckdb.connect(str(config.db_path), read_only=True) as fresh:
-        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert load_repair_row(fresh).phase == "idle"
         assert fresh.execute("SELECT * FROM acknowledged").fetchall() == [(9223372036854775807,)]
 

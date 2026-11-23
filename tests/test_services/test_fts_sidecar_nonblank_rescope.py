@@ -109,8 +109,8 @@ def test_sidecar_rescope_cleans_polluted_v41_rows_without_mutating_duckdb(tmp_pa
                     fts_fields=("content", "thinking", "bash"),
                     sidecar_existed=True,
                 )
-            # Zero DuckDB mutation, schema stays at 41
-            assert get_schema_version(conn) == SCHEMA_VERSION == 41
+            # Zero DuckDB mutation, schema stays at current SCHEMA_VERSION
+            assert get_schema_version(conn) == SCHEMA_VERSION
             after_ms = conn.execute(
                 "SELECT message_id, fts_content, fts_thinking "
                 "FROM message_state ORDER BY message_id"

@@ -49,14 +49,13 @@ from recall.services.indexer import (
     DiscoveredSessionPath,
     SessionContextStats,
     SessionWriteSnapshot,
-    _incremental_write_session,
     _load_session_state,
     _load_session_write_snapshot,
     _normalize_session_identity,
     _prepare_context_run,
     _require_committable_capture,
     _resolve_parse_offset,
-    _write_session,
+    _write_parsed_session,
 )
 from recall.services.live_events import live_path_key
 from recall.services.live_session_set import LiveSessionSet
@@ -1499,36 +1498,18 @@ def _index_single_session(
         snapshot=snapshot,
         observer=lease.observer,
     )
-    if parse_result.is_full_parse:
-        result = _write_session(
-            conn,
-            session,
-            turn=turn,
-            last_byte_offset=parse_result.next_byte_offset,
-            host=host,
-            tail_facts=parse_result.tail_facts,
-            snapshot=snapshot,
-            on_commit=(
-                (lambda: on_commit(session, parse_result, rewrites_history))
-                if on_commit is not None
-                else None
-            ),
-        )
-    else:
-        result = _incremental_write_session(
-            conn,
-            session,
-            turn=turn,
-            last_byte_offset=parse_result.next_byte_offset,
-            reached_end=parse_result.reached_end,
-            host=host,
-            tail_facts=parse_result.tail_facts,
-            on_commit=(
-                (lambda: on_commit(session, parse_result, rewrites_history))
-                if on_commit is not None
-                else None
-            ),
-        )
+    result = _write_parsed_session(
+        conn,
+        replace(parse_result, session=session),
+        turn=turn,
+        host=host,
+        snapshot=snapshot,
+        on_commit=(
+            (lambda: on_commit(session, parse_result, rewrites_history))
+            if on_commit is not None
+            else None
+        ),
+    )
     if context_counts is not None:
         context_counts.add(session_context, mode=context_run.mode)
     path_changed = (

@@ -27,7 +27,16 @@ from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.index_request import resolve_worker_count
-from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.models import (
+    ClaudeUsageFull,
+    ClaudeUsageSuffix,
+    Message,
+    ParseResult,
+    Session,
+    TailFacts,
+    ToolCall,
+    check_claude_aggregate,
+)
 from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
@@ -35,6 +44,7 @@ from recall.core.tool_format import derive_tool_call_fts_text
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
+    claude_usage,
     create_fts_indexes,
     fts_sidecar,
     insert_message_embeddings,
@@ -931,27 +941,14 @@ def _index_sessions(
                             resolved_cache=embedding_cache,
                             context_version=_context_version_for_mode(context_run.mode),
                         )
-                    if result.is_full_parse:
-                        if _write_session(
-                            conn,
-                            session,
-                            turn=turn,
-                            last_byte_offset=result.next_byte_offset,
-                            host=resolved_host,
-                            tail_facts=result.tail_facts,
-                            snapshot=snapshot,
-                        ):
-                            fts_rebuild_needed = True
-                    else:
-                        if _incremental_write_session(
-                            conn,
-                            session,
-                            turn=turn,
-                            last_byte_offset=result.next_byte_offset,
-                            host=resolved_host,
-                            tail_facts=result.tail_facts,
-                        ):
-                            fts_rebuild_needed = True
+                    if _write_parsed_session(
+                        conn,
+                        replace(result, session=session),
+                        turn=turn,
+                        host=resolved_host,
+                        snapshot=snapshot,
+                    ):
+                        fts_rebuild_needed = True
                     if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
                         publication = turn.publish(attempt=True)
                         completion_scope.publication(publication)
@@ -2152,6 +2149,41 @@ class _SessionIndexedFields:
         return "\n".join(assignments), parameters
 
 
+def _write_parsed_session(
+    conn: duckdb.DuckDBPyConnection,
+    parse_result: ParseResult,
+    *,
+    turn: KeywordTurn | OwnedKeywordTurn,
+    host: str | None = None,
+    on_commit: Callable[[], None] | None = None,
+    snapshot: SessionWriteSnapshot | None = None,
+) -> bool:
+    """Publish one parsed capture, routing full and suffix paths through one typed boundary."""
+    if parse_result.is_full_parse:
+        return _write_session(
+            conn,
+            parse_result.session,
+            turn=turn,
+            last_byte_offset=parse_result.next_byte_offset,
+            host=host,
+            tail_facts=parse_result.tail_facts,
+            capture=parse_result,
+            on_commit=on_commit,
+            snapshot=snapshot,
+        )
+    return _incremental_write_session(
+        conn,
+        parse_result.session,
+        turn=turn,
+        last_byte_offset=parse_result.next_byte_offset,
+        reached_end=parse_result.reached_end,
+        host=host,
+        tail_facts=parse_result.tail_facts,
+        capture=parse_result,
+        on_commit=on_commit,
+    )
+
+
 def _incremental_write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
@@ -2163,6 +2195,7 @@ def _incremental_write_session(
     context_mode: str = "off",
     host: str | None = None,
     tail_facts: TailFacts,
+    capture: ParseResult,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
     """Append-only write for incrementally parsed sessions (offset > 0).
@@ -2170,6 +2203,10 @@ def _incremental_write_session(
     Inserts new messages/tools and replaces the complete metadata projection;
     token counters still merge according to the source's accumulation rule.
     """
+    if session.source is Source.CLAUDE_CODE and not isinstance(
+        capture.claude_usage, ClaudeUsageSuffix
+    ):
+        raise ValueError("Claude suffix publication requires a ClaudeUsageSuffix capture")
     _normalize_session_identity(conn, session)
     has_searchable = _session_has_searchable_content(session)
     is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
@@ -2180,13 +2217,36 @@ def _incremental_write_session(
         ),
     ) as stage:
         row = conn.execute(
-            "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
+            "SELECT started_at, cwd, git_repo, input_tokens, output_tokens "
+            "FROM session_state WHERE session_id = ?",
             [session.id],
         ).fetchone()
         if row is None:
             # A suffix cannot establish the missing parent or acknowledge its prefix.
             raise RuntimeError(f"no indexed session to append to: {session.id}")
-        previous = _SessionIndexedFields(*row)
+        previous = _SessionIndexedFields(row[0], row[1], row[2])
+        claude_resolved = False
+        resolved_input = session.input_tokens
+        resolved_output = session.output_tokens
+        if session.source is Source.CLAUDE_CODE:
+            input_delta, output_delta = claude_usage.resolve_suffix(conn, session.id, capture)
+            existing_input = int(row[3]) if row[3] is not None else None
+            existing_output = int(row[4]) if row[4] is not None else None
+            resolved_input = (
+                existing_input
+                if input_delta is None
+                else check_claude_aggregate(
+                    (existing_input or 0) + input_delta, field="input_tokens"
+                )
+            )
+            resolved_output = (
+                existing_output
+                if output_delta is None
+                else check_claude_aggregate(
+                    (existing_output or 0) + output_delta, field="output_tokens"
+                )
+            )
+            claude_resolved = True
         # Native metadata is restored from the checkpoint, never from the
         # overridden stored row. A removed override may therefore publish NULL.
         desired = _SessionIndexedFields(session.started_at, session.cwd, session.git_repo)
@@ -2209,11 +2269,13 @@ def _incremental_write_session(
                 message_count = message_count + ?,
                 tool_count = tool_count + ?,
                 input_tokens = CASE
+                    WHEN ? THEN ?
                     WHEN ? IS NULL THEN input_tokens
                     WHEN ? THEN GREATEST(COALESCE(input_tokens, 0), ?)
                     ELSE COALESCE(input_tokens, 0) + ?
                 END,
                 output_tokens = CASE
+                    WHEN ? THEN ?
                     WHEN ? IS NULL THEN output_tokens
                     WHEN ? THEN GREATEST(COALESCE(output_tokens, 0), ?)
                     ELSE COALESCE(output_tokens, 0) + ?
@@ -2242,14 +2304,18 @@ def _incremental_write_session(
                 session.git_branch,
                 session.message_count,
                 session.tool_count,
-                session.input_tokens,
+                claude_resolved,
+                resolved_input,
+                resolved_input,
                 is_absolute_token_source,
-                session.input_tokens,
-                session.input_tokens,
-                session.output_tokens,
+                resolved_input,
+                resolved_input,
+                claude_resolved,
+                resolved_output,
+                resolved_output,
                 is_absolute_token_source,
-                session.output_tokens,
-                session.output_tokens,
+                resolved_output,
+                resolved_output,
                 session.cached_input_tokens,
                 is_absolute_token_source,
                 session.cached_input_tokens,
@@ -2294,9 +2360,28 @@ def _write_session(
     context_mode: str = "off",
     host: str | None = None,
     tail_facts: TailFacts,
+    capture: ParseResult | None = None,
     on_commit: Callable[[], None] | None = None,
     snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
+    if session.source is Source.CLAUDE_CODE:
+        if (
+            capture is None
+            or not isinstance(capture.claude_usage, ClaudeUsageFull)
+            or capture.committed_prefix_sha256 is None
+        ):
+            raise ValueError(
+                "Claude full publication requires a ClaudeUsageFull capture and prefix digest"
+            )
+        acknowledge = on_commit
+        claude_capture = capture
+
+        def publish_usage() -> None:
+            claude_usage.replace_full(conn, session.id, claude_capture)
+            if acknowledge is not None:
+                acknowledge()
+
+        on_commit = publish_usage
     if snapshot is None:
         snapshot = _load_session_write_snapshot(conn, session, host=host)
     previous_rows = snapshot.rows
@@ -2722,7 +2807,9 @@ def _update_session_row(
     last_byte_offset: int = 0,
 ) -> None:
     values = _session_row_values(session, last_byte_offset=last_byte_offset)
-    if _session_update_is_noop(existing_row, values):
+    if _session_update_is_noop(
+        existing_row, values, preserve_null_tokens=session.source is not Source.CLAUDE_CODE
+    ):
         return
     previous = _SessionIndexedFields(
         cast(datetime | None, existing_row[1]),
@@ -2733,6 +2820,7 @@ def _update_session_row(
     assignments, parameters = desired.assignments_from(previous)
     # Preserve harvest-filled tokens when the parser leaves them None
     # (Grok chat_history has no usage — REQ-USAGE-014 / idempotency).
+    # Claude Code owns absolute nullable totals from its response ledger.
     conn.execute(
         f"""
         UPDATE session_state
@@ -2744,8 +2832,8 @@ def _update_session_row(
             git_branch = ?,
             message_count = ?,
             tool_count = ?,
-            input_tokens = CASE WHEN ? IS NULL THEN input_tokens ELSE ? END,
-            output_tokens = CASE WHEN ? IS NULL THEN output_tokens ELSE ? END,
+            input_tokens = CASE WHEN ? AND ? IS NULL THEN input_tokens ELSE ? END,
+            output_tokens = CASE WHEN ? AND ? IS NULL THEN output_tokens ELSE ? END,
             cached_input_tokens = CASE WHEN ? IS NULL THEN cached_input_tokens ELSE ? END,
             is_complete = ?,
             file_mtime = ?,
@@ -2762,10 +2850,12 @@ def _update_session_row(
             values[7],  # git_branch
             values[8],  # message_count
             values[9],  # tool_count
+            session.source is not Source.CLAUDE_CODE,
             values[10],
-            values[10],  # input_tokens null-preserve
+            values[10],  # input_tokens null-preserve for non-Claude
+            session.source is not Source.CLAUDE_CODE,
             values[11],
-            values[11],  # output_tokens null-preserve
+            values[11],  # output_tokens null-preserve for non-Claude
             values[17],
             values[17],  # cached_input_tokens null-preserve
             values[12],  # is_complete
@@ -3473,7 +3563,12 @@ def _normalize_timestamp_for_compare(value: object) -> object:
     return value
 
 
-def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
+def _session_update_is_noop(
+    existing_row: tuple[object, ...],
+    values: tuple[object, ...],
+    *,
+    preserve_null_tokens: bool = True,
+) -> bool:
     """Whether applying the session UPDATE would leave the row unchanged.
 
     ``existing_row`` is the wider persisted SELECT (includes ``host``, which the
@@ -3486,7 +3581,11 @@ def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[obje
     existing = _canonicalize_scalar_row(existing_row)
     new = _canonicalize_scalar_row(values)
     for index in _SESSION_CHANGE_INDICES:
-        if index in _SESSION_NULL_PRESERVE_INDICES and new[index] is None:
+        if (
+            index in _SESSION_NULL_PRESERVE_INDICES
+            and new[index] is None
+            and (preserve_null_tokens or index == 17)
+        ):
             continue
         if new[index] != existing[index]:
             return False

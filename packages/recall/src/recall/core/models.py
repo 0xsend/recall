@@ -404,14 +404,121 @@ class NormalizationCheckpoint:
         )
 
 
+CLAUDE_USAGE_INT64_MAX = (1 << 63) - 1
+CLAUDE_USAGE_COUNTER_MAX = 10**12
+
+
+def admit_claude_counter(value: object) -> int | None:
+    """Admit one non-negative integer usage counter within the per-response bound."""
+    if type(value) is int and 0 <= value <= CLAUDE_USAGE_COUNTER_MAX:
+        return value
+    return None
+
+
+def check_claude_aggregate(value: int | None, *, field: str) -> int | None:
+    """Verify an accumulated Claude session token total fits signed 64-bit storage."""
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= CLAUDE_USAGE_INT64_MAX:
+        raise ValueError(f"Claude {field} total exceeds int64 range")
+    return value
+
+
+@dataclass(frozen=True)
+class ClaudeCounters:
+    """Last supplied cells; None means the field has never been supplied."""
+
+    input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for value in self.cells():
+            if value is not None and admit_claude_counter(value) is None:
+                raise ValueError(f"invalid Claude usage counter: {value!r}")
+
+    def cells(self) -> tuple[int | None, ...]:
+        return (
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+            self.output_tokens,
+        )
+
+    def patched(self, patch: ClaudeCounters) -> ClaudeCounters:
+        return ClaudeCounters(
+            *(
+                old if new is None else new
+                for old, new in zip(self.cells(), patch.cells(), strict=True)
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ClaudeAnonymousCounters:
+    """Additive counters for anonymous Claude records lacking message.id."""
+
+    input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("input_tokens", self.input_tokens),
+            ("cache_creation_input_tokens", self.cache_creation_input_tokens),
+            ("cache_read_input_tokens", self.cache_read_input_tokens),
+            ("output_tokens", self.output_tokens),
+        ):
+            check_claude_aggregate(value, field=name)
+
+    def cells(self) -> tuple[int | None, ...]:
+        return (
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+            self.output_tokens,
+        )
+
+
+@dataclass(frozen=True)
+class ClaudeResponseUsage:
+    response_id: str
+    counters: ClaudeCounters
+
+
+@dataclass(frozen=True)
+class ClaudeUsageFull:
+    """Complete file-local projection, unbound until its publishing transaction."""
+
+    responses: tuple[ClaudeResponseUsage, ...]
+
+
+@dataclass(frozen=True)
+class ClaudeUsageSuffix:
+    """Unresolved patches, never additive session totals.
+
+    An unbound token can occur in a direct parser call; it authorizes no write.
+    Only the writer can bind a full projection's checkpoint to a durable scope.
+    """
+
+    scope_token: str | None
+    base_offset: int
+    base_prefix_sha256: str
+    responses: tuple[ClaudeResponseUsage, ...]
+    anonymous: ClaudeAnonymousCounters
+
+
 @dataclass(frozen=True)
 class ParseResult:
     """Result of parsing a session file, supporting byte-offset incremental parsing.
 
     When ``is_full_parse`` is True (offset=0), ``session`` contains all messages.
     When False (offset>0), ``session`` contains only newly parsed messages and
-    a complete metadata projection and token deltas — the caller appends the
-    content, replaces metadata, and merges the source's token counters.
+    a complete metadata projection. Claude usage is an unresolved typed patch;
+    other sources supply token deltas. The writer resolves usage in its content
+    transaction before merging totals.
     """
 
     session: Session
@@ -434,3 +541,4 @@ class ParseResult:
     # is the only safe reading of an open normalization boundary.
     normalization_checkpoint: NormalizationCheckpoint | None = None
     reached_end: bool = True
+    claude_usage: ClaudeUsageFull | ClaudeUsageSuffix | None = None

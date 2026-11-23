@@ -316,6 +316,7 @@ CREATE TABLE IF NOT EXISTS runtime_state (
     needs_index_verification BOOLEAN DEFAULT FALSE,
     -- Applied INDEX_MIGRATION_VERSION. 0 means never applied (existing DBs).
     -- Fresh databases are initialized to the package version in ensure_schema.
+    claude_usage_incarnation BIGINT DEFAULT 0,
     index_migration_version INTEGER DEFAULT 0
 );
 
@@ -362,3 +363,19 @@ CREATE INDEX IF NOT EXISTS idx_embedding_cache_kind ON embedding_cache(kind);
 CREATE INDEX IF NOT EXISTS idx_fts_sidecar_pending_kind_id ON fts_sidecar_pending(kind, id);
 -- Pairing a tool_result to its call is a lookup by (session, harness id).
 CREATE INDEX IF NOT EXISTS idx_tool_use_ids_lookup ON tool_use_ids(session_id, tool_use_id);
+
+CREATE TABLE IF NOT EXISTS claude_usage_scopes (
+    session_id TEXT PRIMARY KEY,
+    scope_token TEXT NOT NULL,
+    format_revision INTEGER NOT NULL,
+    committed_offset BIGINT NOT NULL,
+    prefix_sha256 TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS claude_response_usage (
+    response_key TEXT PRIMARY KEY,
+    scope_token TEXT NOT NULL,
+    input_tokens BIGINT,
+    cache_creation_input_tokens BIGINT,
+    cache_read_input_tokens BIGINT,
+    output_tokens BIGINT
+);

@@ -16,6 +16,17 @@ from recall.core.source_io import open_source
 
 HASH_BUFFER_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 64 * 1024 * 1024
+# Bound JSON integer parsing well above 64-bit integers and well below Python's
+# 4,300-digit int_max_str_digits ValueError guard. Returning None preserves
+# type distinction from quoted strings, keeps strict JSON serialization valid,
+# and presents oversized counters as unsupplied.
+MAX_JSON_INT_DIGITS = 100
+
+
+def _parse_bounded_json_int(raw: str) -> int | None:
+    if len(raw) - raw.startswith("-") > MAX_JSON_INT_DIGITS:
+        return None
+    return int(raw)
 
 
 class JsonlCapture:
@@ -140,7 +151,7 @@ class JsonlCapture:
                 break
             try:
                 line = raw.decode("utf-8").strip()
-                entry = json.loads(line) if line else None
+                entry = json.loads(line, parse_int=_parse_bounded_json_int) if line else None
             except (UnicodeDecodeError, json.JSONDecodeError):
                 self.diagnostics.append(
                     ParseDiagnostic("malformed_record", self.record_start, "invalid UTF-8 or JSON")

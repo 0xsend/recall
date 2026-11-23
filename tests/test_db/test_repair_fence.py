@@ -5,7 +5,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from recall.db.schema import ensure_schema, ensure_schema_lenient
+from recall.db.schema import SCHEMA_VERSION, ensure_schema, ensure_schema_lenient
 
 RECREATE = "recall index --recreate --yes"
 
@@ -15,7 +15,9 @@ def test_fresh_database_is_fenced_with_seeded_recovery_state(tmp_path: Path) -> 
     with duckdb.connect(str(path)) as conn:
         ensure_schema(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert conn.execute(
             "SELECT phase, attempt_no, success_since_attempt, success_since_failure "
             "FROM daemon_index_repair WHERE singleton"
@@ -41,7 +43,9 @@ def test_existing_database_upgrade_preserves_acknowledged_rows(tmp_path: Path) -
     with duckdb.connect(str(path)) as conn:
         ensure_schema_lenient(conn)
     with duckdb.connect(str(path), read_only=True) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert conn.execute("SELECT * FROM witness").fetchall() == [(1, "acknowledged")]
         assert conn.execute("SELECT phase FROM daemon_index_repair").fetchone() == ("idle",)
 
@@ -109,7 +113,9 @@ def test_schema_41_without_a_valid_recovery_singleton_is_not_admitted(
         ensure(conn)
     _assert_prohibits_recreate(str(caught.value))
     with duckdb.connect(str(path), read_only=True) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert conn.execute("SELECT id FROM witness").fetchall() == [(1,)]
         tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
         if damage == "table_absent":

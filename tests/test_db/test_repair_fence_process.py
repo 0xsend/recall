@@ -8,7 +8,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from recall.db.schema import ensure_schema
+from recall.db.schema import SCHEMA_VERSION, ensure_schema
 
 
 @pytest.mark.parametrize("operation", ["upgrade", "fresh", "recreate"])
@@ -81,7 +81,13 @@ def test_fence_effects_are_atomic_across_real_process_loss(
             else (None,)
         )
         assert versions == (
-            41 if committed or operation == "recreate" else 36 if operation == "upgrade" else None,
+            41
+            if operation == "upgrade" and committed
+            else SCHEMA_VERSION
+            if committed or operation == "recreate"
+            else 36
+            if operation == "upgrade"
+            else None,
         )
         audit = (
             fresh.execute(

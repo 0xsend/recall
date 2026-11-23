@@ -263,9 +263,45 @@ def require_schema_fence(conn: duckdb.DuckDBPyConnection) -> SchemaFence:
     return SchemaFence(int(row[0]))
 
 
+_EXPECTED_COLUMN_TYPES: dict[str, str] = {
+    "singleton": "BOOLEAN",
+    "attempt_no": "UBIGINT",
+    "phase": "VARCHAR",
+    "trigger_id": "UUID",
+    "trigger_kind": "VARCHAR",
+    "signature": "VARCHAR",
+    "trigger_json": "JSON",
+    "target_manifest": "JSON",
+    "oracle_ref": "VARCHAR",
+    "oracle_hash": "VARCHAR",
+    "success_since_attempt": "BOOLEAN",
+    "last_folded_event_id": "UUID",
+    "success_since_failure": "BOOLEAN",
+    "acknowledged_events": "JSON",
+    "release_certificate": "JSON",
+}
+
+
 def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
+    base_table = conn.execute(
+        "SELECT 1 FROM duckdb_tables() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'daemon_index_repair' AND NOT internal AND NOT temporary"
+    ).fetchone()
+    if base_table is None:
+        raise ValueError("recovery singleton base table is missing")
+    columns = {
+        str(name): str(col_type)
+        for name, col_type in conn.execute(
+            "SELECT column_name, data_type FROM duckdb_columns() "
+            "WHERE database_name = current_database() AND schema_name = 'main' "
+            "AND table_name = 'daemon_index_repair' AND NOT internal"
+        ).fetchall()
+    }
+    if columns != _EXPECTED_COLUMN_TYPES:
+        raise ValueError("recovery singleton schema does not match expected columns/types")
     rows = conn.execute(
-        f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
+        f"SELECT {', '.join(_COLUMNS)} FROM main.daemon_index_repair WHERE singleton"
     ).fetchall()
     if len(rows) != 1:
         raise ValueError("recovery singleton is missing or duplicated")
@@ -363,7 +399,7 @@ def save_repair_row(conn: duckdb.DuckDBPyConnection, row: RepairRow) -> None:
         for name in _COLUMNS
     ]
     updated = conn.execute(
-        "UPDATE daemon_index_repair SET "
+        "UPDATE main.daemon_index_repair SET "
         + ", ".join(f"{name} = ?" for name in _COLUMNS)
         + " WHERE singleton",
         values,

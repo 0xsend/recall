@@ -28,6 +28,7 @@ from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
+from recall.db import claude_usage
 from recall.db.fts_sidecar_stage import OwnedKeywordTurn, Publication
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.source_files import (
@@ -1272,6 +1273,8 @@ def _commit_raw_content(
             if current is None or (
                 current.committed_generation != item.committed_generation
                 or current.content_epoch != item.content_epoch
+                or current.committed_offset != item.committed_offset
+                or current.committed_prefix_sha256 != item.committed_prefix_sha256
             ):
                 raise RuntimeError("committed source generation changed during preparation")
             if capture.unsupported_limit is not None:
@@ -1340,6 +1343,8 @@ def _commit_raw_content(
                 if prefix is None:
                     raise RuntimeError("raw reconciliation requires a captured prefix digest")
                 checkpoint = result.normalization_checkpoint
+                if checkpoint is not None and result.claude_usage is not None:
+                    checkpoint = claude_usage.bind_checkpoint(conn, session.id, checkpoint)
                 catalog.bind_session(source.source, source.source_path, session.id)
                 if not catalog.acknowledge(
                     source.source,
@@ -1395,6 +1400,13 @@ def _commit_raw_content(
             # An unsupported record alone never rejects a capture, so the
             # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
+            if isinstance(err, claude_usage.UnprovedClaudeScope):
+                # Leave the old acknowledgement intact, but require preparation
+                # from zero on the next turn. No file parse occurs in the writer.
+                conn.execute(
+                    "UPDATE source_files SET normalization_checkpoint = NULL WHERE source_key = ?",
+                    [catalog_key(item.source, item.source_path)],
+                )
             catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn, observer=lease.observer)

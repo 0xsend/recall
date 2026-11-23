@@ -9,6 +9,7 @@ import duckdb
 import pytest
 from recall.db.connection import connect
 from recall.db.repair import SchemaFence, load_repair_row
+from recall.db.schema import SCHEMA_VERSION
 from recall.services import indexer
 from recall.services.repair_events import publish_event, read_events
 from recall.services.self_repair import (
@@ -117,7 +118,9 @@ def test_failed_reset_rolls_back_the_fence_and_retains_backup(
         asyncio.run(server.stop())
     with duckdb.connect(str(server._config.db_path), read_only=True) as fresh:
         assert fresh.execute("SELECT * FROM witness").fetchall() == [(17,)]
-        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert (load_repair_row(fresh).phase, load_repair_row(fresh).attempt_no) == ("idle", 0)
     with duckdb.connect(str(backup / "recall.duckdb"), read_only=True) as saved:
         assert saved.execute("SELECT * FROM witness").fetchall() == [(17,)]
@@ -160,7 +163,7 @@ def test_explicit_settled_reset_retains_matched_recovery_set_and_atomic_fence(
         assert (backup / before.oracle_ref / name).read_bytes() == content
     manifest = json.loads((backup / "manifest.json").read_text())
     assert manifest["complete"] is True
-    assert manifest["recovery"]["schema_version"] == 41
+    assert manifest["recovery"]["schema_version"] == SCHEMA_VERSION
     with duckdb.connect(str(backup / "recall.duckdb"), read_only=True) as saved:
         assert load_repair_row(saved) == before
         assert saved.execute("SELECT * FROM witness").fetchall() == [(17,)]
@@ -168,7 +171,9 @@ def test_explicit_settled_reset_retains_matched_recovery_set_and_atomic_fence(
         row = load_repair_row(fresh)
         assert (row.phase, row.attempt_no) == ("idle", 0)
         assert row.success_since_attempt is True and row.success_since_failure is True
-        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (41,)
+        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (
+            SCHEMA_VERSION,
+        )
         assert fresh.execute(
             "SELECT migration_id FROM schema_migrations "
             "WHERE migration_id = '0041_daemon_index_repair'"
