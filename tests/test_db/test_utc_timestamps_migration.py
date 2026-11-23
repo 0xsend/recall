@@ -499,3 +499,37 @@ def test_migration_0043_converts_pending_sidecar_queue_preserving_utc_plus_9_ord
             assert sidecar.execute("SELECT COUNT(*) FROM message_fts").fetchone() == (1,)
         finally:
             sidecar.close()
+
+
+def test_pending_sidecar_repair_converges_across_chicago_dst_fallback_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ambiguous Chicago fall-back delete (01:30 -> 07:30Z) cannot erase live 07:05Z upsert."""
+    from recall.db.fts_sidecar import open_sidecar
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch_on
+
+    _set_tz(monkeypatch, "America/Chicago")
+    path = tmp_path / "v42_fallback.duckdb"
+    _seed_schema_42_db(path, tz_name="America/Chicago", version=42)
+
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("SET TimeZone = 'America/Chicago'")
+        # Pre-upgrade delete at 01:30 CDT on Nov 1, 2026 (06:30Z); 0043 resolves ambiguous
+        # 01:30 to 07:30Z, which sorts AFTER a post-upgrade 07:05Z upsert.
+        conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at) "
+            "VALUES ('message', 'm1', 'delete', TIMESTAMP '2026-11-01 01:30:00')"
+        )
+        ensure_schema(conn)
+        conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at) "
+            "VALUES ('message', 'm1', 'upsert', TIMESTAMP '2026-11-01 07:05:00')"
+        )
+        sidecar = open_sidecar(Path(":memory:"))
+        try:
+            with StandaloneLifetime().lease(conn) as lease:
+                result = repair_pending_batch_on(lease, sidecar)
+            assert result.applied == 2 and result.remaining == 0
+            assert sidecar.execute("SELECT COUNT(*) FROM message_fts").fetchone() == (1,)
+        finally:
+            sidecar.close()

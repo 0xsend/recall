@@ -716,3 +716,57 @@ def test_cross_device_move_across_schema_42_to_43_transition_retains_session_id(
                 ],
             )
             assert find_moved_predecessors(conn, moved_capture, host="h1") == (sid,)
+
+        # Regression: 20 unrelated departed transcripts sharing the same native ID 1..20 min later
+        # must NOT displace a proven cross-device continuation (for either UTC or legacy-local row).
+        for stored_ts in (datetime(2026, 7, 15, 18, 0, 0), datetime(2026, 7, 15, 13, 0, 0)):
+            conn.execute("DELETE FROM source_files")
+            conn.execute("DELETE FROM session_state")
+            conn.execute("DELETE FROM sessions")
+            conn.execute(
+                "INSERT INTO sessions(id, source, source_path, source_session_id) "
+                "VALUES ('true_pred', 'codex', ?, 'native_cutover')",
+                [str(old_path)],
+            )
+            conn.execute(
+                "INSERT INTO session_state(session_id, started_at, file_mtime, file_size, host) "
+                "VALUES ('true_pred', ?, 1.0, 100, 'h1')",
+                [stored_ts],
+            )
+            conn.execute(
+                """INSERT INTO source_files(
+                    source_key, source, source_path, root_path, session_id,
+                    dev, inode, ctime_ns, mtime_ns, size,
+                    committed_offset, committed_prefix_sha256, observed_at
+                ) VALUES (?, 'codex', ?, ?, 'true_pred', 0, 0, 1, 1, ?, ?, ?, 1.0)""",
+                [
+                    source_key("codex", str(old_path)),
+                    str(old_path),
+                    str(root),
+                    orig_capture.next_byte_offset,
+                    orig_capture.next_byte_offset,
+                    orig_capture.committed_prefix_sha256,
+                ],
+            )
+            for idx in range(1, 21):
+                other_path = str(root / f"other_{idx}.jsonl")
+                conn.execute(
+                    "INSERT INTO sessions(id, source, source_path, source_session_id) "
+                    "VALUES (?, 'codex', ?, 'native_cutover')",
+                    [f"other_{idx}", other_path],
+                )
+                conn.execute(
+                    "INSERT INTO session_state"
+                    "(session_id, started_at, file_mtime, file_size, host) "
+                    "VALUES (?, ?, 1.0, 100, 'h1')",
+                    [f"other_{idx}", stored_ts + timedelta(minutes=idx)],
+                )
+                conn.execute(
+                    """INSERT INTO source_files(
+                        source_key, source, source_path, root_path, session_id,
+                        dev, inode, ctime_ns, mtime_ns, size,
+                        committed_offset, committed_prefix_sha256, observed_at
+                    ) VALUES (?, 'codex', ?, ?, ?, 0, 0, 1, 1, 50, 50, 'deadbeef', 1.0)""",
+                    [source_key("codex", other_path), other_path, str(root), f"other_{idx}"],
+                )
+            assert find_moved_predecessors(conn, moved_capture, host="h1") == ("true_pred",)

@@ -854,12 +854,12 @@ def _partition_pending_entries(
     message_ids = [
         entry.entity_id
         for entry in entries
-        if entry.kind == _MESSAGE_KIND and entry.op == _UPSERT_OP
+        if entry.kind == _MESSAGE_KIND and entry.op in (_UPSERT_OP, _DELETE_OP)
     ]
     tool_call_ids = [
         entry.entity_id
         for entry in entries
-        if entry.kind == _TOOL_CALL_KIND and entry.op == _UPSERT_OP
+        if entry.kind == _TOOL_CALL_KIND and entry.op in (_UPSERT_OP, _DELETE_OP)
     ]
     message_sizes = _measure_message_payload_bytes(duckdb_conn, message_ids) if message_ids else {}
     tool_sizes = (
@@ -868,7 +868,7 @@ def _partition_pending_entries(
     chunk: list[_PendingEntry] = []
     used = 0
     for entry in entries:
-        if entry.op != _UPSERT_OP:
+        if entry.op not in (_UPSERT_OP, _DELETE_OP):
             entry_bytes = 0
         elif entry.kind == _TOOL_CALL_KIND:
             entry_bytes = tool_sizes.get(entry.entity_id, 0)
@@ -893,18 +893,21 @@ def _hydrate_pending_entries(
 ) -> list[_PendingRow]:
     if not entries:
         return []
+    # Hydrate canonical DuckDB state for both upserts and deletes so repair
+    # always converges on current canonical state even if intent timestamps
+    # cross a DST fall-back hour or timezone cutover.
     message_ids = list(
         dict.fromkeys(
             entry.entity_id
             for entry in entries
-            if entry.kind == _MESSAGE_KIND and entry.op == _UPSERT_OP
+            if entry.kind == _MESSAGE_KIND and entry.op in (_UPSERT_OP, _DELETE_OP)
         )
     )
     tool_call_ids = list(
         dict.fromkeys(
             entry.entity_id
             for entry in entries
-            if entry.kind == _TOOL_CALL_KIND and entry.op == _UPSERT_OP
+            if entry.kind == _TOOL_CALL_KIND and entry.op in (_UPSERT_OP, _DELETE_OP)
         )
     )
     # Scalar IN parameters retain index scans for scattered IDs on DuckDB 1.5.5;
@@ -991,23 +994,17 @@ def _apply_pending_row(
     *,
     fts_fields: tuple[str, ...] | None,
 ) -> None:
-    if row.kind == _MESSAGE_KIND and row.op == _UPSERT_OP:
+    if row.kind == _MESSAGE_KIND and row.op in (_UPSERT_OP, _DELETE_OP):
         if row.message_columns is None:
             _page_publication(sidecar_conn).delete([row.entity_id], "message")
         else:
             upsert_message_fts(sidecar_conn, row.entity_id, *row.message_columns, fields=fts_fields)
         return
-    if row.kind == _MESSAGE_KIND and row.op == _DELETE_OP:
-        _page_publication(sidecar_conn).delete([row.entity_id], "message")
-        return
-    if row.kind == _TOOL_CALL_KIND and row.op == _UPSERT_OP:
+    if row.kind == _TOOL_CALL_KIND and row.op in (_UPSERT_OP, _DELETE_OP):
         if row.bash_command is None:
             _page_publication(sidecar_conn).delete([row.entity_id], "tool_call")
         else:
             upsert_tool_call_fts(sidecar_conn, row.entity_id, row.bash_command, fields=fts_fields)
-        return
-    if row.kind == _TOOL_CALL_KIND and row.op == _DELETE_OP:
-        _page_publication(sidecar_conn).delete([row.entity_id], "tool_call")
         return
     raise ValueError("unsupported kind/op")
 
