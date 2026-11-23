@@ -268,13 +268,18 @@ def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
         rows = conn.execute(
             f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
         ).fetchall()
-    except duckdb.BinderException as error:
+    except (duckdb.BinderException, duckdb.ConversionException) as error:
         raise ValueError(f"recovery singleton schema is invalid: {error}") from error
     if len(rows) != 1:
         raise ValueError("recovery singleton is missing or duplicated")
     payload = dict(zip(_COLUMNS, rows[0], strict=True))
     for name in _JSON_COLUMNS:
         if payload[name] is not None:
+            if not isinstance(payload[name], str):
+                raise ValueError(
+                    f"recovery singleton column {name} must be JSON text, got "
+                    f"{type(payload[name]).__name__}"
+                )
             payload[name] = json.loads(payload[name])
     return RepairRow.model_validate(payload)
 
