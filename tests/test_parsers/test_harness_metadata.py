@@ -28,7 +28,17 @@ CASES = [
     pytest.param(
         KimiCodeParser(), "kimi_code/plan-revision/agents/main/wire.jsonl", id="plan-revision"
     ),
+    pytest.param(
+        KimiCodeParser(),
+        "kimi_code/env-subagent-tool-select/agents/main/wire.jsonl",
+        id="kimi-env-subagent-tool-select",
+    ),
     pytest.param(ClaudeCodeParser(), "claude_code/session-tools-used.jsonl", id="tools-used"),
+    pytest.param(
+        ClaudeCodeParser(),
+        "claude_code/session-data-flow-repl.jsonl",
+        id="claude-data-flow-repl",
+    ),
 ]
 
 
@@ -51,7 +61,8 @@ def test_harness_metadata_preserves_conversation(
     assert result.session.input_tokens is None
     assert result.session.output_tokens is None
     if parser.source == "claude_code":
-        assert result.session.source_session_id == "tools-used"
+        expected_sid = "claude-data-flow-repl" if "data-flow" in fixture else "tools-used"
+        assert result.session.source_session_id == expected_sid
 
 
 @pytest.mark.parametrize(("parser", "fixture"), CASES)
@@ -103,7 +114,12 @@ def test_harness_metadata_split_matches_full_parse(
         ),
         (KimiCodeParser(), {"type": "changeNotifier.future"}),
         (KimiCodeParser(), {"type": "plan.future"}),
+        (KimiCodeParser(), {"type": "environment.future"}),
+        (KimiCodeParser(), {"type": "tool_select.future"}),
+        (KimiCodeParser(), {"type": "subagent.future"}),
         (ClaudeCodeParser(), {"type": "tools-used-future"}),
+        (ClaudeCodeParser(), {"type": "data-flow-future"}),
+        (ClaudeCodeParser(), {"type": "repl-mode-future"}),
     ],
 )
 def test_unknown_harness_metadata_stays_diagnostic(

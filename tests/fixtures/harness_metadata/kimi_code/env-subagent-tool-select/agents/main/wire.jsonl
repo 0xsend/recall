@@ -1,0 +1,5 @@
+{"time": 1792972800000, "type": "context.append_message", "message": {"role": "user", "content": "Parser orchard question"}}
+{"time": 1792972800100, "type": "environment.set_binding", "agentId": "main", "binding": {"cwd": "/work"}}
+{"time": 1792972800200, "type": "tool_select.initialized", "agentId": "main", "tools": ["Read"]}
+{"time": 1792972800300, "type": "subagent.cancelled", "agentId": "main", "subagentId": "sub-1"}
+{"time": 1792972800400, "type": "context.append_message", "message": {"role": "system", "content": "Parser orchard answer"}}
