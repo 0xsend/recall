@@ -28,7 +28,7 @@ from recall.core.fleet import (
     load_fleet_config,
 )
 from recall.core.host_text import HostMessage, HostText, format_host
-from recall.core.types import Source
+from recall.core.types import Role, Source
 from recall.services.fleet_transport import fleet_status
 
 app = typer.Typer(help="Diagnose inventory SSH routes to edge daemons")
@@ -202,19 +202,28 @@ def run_fleet_search(
     tool: str | None,
     source: str | None,
     mode: str | None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: str | None = None,
+    host: str | None = None,
+    per_session: int | None = None,
     limit: int,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
 ) -> tuple[list[dict[str, object]], str | None]:
     from recall.services.fleet_query import fleet_search
 
-    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
     result = fleet_search(
         executor,
         query=query,
         tool=tool,
         source=source,
         mode=mode,
+        roles=roles,
+        project=project,
+        since=since,
+        per_session=per_session,
         limit=limit,
     )
     _emit_skips(result.errors)

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from recall.core.host_text import HostValue
-from recall.core.rpc_params import ListParams, LiveParams, SearchParams, ShowParams
-from recall.core.types import is_attributed_host
+from recall.core.rpc_params import (
+    ListParams,
+    LiveParams,
+    SearchFilteredParams,
+    SearchParams,
+    ShowParams,
+)
+from recall.core.search_filters import has_filtered_search_params
+from recall.core.types import Role, is_attributed_host
 from recall.services.fleet_endpoints import (
     EndpointFailure,
     EndpointNotFound,
@@ -217,6 +225,90 @@ def fleet_list(
     )
 
 
+def _parse_finite_score(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("search row score must be a finite number")
+    try:
+        score = float(value)
+    except (TypeError, ValueError, OverflowError) as err:
+        raise ValueError("search row score must be a finite number") from err
+    if not math.isfinite(score):
+        raise ValueError("search row score must be finite")
+    return score
+
+
+def _decode_filtered_search_array(
+    value: Any,
+    *,
+    expected_roles: frozenset[str] | None,
+    per_session: int | None,
+) -> list[dict[str, Any]]:
+    """Validate filtered search rows fail-closed before fleet merging."""
+    rows = decode_array(value)
+    validated: list[dict[str, Any]] = []
+    session_counts: dict[str, int] = {}
+    for row in rows:
+        kind = row.get("kind")
+        if not isinstance(kind, str) or kind not in {"message", "tool_call"}:
+            raise ValueError("filtered search row missing valid kind")
+        session_id = row.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("filtered search row missing valid session_id")
+        score = _parse_finite_score(row.get("score"))
+        role = row.get("role")
+        if expected_roles is not None and (
+            kind != "message" or not isinstance(role, str) or role not in expected_roles
+        ):
+            raise ValueError("filtered search reply violated --role filter")
+        if per_session is not None:
+            seen = session_counts.get(session_id, 0) + 1
+            if seen > per_session:
+                raise ValueError("filtered search reply exceeded --per-session cap")
+            session_counts[session_id] = seen
+        validated.append({**row, "score": score})
+    return validated
+
+
+def _safe_search_score(row: dict[str, Any]) -> float:
+    raw = row.get("score")
+    if isinstance(raw, bool):
+        return 0.0
+    try:
+        score = float(raw or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
+def _merge_search_with_endpoints(
+    rows: Sequence[dict[str, Any]],
+    endpoints: Sequence[HostValue],
+    *,
+    limit: int,
+    per_session: int | None = None,
+) -> tuple[list[dict[str, Any]], tuple[HostValue, ...]]:
+    paired = list(zip(rows, endpoints, strict=True))
+    ordered = sorted(paired, key=lambda item: _safe_search_score(item[0]), reverse=True)
+    if per_session is None:
+        if limit > 0:
+            ordered = ordered[:limit]
+        return [row for row, _ in ordered], tuple(ep for _, ep in ordered)
+    kept_rows: list[dict[str, Any]] = []
+    kept_endpoints: list[HostValue] = []
+    counts: dict[tuple[str, str], int] = {}
+    for row, endpoint in ordered:
+        session_key = (endpoint.raw(), str(row.get("session_id", "")))
+        seen = counts.get(session_key, 0)
+        if seen >= per_session:
+            continue
+        counts[session_key] = seen + 1
+        kept_rows.append(row)
+        kept_endpoints.append(endpoint)
+        if limit > 0 and len(kept_rows) >= limit:
+            break
+    return kept_rows, tuple(kept_endpoints)
+
+
 def fleet_search(
     executor: FleetExecutor,
     *,
@@ -224,35 +316,74 @@ def fleet_search(
     tool: str | None = None,
     source: str | None = None,
     mode: str | None = None,
+    roles: tuple[Role, ...] | None = None,
+    project: str | None = None,
+    since: str | None = None,
+    per_session: int | None = None,
     limit: int = 20,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetQueryResult:
     argv = ["recall", "search", query, "--json", "--limit", str(limit)]
-    for flag, value in (("--tool", tool), ("--source", source), ("--mode", mode)):
+    for flag, value in (
+        ("--tool", tool),
+        ("--source", source),
+        ("--mode", mode),
+        ("--project", project),
+        ("--since", since),
+    ):
         if value:
             argv.extend([flag, value])
-    raw = _arrays(
-        executor,
-        FleetOperation(
+    if roles:
+        for role in roles:
+            argv.extend(["--role", role.value])
+    if per_session is not None:
+        argv.extend(["--per-session", str(per_session)])
+
+    use_filtered = has_filtered_search_params(
+        roles=roles,
+        project=project,
+        since=since,
+        per_session=per_session,
+        fleet=True,
+    )
+    if use_filtered:
+        expected_roles = frozenset(role.value for role in roles) if roles else None
+        operation = FleetOperation(
+            "recall.search_filtered",
+            SearchFilteredParams(
+                query=query,
+                tool=tool,
+                source=source,
+                mode=mode,
+                limit=limit,
+                role=[role.value for role in roles] if roles else None,
+                project=project,
+                since=since,
+                per_session=per_session,
+            ),
+            argv,
+            lambda value: _decode_filtered_search_array(
+                value,
+                expected_roles=expected_roles,
+                per_session=per_session,
+            ),
+            local_seconds=timeout,
+            remote_seconds=timeout,
+        )
+    else:
+        operation = FleetOperation(
             "recall.search",
             SearchParams(query=query, tool=tool, source=source, mode=mode, limit=limit),
             argv,
             decode_array,
             local_seconds=timeout,
             remote_seconds=timeout,
-        ),
-        concurrency,
-    )
+        )
 
-    def score_key(row: dict[str, Any]) -> float:
-        try:
-            return float(row.get("score") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    merged_rows, merged_endpoints = _merge_with_endpoints(
-        raw.rows, raw.endpoints, key=score_key, limit=limit
+    raw = _arrays(executor, operation, concurrency)
+    merged_rows, merged_endpoints = _merge_search_with_endpoints(
+        raw.rows, raw.endpoints, limit=limit, per_session=per_session
     )
     return FleetQueryResult(
         merged_rows, raw.errors, raw.hosts_ok, raw.hosts_failed, endpoints=merged_endpoints

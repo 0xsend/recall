@@ -50,6 +50,7 @@ from recall.core.rpc_params import (
     Params,
     ResponsiveReadParams,
     SchedulerParams,
+    SearchFilteredParams,
     SearchParams,
     ShowParams,
     SkillStatsParams,
@@ -73,6 +74,7 @@ from recall.core.rpc_types import (
     serialize_rpc_value,
 )
 from recall.core.search_budget import SEARCH_ENRICHMENT_WAIT_SECONDS
+from recall.core.search_filters import normalize_search_filters
 from recall.core.socket_path import validate_socket_path
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import (
@@ -162,6 +164,7 @@ _PROGRESS_KEEPALIVE_SECONDS = 20.0
 _BOUNDED_READ_METHODS = frozenset(
     {
         "recall.search",
+        "recall.search_filtered",
         "recall.list",
         "recall.list_by_session",
         "recall.show",
@@ -1536,6 +1539,7 @@ class RpcServer:
     def _register_methods(self) -> None:
         self._register_method("recall.index", IndexParams, self._handle_index)
         self._register_method("recall.search", SearchParams, self._handle_search)
+        self._register_method("recall.search_filtered", SearchFilteredParams, self._handle_search)
         self._register_method("recall.list", ListParams, self._handle_list)
         self._register_method("recall.list_by_session", ListBySessionParams, self._handle_list)
         self._register_method("recall.show", ShowParams, self._handle_show)
@@ -2881,6 +2885,17 @@ class RpcServer:
         limit = int(params.get("limit", 20))
         mode_value = params.get("mode")
         mode = parse_search_mode(mode_value) if mode_value else SearchMode.AUTO
+        try:
+            filters = normalize_search_filters(
+                tool=tool,
+                role=params.get("role"),
+                project=params.get("project"),
+                since=params.get("since"),
+                host=params.get("host"),
+                per_session=params.get("per_session"),
+            )
+        except ValueError as err:
+            raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
         effective_mode = (
             SearchMode.KEYWORD
             if tool
@@ -2910,6 +2925,11 @@ class RpcServer:
                 source=source,
                 tool=tool,
                 session=session,
+                roles=filters.roles,
+                project=filters.project,
+                since=filters.since,
+                host=filters.host,
+                per_session=filters.per_session,
                 limit=limit,
                 mode=effective_mode,
                 config=self._config,
@@ -4924,7 +4944,11 @@ class RpcServer:
         request_id: object = None,
     ) -> Any:
         """Cancel a handler on deadline or peer departure and drain its cleanup."""
-        timing = SearchRequest(request_id, timeout) if method == "recall.search" else None
+        timing = (
+            SearchRequest(request_id, timeout)
+            if method in {"recall.search", "recall.search_filtered"}
+            else None
+        )
 
         async def invoke() -> Any:
             token = search_request.set(timing)

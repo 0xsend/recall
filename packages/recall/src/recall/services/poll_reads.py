@@ -17,6 +17,7 @@ from recall.core.poll_reads import (
     ListRead,
     PollRead,
     PollSnapshot,
+    SearchFilteredRead,
     SearchRead,
     SessionListRead,
     ShowRead,
@@ -26,6 +27,7 @@ from recall.core.poll_reads import (
 )
 from recall.core.read_cancellation import check_read_cancelled, read_cancellation
 from recall.core.rpc_types import RpcError
+from recall.core.search_filters import normalize_search_filters
 from recall.core.types import SearchMode, parse_search_mode, parse_source
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
@@ -104,11 +106,23 @@ def _load_legacy(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _search(
-    config: AppConfig, request: SearchRead, execution: _Execution
+    config: AppConfig, request: SearchRead | SearchFilteredRead, execution: _Execution
 ) -> Callable[[duckdb.DuckDBPyConnection], Any]:
     params = request.params
     if not params.query:
         raise ValueError("query is required")
+    filters = (
+        normalize_search_filters(
+            tool=request.params.tool,
+            role=request.params.role,
+            project=request.params.project,
+            since=request.params.since,
+            host=request.params.host,
+            per_session=request.params.per_session,
+        )
+        if isinstance(request, SearchFilteredRead)
+        else normalize_search_filters(tool=request.params.tool)
+    )
     mode = parse_search_mode(params.mode) if params.mode else SearchMode.AUTO
     desired = SearchMode.KEYWORD if params.tool else mode
     if desired is SearchMode.AUTO:
@@ -171,6 +185,11 @@ def _search(
             source=parse_source(params.source) if params.source else None,
             tool=params.tool,
             session=params.session,
+            roles=filters.roles,
+            project=filters.project,
+            since=filters.since,
+            host=filters.host,
+            per_session=filters.per_session,
             limit=params.limit,
             mode=final_mode,
             config=config,
@@ -186,7 +205,7 @@ def _reader(
     config: AppConfig, request: PollRead, execution: _Execution
 ) -> Callable[[duckdb.DuckDBPyConnection], Any]:
     match request:
-        case SearchRead():
+        case SearchRead() | SearchFilteredRead():
             return _search(config, request, execution)
         case ListRead() | SessionListRead():
             return lambda conn: read_list(config, conn, request.params)

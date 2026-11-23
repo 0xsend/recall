@@ -15,6 +15,7 @@ from recall.cli.fleet_help import (
 )
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
+from recall.core.search_filters import VALID_SEARCH_ROLES
 from recall.core.types import SOURCE_ALIASES, SOURCE_CLI_NAMES
 
 
@@ -415,6 +416,44 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "options": [
             {"name": "tool", "type": "string"},
             {
+                "name": "role",
+                "type": "string[]",
+                "enum": list(VALID_SEARCH_ROLES),
+                "repeatable": True,
+                "description": (
+                    "Restrict to message hits with matching role; repeatable; "
+                    "cannot be combined with --tool."
+                ),
+            },
+            {
+                "name": "project",
+                "type": "string",
+                "description": "Case-insensitive literal substring filter on session git_repo.",
+            },
+            {
+                "name": "since",
+                "type": "string",
+                "description": (
+                    "Include hits on or after this UTC cutoff (duration like 7d/24h or ISO-8601)."
+                ),
+            },
+            {
+                "name": "host",
+                "type": "string",
+                "description": (
+                    "Locally filters stored session host (and scopes --session); "
+                    "with --fleet selects the inventory endpoint to query."
+                ),
+            },
+            {
+                "name": "per_session",
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Maximum hits returned per session (per endpoint+session on --fleet)."
+                ),
+            },
+            {
                 "name": "session",
                 "type": "string",
                 "description": (
@@ -466,6 +505,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
         "examples": [
             "recall search git",
+            "recall search git --role user --project recall --since 7d --per-session 2",
             'recall search --params \'{"query":"git","limit":5}\'',
         ],
     },

@@ -14,6 +14,7 @@ from recall.core.rpc_params import (
     ListBySessionParams,
     ListParams,
     Params,
+    SearchFilteredParams,
     SearchParams,
     ShowParams,
     SkillStatsParams,
@@ -24,6 +25,11 @@ from recall.core.rpc_params import (
 class SearchRead(Params):
     method: Literal["recall.search"]
     params: SearchParams
+
+
+class SearchFilteredRead(Params):
+    method: Literal["recall.search_filtered"]
+    params: SearchFilteredParams
 
 
 class ListRead(Params):
@@ -63,6 +69,7 @@ class SkillsRead(Params):
 
 PollRead = (
     SearchRead
+    | SearchFilteredRead
     | ListRead
     | SessionListRead
     | ShowRead

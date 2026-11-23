@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import duckdb as duckdb
 import pytest
 from recall import _native
-from recall.core.types import Source
+from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
 from recall.services.search import _vector_search_messages, _vector_search_tool_calls
 
@@ -105,3 +106,96 @@ def test_vector_search_bounds_vectors_during_identity_joins(tmp_path: Path, kind
         assert results[1].score == pytest.approx(2**-0.5)
         assert results[0].source_path == "/owned/join-source"
         assert results[0].content == ("current" if kind == "message" else None)
+
+
+@pytest.mark.parametrize("kind", ["message", "tool_call"])
+def test_vector_search_filtered_per_session_respects_memory_bound(
+    tmp_path: Path, kind: str
+) -> None:
+    """Filtered vector search with QUALIFY per_session preserves scores-first memory guard."""
+    path = tmp_path / "filtered-vectors.duckdb"
+    ts = datetime(2026, 11, 20, 12, 0, 0)
+    with _native.duckdb_connect(str(path)) as conn:
+        ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO sessions (id, source, source_path, source_session_id)
+            SELECT 's-' || (i % 16)::TEXT, 'codex', '/owned/' || (i % 16)::TEXT, NULL
+            FROM range(16) r(i)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session_state (
+                session_id, started_at, ended_at, git_repo, host,
+                message_count, tool_count, is_complete, file_mtime, file_size, indexed_at
+            )
+            SELECT
+                's-' || i::TEXT, ?, ?, 'org/recall', 'aem5',
+                512, 512, true, 1.0, 100, ?
+            FROM range(16) r(i)
+            """,
+            [ts, ts, ts],
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (id, session_id, idx)
+            SELECT i::TEXT, 's-' || (i % 16)::TEXT, i FROM range(8192) r(i)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO message_state (message_id, role, content, timestamp)
+            SELECT i::TEXT, 'assistant', repeat(md5(i::TEXT), 512), ?
+            FROM range(8192) r(i)
+            """,
+            [ts],
+        )
+        if kind == "message":
+            conn.execute("""
+                INSERT INTO message_embeddings (message_id, content_embedding)
+                SELECT i::TEXT, list_transform(range(384), j ->
+                    CASE WHEN j = 0 THEN 1.0 WHEN j = 1 THEN (i::FLOAT / 10.0) ELSE 0.0 END)
+                FROM range(8192) r(i)
+            """)
+        else:
+            conn.execute("""
+                INSERT INTO tool_calls (id, session_id, message_id, idx, tool_name, bash_command)
+                SELECT
+                    i::TEXT, 's-' || (i % 16)::TEXT, i::TEXT, i, 'Bash', repeat(md5(i::TEXT), 512)
+                FROM range(8192) r(i)
+            """)
+            conn.execute("""
+                INSERT INTO tool_call_embeddings (tool_call_id, bash_embedding)
+                SELECT i::TEXT, list_transform(range(384), j ->
+                    CASE WHEN j = 0 THEN 1.0 WHEN j = 1 THEN (i::FLOAT / 10.0) ELSE 0.0 END)
+                FROM range(8192) r(i)
+            """)
+        conn.execute("CHECKPOINT")
+
+    with _native.duckdb_connect(str(path), config={"memory_limit": "64MiB", "threads": 2}) as conn:
+        if kind == "message":
+            results = _vector_search_messages(
+                conn,
+                [1.0] + [0.0] * 383,
+                source=Source.CODEX,
+                limit=4,
+                roles=(Role.ASSISTANT,),
+                project="recall",
+                since=datetime(2026, 11, 1, 0, 0, 0),
+                host="aem5",
+                per_session=1,
+            )
+        else:
+            results = _vector_search_tool_calls(
+                conn,
+                [1.0] + [0.0] * 383,
+                source=Source.CODEX,
+                limit=4,
+                project="recall",
+                since=datetime(2026, 11, 1, 0, 0, 0),
+                host="aem5",
+                per_session=1,
+            )
+        assert len(results) == 4
+        assert len({result.session_id for result in results}) == 4
