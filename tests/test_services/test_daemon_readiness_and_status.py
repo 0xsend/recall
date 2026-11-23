@@ -491,21 +491,23 @@ def test_compressed_limit_takes_precedence_over_truncated_tail(
 
 
 def test_v2_cursor_survives_zsh_echo_json_pipeline_and_accepts_legacy() -> None:
+    import re
+    import shutil
+
     cursor = CatalogCursor(Source.CLAUDE_CODE, "/Users/allen/.claude/projects/a/session.jsonl")
-    assert cursor.token.startswith("v2:")
+    assert re.fullmatch(r"v2:[A-Za-z0-9_-]+", cursor.token) is not None
     assert "\x1f" not in cursor.token
     assert CatalogCursor.parse(cursor.token) == cursor
     assert CatalogCursor.parse(cursor.db_key) == cursor
 
     payload = json.dumps({"reconciliation": {"next_cursor": cursor.token}}, separators=(",", ":"))
-    zsh = subprocess.run(
-        ["zsh", "-c", 'out=$1; echo "$out"', "--", payload],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    parsed = json.loads(zsh.stdout)
-    assert parsed["reconciliation"]["next_cursor"] == cursor.token
+    shells = [["bash", "-c", 'out=$1; echo -e "$out"', "--", payload]]
+    if shutil.which("zsh"):
+        shells.append(["zsh", "-c", 'out=$1; echo "$out"', "--", payload])
+    for cmd in shells:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        parsed = json.loads(proc.stdout)
+        assert parsed["reconciliation"]["next_cursor"] == cursor.token
 
 
 def test_verified_startup_rebuild_clears_needs_index_verification_with_unverifiable_samples(
