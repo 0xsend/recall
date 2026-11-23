@@ -14,7 +14,8 @@ from typing import Any
 
 import duckdb
 from recall.core.config import AppConfig
-from recall.core.models import ParseResult, Session
+from recall.core.models import ClaudeUsageFull, ParseResult, Session
+from recall.core.types import Source
 from recall.db import advisory_lock, connect
 from recall.db.fts_sidecar import ensure_sidecar, sidecar_path
 from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, Publication
@@ -54,6 +55,17 @@ def staged(
     publish(conn, turn)
 
 
+def synthetic_claude_capture(session: Session) -> ParseResult:
+    """Build a valid full-parse capture for synthetic Claude unit-test sessions."""
+    return ParseResult(
+        session=session,
+        next_byte_offset=session.file_size,
+        is_full_parse=True,
+        committed_prefix_sha256="0" * 64,
+        claude_usage=ClaudeUsageFull(()),
+    )
+
+
 def write_published_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
@@ -63,6 +75,8 @@ def write_published_session(
     **kwargs: Any,
 ) -> bool:
     """`_write_session` in its own turn, published to the sidecar under `data_dir`."""
+    if session.source is Source.CLAUDE_CODE and "capture" not in kwargs:
+        kwargs["capture"] = synthetic_claude_capture(session)
     turn = sidecar_turn(data_dir, fields=fields)
     result = _write_session(conn, session, turn=turn, **kwargs)
     publish(conn, turn)

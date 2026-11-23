@@ -25,7 +25,7 @@ from recall.db.connection import (
 )
 from recall.db.lease import DbLifetime, StandaloneLifetime, owned_connection
 from recall.db.repair import FENCE_VERSION
-from recall.db.schema import INDEX_MIGRATION_VERSION
+from recall.db.schema import INDEX_MIGRATION_VERSION, SCHEMA_VERSION
 from recall.db.source_files import SourceCatalog
 from recall.services.migration_backup import original_backup
 from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
@@ -356,11 +356,12 @@ def rollback_migration(config: AppConfig, *, preserve: Path) -> Path:
     """
     from recall.services.self_repair import refusal_marker_path, write_refusal_marker
 
+    assert SCHEMA_VERSION >= FENCE_VERSION
     with offline_file_lifetime(config) as (owner, admission):
 
         def inspect_schema(lease, version):
             admission.observe_schema(version)
-            if version != FENCE_VERSION:
+            if version != SCHEMA_VERSION:
                 raise RuntimeError("migration rollback requires the current fenced schema")
 
         with owned_connection(
@@ -389,7 +390,7 @@ def rollback_migration(config: AppConfig, *, preserve: Path) -> Path:
             )
 
             def same_schema(lease, version):
-                if version != FENCE_VERSION:
+                if version != SCHEMA_VERSION:
                     raise RuntimeError(
                         "migration rollback cannot lower the logical schema; "
                         "use the matched old-install restore procedure"

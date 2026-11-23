@@ -30,7 +30,12 @@ from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
 
 from scripts.benchmark_raw_commit import PandasProbeCounter, build_session
-from tests.keyword_turns import publish, sidecar_turn, without_keyword_index
+from tests.keyword_turns import (
+    publish,
+    sidecar_turn,
+    synthetic_claude_capture,
+    without_keyword_index,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -74,7 +79,13 @@ def _commit_probes(messages: int, counter: PandasProbeCounter) -> list[int]:
             counter.counting = True
             counter.take()
             turn = sidecar_turn(Path(scratch))
-            _write_session(conn, session, tail_facts=TailFacts(), turn=turn)
+            _write_session(
+                conn,
+                session,
+                tail_facts=TailFacts(),
+                capture=synthetic_claude_capture(session),
+                turn=turn,
+            )
             assert publish(conn, turn).outcome == "published"
             counter.counting = False
             tallies.append(counter.take())
@@ -138,18 +149,28 @@ def test_an_id_that_reads_as_sql_never_reaches_another_session() -> None:
     try:
         ensure_schema(conn)
         bystander = _two_message_session("d" * 32, "bystander", session_id="bystander-session")
-        _write_session(conn, bystander, tail_facts=TailFacts(), turn=without_keyword_index())
-
         _write_session(
             conn,
-            _two_message_session(HOSTILE_ID, "before"),
+            bystander,
             tail_facts=TailFacts(),
+            capture=synthetic_claude_capture(bystander),
             turn=without_keyword_index(),
         )
+
+        before_hostile = _two_message_session(HOSTILE_ID, "before")
         _write_session(
             conn,
-            _two_message_session(HOSTILE_ID, "after"),
+            before_hostile,
             tail_facts=TailFacts(),
+            capture=synthetic_claude_capture(before_hostile),
+            turn=without_keyword_index(),
+        )
+        after_hostile = _two_message_session(HOSTILE_ID, "after")
+        _write_session(
+            conn,
+            after_hostile,
+            tail_facts=TailFacts(),
+            capture=synthetic_claude_capture(after_hostile),
             turn=without_keyword_index(),
         )
 
@@ -168,16 +189,20 @@ def test_a_rewrite_keeps_every_row_when_an_id_cannot_be_a_literal() -> None:
     conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn)
+        before_quote = _two_message_session("quote'id", "before")
         _write_session(
             conn,
-            _two_message_session("quote'id", "before"),
+            before_quote,
             tail_facts=TailFacts(),
+            capture=synthetic_claude_capture(before_quote),
             turn=without_keyword_index(),
         )
+        after_quote = _two_message_session("quote'id", "after")
         _write_session(
             conn,
-            _two_message_session("quote'id", "after"),
+            after_quote,
             tail_facts=TailFacts(),
+            capture=synthetic_claude_capture(after_quote),
             turn=without_keyword_index(),
         )
 

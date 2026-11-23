@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb as duckdb
 import pytest
 from recall import _native
-from recall.core.models import Session, TailFacts
+from recall.core.models import ParseResult, Session, TailFacts
 from recall.core.types import Source
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _incremental_write_session, _write_session
@@ -39,12 +39,22 @@ def test_progress_preserves_row_and_changed_indexed_metadata_is_searchable(
             progressed,
             last_byte_offset=20,
             tail_facts=TailFacts(),
+            capture=ParseResult(
+                session=progressed, next_byte_offset=20, is_full_parse=not incremental
+            ),
             turn=without_keyword_index(),
         )
         assert conn.execute("SELECT rowid FROM session_state").fetchone() == before
         changed = progressed.model_copy(update={"cwd": "/new", "git_repo": "new"})
         write(
-            conn, changed, last_byte_offset=20, tail_facts=TailFacts(), turn=without_keyword_index()
+            conn,
+            changed,
+            last_byte_offset=20,
+            tail_facts=TailFacts(),
+            capture=ParseResult(
+                session=changed, next_byte_offset=20, is_full_parse=not incremental
+            ),
+            turn=without_keyword_index(),
         )
         assert conn.execute(
             "SELECT session_id FROM session_state WHERE cwd='/new' AND git_repo='new'"

@@ -17,7 +17,7 @@ from .migrations import run_pending_migrations_on
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 INDEX_MIGRATION_VERSION = 1
 
 
@@ -84,7 +84,11 @@ def ensure_schema_on(
     if current is None:
         _initialize_schema_on(lease, embed_dim)
         return SchemaChange.CHANGED
+    from recall.db.repair import FENCE_VERSION
+
     previous = current
+    if current >= FENCE_VERSION:
+        _require_recovery_state(lease)
     run_pending_migrations_on(lease, current)
     current = lease.call("postmigration_version", _get_schema_version)
     if current != SCHEMA_VERSION:

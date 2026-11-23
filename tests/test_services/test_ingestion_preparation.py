@@ -11,7 +11,7 @@ from recall.services import indexer
 from recall.services.watcher import index_single_session
 from test_source_reconciliation import _message_rows, _runtime
 
-from tests.keyword_turns import without_keyword_index
+from tests.keyword_turns import synthetic_claude_capture, without_keyword_index
 
 
 def test_positional_insertion_preserves_equivalent_content_embedding(tmp_path: Path) -> None:
@@ -53,7 +53,11 @@ def test_changed_tool_input_invalidates_legacy_context_for_full_document(tmp_pat
         session.messages[0].context_text = "summary includes old tool arguments"
         session.messages[0].context_mode = "llm-codex"
         indexer._write_session(
-            conn, session, tail_facts=parser.parse(path).tail_facts, turn=without_keyword_index()
+            conn,
+            session,
+            tail_facts=parser.parse(path).tail_facts,
+            capture=synthetic_claude_capture(session),
+            turn=without_keyword_index(),
         )
         rewritten = session.model_copy(deep=True)
         rewritten.messages[0].context_text = ""
@@ -98,7 +102,11 @@ def test_a_full_reparse_of_an_appended_session_keeps_stored_llm_context(tmp_path
             message.context_text = f"[summary {message.idx}] "
             message.context_mode = "llm-codex"
         indexer._write_session(
-            conn, session, tail_facts=parser.parse(path).tail_facts, turn=without_keyword_index()
+            conn,
+            session,
+            tail_facts=parser.parse(path).tail_facts,
+            capture=synthetic_claude_capture(session),
+            turn=without_keyword_index(),
         )
         appended = {"type": "event_msg", "payload": {"type": "user_message", "message": "Later"}}
         with path.open("a") as stream:

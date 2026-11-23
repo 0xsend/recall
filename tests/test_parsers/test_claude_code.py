@@ -226,11 +226,14 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     from recall.services.indexer import _write_session
 
     parser = ClaudeCodeParser()
-    session = parser.parse(SUBAGENT_FIXTURE).session
+    parsed = parser.parse(SUBAGENT_FIXTURE)
+    session = parsed.session
 
     conn = _native.duckdb_connect(str(tmp_path / "test.duckdb"))
     ensure_schema(conn)
-    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
+    _write_session(
+        conn, session, tail_facts=TailFacts(), capture=parsed, turn=without_keyword_index()
+    )
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("insert failed mid-rewrite")
@@ -238,7 +241,12 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     renamed = session.model_copy(update={"source_session_id": "rotated-source-id"})
     with pytest.raises(RuntimeError):
         _write_session(
-            conn, renamed, tail_facts=TailFacts(), on_commit=_boom, turn=without_keyword_index()
+            conn,
+            renamed,
+            tail_facts=TailFacts(),
+            capture=parsed,
+            on_commit=_boom,
+            turn=without_keyword_index(),
         )
 
     agent_msgs = conn.execute("SELECT agent_id FROM messages WHERE agent_id IS NOT NULL").fetchall()

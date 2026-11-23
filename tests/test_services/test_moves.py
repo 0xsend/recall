@@ -67,6 +67,7 @@ def _index(
         session,
         last_byte_offset=len(data),
         tail_facts=TailFacts(),
+        capture=capture,
         snapshot=snapshot,
         turn=without_keyword_index(),
     )
@@ -188,7 +189,8 @@ def test_a_successor_indexed_short_of_the_old_history_keeps_the_old_row(
     old_id = _index(conn, old_path)
 
     new_path = _transcript(home, "-work-new", LINES[:1])
-    partial = ClaudeCodeParser().parse(new_path).session
+    parsed_partial = ClaudeCodeParser().parse(new_path)
+    partial = parsed_partial.session
     _transcript(home, "-work-new", LINES)
     old_path.unlink()
     _write_session(
@@ -196,6 +198,7 @@ def test_a_successor_indexed_short_of_the_old_history_keeps_the_old_row(
         partial,
         last_byte_offset=len(LINES[0].encode()),
         tail_facts=TailFacts(),
+        capture=parsed_partial,
         turn=without_keyword_index(),
     )
 
@@ -342,6 +345,181 @@ def test_a_copy_indexed_before_its_original_is_deleted_supersedes_it_when_the_de
         [old_id],
     ).fetchone()
     assert carried is not None and carried[0] > 0
+
+
+@pytest.mark.parametrize(
+    ("source", "fixture", "relative"),
+    [
+        ("codex", "codex/session1/rollout.jsonl", "day/rollout.jsonl"),
+        ("pi_agent", "pi_agent/session1.jsonl", "project/a.jsonl"),
+        ("kimi_code", "kimi_code/session1/agents/main/wire.jsonl", "agents/main/wire.jsonl"),
+    ],
+)
+@pytest.mark.parametrize("queue_sidecar_deletes", [False, True], ids=["offline", "daemon"])
+def test_adopted_move_preserves_non_claude_predecessor_usage(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    source: str,
+    fixture: str,
+    relative: str,
+    queue_sidecar_deletes: bool,
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.parsers.codex import CodexParser
+    from recall.parsers.kimi_code import KimiCodeParser
+    from recall.parsers.pi_agent import PiAgentParser
+    from recall.services.coordinator import (
+        capture_path,
+        commit_prepared_raw_sources,
+        observe_path,
+        prepare_raw_sources,
+    )
+    from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
+
+    fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
+    root = tmp_path.resolve() / "transcripts"
+    original = root / "before" / relative
+    original.parent.mkdir(parents=True)
+    shutil.copyfile(fixtures_dir / fixture, original)
+    parser_classes = {
+        "codex": CodexParser,
+        "pi_agent": PiAgentParser,
+        "kimi_code": KimiCodeParser,
+    }
+    parser = parser_classes[source](roots=(root,))
+
+    def publish(path: Path) -> str:
+        item = observe_path(parser, capture_path(parser, path), conn=conn)
+        prepared = prepare_raw_sources((item,), {source: parser})
+        result = commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn)
+        assert result.changed == 1
+        row = conn.execute(
+            "SELECT session_id FROM source_files WHERE source = ? AND source_path = ?",
+            [source, str(path)],
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        return str(row[0])
+
+    old_id = publish(original)
+    moved = root / "after" / relative
+    moved.parent.mkdir(parents=True)
+    shutil.copyfile(original, moved)
+    successor_id = publish(moved)
+    conn.execute(
+        "UPDATE session_state SET input_tokens = 12, output_tokens = 7, "
+        "cached_input_tokens = 3 WHERE session_id = ?",
+        [old_id],
+    )
+    conn.execute(
+        "UPDATE session_state SET input_tokens = NULL, output_tokens = NULL, "
+        "cached_input_tokens = NULL WHERE session_id = ?",
+        [successor_id],
+    )
+    original.unlink()
+
+    plans = plan_moved_duplicates(conn, host=default_session_host())
+    assert len(plans) == 1
+    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=queue_sidecar_deletes) == 1
+    assert _session_ids(conn) == [old_id]
+    assert conn.execute(
+        "SELECT input_tokens, output_tokens, cached_input_tokens FROM session_state "
+        "WHERE session_id = ?",
+        [old_id],
+    ).fetchone() == (12, 7, 3)
+
+
+@pytest.mark.parametrize("queue_sidecar_deletes", [False, True], ids=["offline", "daemon"])
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [({}, (None, None)), ({"input_tokens": 0}, (0, None)), ({"output_tokens": 0}, (None, 0))],
+)
+def test_adopted_claude_move_retains_absolute_usage_and_successor_scope(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    queue_sidecar_deletes: bool,
+    usage: dict[str, int],
+    expected: tuple[int | None, int | None],
+) -> None:
+    from recall.core.models import NormalizationCheckpoint
+    from recall.core.types import default_session_host
+    from recall.services.coordinator import (
+        capture_path,
+        commit_prepared_raw_sources,
+        observe_path,
+        prepare_raw_sources,
+    )
+    from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
+
+    from tests.test_parsers.test_claude_usage import encoded, records
+
+    root = tmp_path.resolve() / "transcripts"
+    original = root / "before" / "session.jsonl"
+    original.parent.mkdir(parents=True)
+    items = records("main")[:1]
+    items[0]["message"]["usage"] = usage
+    original.write_bytes(encoded(items))
+    parser = ClaudeCodeParser(roots=(root,))
+
+    def publish(path: Path) -> str:
+        item = observe_path(parser, capture_path(parser, path), conn=conn)
+        prepared = prepare_raw_sources((item,), {"claude_code": parser})
+        result = commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn)
+        assert result.changed == 1
+        row = conn.execute(
+            "SELECT session_id FROM source_files WHERE source = 'claude_code' AND source_path = ?",
+            [str(path)],
+        ).fetchone()
+        assert row is not None and row[0] is not None
+        return str(row[0])
+
+    old_id = publish(original)
+    moved = root / "after" / "session.jsonl"
+    moved.parent.mkdir(parents=True)
+    shutil.copyfile(original, moved)
+    successor_id = publish(moved)
+    assert _session_ids(conn) == sorted([old_id, successor_id])
+    # The departed identity can retain older usage, while adopted content is absolute.
+    conn.execute(
+        "UPDATE session_state SET input_tokens = 12, output_tokens = 7 WHERE session_id = ?",
+        [old_id],
+    )
+    scope = conn.execute(
+        "SELECT scope_token, format_revision, committed_offset, prefix_sha256 "
+        "FROM claude_usage_scopes WHERE session_id = ?",
+        [successor_id],
+    ).fetchone()
+    assert scope is not None
+    cells = conn.execute(
+        "SELECT * FROM claude_response_usage WHERE scope_token = ?", [scope[0]]
+    ).fetchall()
+    assert len(cells) == (1 if usage else 0)
+    original.unlink()
+
+    plans = plan_moved_duplicates(conn, host=default_session_host())
+    assert len(plans) == 1
+    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=queue_sidecar_deletes) == 1
+    assert _session_ids(conn) == [old_id]
+    assert (
+        conn.execute(
+            "SELECT input_tokens, output_tokens FROM session_state WHERE session_id = ?", [old_id]
+        ).fetchone()
+        == expected
+    )
+    assert conn.execute(
+        "SELECT session_id, scope_token, format_revision, committed_offset, prefix_sha256 "
+        "FROM claude_usage_scopes"
+    ).fetchall() == [(old_id, *scope)]
+    assert conn.execute("SELECT * FROM claude_response_usage").fetchall() == cells
+    checkpoint_row = conn.execute(
+        "SELECT normalization_checkpoint, committed_offset, committed_prefix_sha256 "
+        "FROM source_files WHERE source_path = ?",
+        [str(moved)],
+    ).fetchone()
+    assert checkpoint_row is not None
+    checkpoint = NormalizationCheckpoint.decode(checkpoint_row[0])
+    assert checkpoint is not None
+    assert checkpoint.adapter_state["usage_scope"] == {"format": 1, "token": scope[0]}
+    assert checkpoint_row[1:] == scope[2:]
 
 
 def _missing_paths(conn: duckdb.DuckDBPyConnection) -> set[str]:
@@ -687,11 +865,13 @@ def test_a_failed_successor_insert_keeps_the_old_row(
         raise RuntimeError("insert failed")
 
     monkeypatch.setattr(indexer_module, "insert_tool_calls", fail)
+    parsed_new = ClaudeCodeParser().parse(new_path)
     with pytest.raises(RuntimeError):
         _write_session(
             conn,
-            ClaudeCodeParser().parse(new_path).session,
+            parsed_new.session,
             tail_facts=TailFacts(),
+            capture=parsed_new,
             turn=without_keyword_index(),
         )
 
@@ -1312,12 +1492,14 @@ def test_failed_move_acknowledgement_rolls_back_identity_and_catalog_ownership(
     def reject() -> None:
         raise RuntimeError("acknowledgement interrupted")
 
+    parsed = ClaudeCodeParser().parse(moved)
     with pytest.raises(RuntimeError, match="acknowledgement interrupted"):
         _write_session(
             conn,
-            ClaudeCodeParser().parse(moved).session,
+            parsed.session,
             last_byte_offset=moved.stat().st_size,
             tail_facts=TailFacts(),
+            capture=parsed,
             on_commit=reject,
             turn=without_keyword_index(),
         )
