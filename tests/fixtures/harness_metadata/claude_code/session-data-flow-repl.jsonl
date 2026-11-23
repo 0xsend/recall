@@ -1,0 +1,6 @@
+{"timestamp": "2026-11-22T00:00:00Z", "type": "user", "message": {"role": "user", "content": "Parser orchard question"}}
+{"timestamp": "2026-11-22T00:00:01Z", "type": "data-flow-records", "records": [], "sessionId": "claude-data-flow-repl"}
+{"timestamp": "2026-11-22T00:00:02Z", "type": "data-flow-incomplete", "reason": "buffer_cap", "sessionId": "claude-data-flow-repl"}
+{"timestamp": "2026-11-22T00:00:03Z", "type": "derived-from", "parentSessionId": "parent-123", "sessionId": "claude-data-flow-repl"}
+{"timestamp": "2026-11-22T00:00:04Z", "type": "repl-mode", "enabled": true, "sessionId": "claude-data-flow-repl"}
+{"timestamp": "2026-11-22T00:00:05Z", "type": "assistant", "message": {"role": "assistant", "content": "Parser orchard answer"}}

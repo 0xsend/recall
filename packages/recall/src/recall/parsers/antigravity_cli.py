@@ -246,6 +246,7 @@ class AntigravityCliParser:
                 elif entry_type == "GENERIC":
                     content = _coerce_str(entry.get("content")) or _coerce_str(entry.get("error"))
                     if content:
+                        content = _strip_generic_timestamp_preamble(content)
                         messages.append(
                             _plain_message(
                                 role=Role.SYSTEM,
@@ -385,6 +386,27 @@ class AntigravityCliParser:
                 stop_markers=tuple(stop_markers),
             ),
         )
+
+
+_GENERIC_TIMESTAMP_LINE_RE = re.compile(
+    r"^(?:Created|Completed) At:\s*"
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\r?\n?"
+)
+
+
+def _strip_generic_timestamp_preamble(text: str) -> str:
+    """Strip leading duplicated Created At / Completed At ISO timestamp lines on GENERIC steps.
+
+    Falls back to the original text if stripping leaves nothing so message indexing never shifts.
+    """
+    remaining = text
+    while True:
+        match = _GENERIC_TIMESTAMP_LINE_RE.match(remaining)
+        if match is None:
+            break
+        remaining = remaining[match.end() :]
+    stripped = remaining.lstrip("\r\n")
+    return stripped if stripped else text
 
 
 def _plain_message(

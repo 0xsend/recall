@@ -76,6 +76,10 @@ _KNOWN_RECORD_TYPES = frozenset(
         "agent-setting",
         "dev-mods",
         "tools-used",
+        "data-flow-records",
+        "data-flow-incomplete",
+        "derived-from",
+        "repl-mode",
     }
 )
 

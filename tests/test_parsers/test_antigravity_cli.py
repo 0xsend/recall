@@ -391,3 +391,56 @@ def test_antigravity_cli_diagnoses_unknown_record_and_declines_checkpoint(tmp_pa
     assert result.next_byte_offset == transcript.stat().st_size
     assert result.normalization_checkpoint is None
     assert [d.kind for d in result.diagnostics] == ["unsupported_record"]
+
+
+def test_antigravity_cli_strips_generic_timestamp_preamble_without_shifting_idx(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "transcript_full.jsonl"
+    lines = [
+        {
+            "step_index": 0,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:37:07Z",
+            "content": (
+                "Created At: 2026-11-21T20:37:07-06:00\n"
+                "Completed At: 2026-11-21T20:37:09-06:00\n"
+                "Created At: 2026-11-21T20:37:07-06:00\n"
+                "Completed At: 2026-11-21T20:37:09-06:00\n"
+                "Showing lines 1-2 of 2\n"
+                "Created At: 2026-11-21T20:37:07-06:00 inside body stays\n"
+            ),
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:37:10Z",
+            "content": (
+                "Created At: 2026-11-21T20:37:10-06:00\nCompleted At: 2026-11-21T20:37:11-06:00\n"
+            ),
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-21T20:37:12Z",
+            "content": "Done.",
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+    result = AntigravityCliParser().parse(transcript)
+    assert result.diagnostics == ()
+    assert [m.idx for m in result.session.messages] == [0, 1, 2]
+    assert result.session.messages[0].content == (
+        "Showing lines 1-2 of 2\nCreated At: 2026-11-21T20:37:07-06:00 inside body stays\n"
+    )
+    # Timestamp-only GENERIC step falls back to original text so message_idx never shifts.
+    assert result.session.messages[1].content == (
+        "Created At: 2026-11-21T20:37:10-06:00\nCompleted At: 2026-11-21T20:37:11-06:00\n"
+    )
+    assert result.session.messages[2].content == "Done."
