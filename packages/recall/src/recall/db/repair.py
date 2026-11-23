@@ -283,18 +283,25 @@ _EXPECTED_COLUMN_TYPES: dict[str, str] = {
 
 
 def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
+    base_table = conn.execute(
+        "SELECT 1 FROM duckdb_tables() "
+        "WHERE database_name = current_database() AND schema_name = 'main' "
+        "AND table_name = 'daemon_index_repair' AND NOT internal AND NOT temporary"
+    ).fetchone()
+    if base_table is None:
+        raise ValueError("recovery singleton base table is missing")
     columns = {
         str(name): str(col_type)
-        for _, name, col_type, *_ in conn.execute(
-            "PRAGMA table_info('daemon_index_repair')"
+        for name, col_type in conn.execute(
+            "SELECT column_name, data_type FROM duckdb_columns() "
+            "WHERE database_name = current_database() AND schema_name = 'main' "
+            "AND table_name = 'daemon_index_repair' AND NOT internal"
         ).fetchall()
     }
-    if not columns:
-        raise ValueError("recovery singleton table is missing")
     if columns != _EXPECTED_COLUMN_TYPES:
         raise ValueError("recovery singleton schema does not match expected columns/types")
     rows = conn.execute(
-        f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
+        f"SELECT {', '.join(_COLUMNS)} FROM main.daemon_index_repair WHERE singleton"
     ).fetchall()
     if len(rows) != 1:
         raise ValueError("recovery singleton is missing or duplicated")
@@ -392,7 +399,7 @@ def save_repair_row(conn: duckdb.DuckDBPyConnection, row: RepairRow) -> None:
         for name in _COLUMNS
     ]
     updated = conn.execute(
-        "UPDATE daemon_index_repair SET "
+        "UPDATE main.daemon_index_repair SET "
         + ", ".join(f"{name} = ?" for name in _COLUMNS)
         + " WHERE singleton",
         values,

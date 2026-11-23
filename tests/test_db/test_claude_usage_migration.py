@@ -106,30 +106,45 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
         tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
         assert "claude_usage_scopes" not in tables
 
-    for mode in ("table_absent", "column_missing", "column_wrong_type", "column_wrong_type_null"):
+    for mode in (
+        "table_absent",
+        "column_missing",
+        "column_wrong_type",
+        "column_wrong_type_null",
+        "view_shadow",
+    ):
         damaged = tmp_path / f"v41_damaged_{mode}.duckdb"
         _schema_41_db(damaged)
         with duckdb.connect(str(damaged)) as conn:
-            conn.execute("DROP TABLE daemon_index_repair")
-            if mode == "column_missing":
-                conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
-                conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
-            elif mode in {"column_wrong_type", "column_wrong_type_null"}:
+            if mode == "view_shadow":
                 conn.execute(
-                    "CREATE TABLE daemon_index_repair ("
-                    "singleton BOOLEAN, attempt_no UBIGINT, phase VARCHAR, trigger_id UUID, "
-                    "trigger_kind VARCHAR, signature VARCHAR, trigger_json INTEGER, "
-                    "target_manifest JSON, oracle_ref VARCHAR, oracle_hash VARCHAR, "
-                    "success_since_attempt BOOLEAN, last_folded_event_id UUID, "
-                    "success_since_failure BOOLEAN, acknowledged_events JSON, "
-                    "release_certificate JSON)"
+                    "CREATE TABLE daemon_index_repair_backing AS SELECT * FROM daemon_index_repair"
                 )
-                trigger_val = "NULL" if mode == "column_wrong_type_null" else "1"
+                conn.execute("DROP TABLE daemon_index_repair")
                 conn.execute(
-                    "INSERT INTO daemon_index_repair VALUES "
-                    f"(TRUE, 0, 'idle', NULL, NULL, NULL, {trigger_val}, NULL, NULL, NULL, "
-                    "TRUE, NULL, TRUE, '[]', NULL)"
+                    "CREATE VIEW daemon_index_repair AS SELECT * FROM daemon_index_repair_backing"
                 )
+            else:
+                conn.execute("DROP TABLE daemon_index_repair")
+                if mode == "column_missing":
+                    conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
+                    conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
+                elif mode in {"column_wrong_type", "column_wrong_type_null"}:
+                    conn.execute(
+                        "CREATE TABLE daemon_index_repair ("
+                        "singleton BOOLEAN, attempt_no UBIGINT, phase VARCHAR, trigger_id UUID, "
+                        "trigger_kind VARCHAR, signature VARCHAR, trigger_json INTEGER, "
+                        "target_manifest JSON, oracle_ref VARCHAR, oracle_hash VARCHAR, "
+                        "success_since_attempt BOOLEAN, last_folded_event_id UUID, "
+                        "success_since_failure BOOLEAN, acknowledged_events JSON, "
+                        "release_certificate JSON)"
+                    )
+                    trigger_val = "NULL" if mode == "column_wrong_type_null" else "1"
+                    conn.execute(
+                        "INSERT INTO daemon_index_repair VALUES "
+                        f"(TRUE, 0, 'idle', NULL, NULL, NULL, {trigger_val}, NULL, NULL, NULL, "
+                        "TRUE, NULL, TRUE, '[]', NULL)"
+                    )
             with StandaloneLifetime().lease(conn) as lease:
                 assert migration._upgrade(lease) is False
             assert get_schema_version(conn) == 41
@@ -149,6 +164,7 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
         "column_missing",
         "column_wrong_type",
         "column_wrong_type_null",
+        "view_shadow",
         "row_absent",
         "row_invalid",
     ],
@@ -162,6 +178,14 @@ def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
     with duckdb.connect(str(path)) as conn:
         if damage == "table_absent":
             conn.execute("DROP TABLE daemon_index_repair")
+        elif damage == "view_shadow":
+            conn.execute(
+                "CREATE TABLE daemon_index_repair_backing AS SELECT * FROM daemon_index_repair"
+            )
+            conn.execute("DROP TABLE daemon_index_repair")
+            conn.execute(
+                "CREATE VIEW daemon_index_repair AS SELECT * FROM daemon_index_repair_backing"
+            )
         elif damage == "column_missing":
             conn.execute("DROP TABLE daemon_index_repair")
             conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
