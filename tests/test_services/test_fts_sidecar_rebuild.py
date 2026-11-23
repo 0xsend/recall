@@ -30,11 +30,11 @@ def _operation(tmp_path: Path) -> KeywordRebuild:
     conn = connect(config)
     conn.execute(
         "INSERT INTO message_state(message_id, role, content, fts_content, fts_thinking) "
-        "VALUES ('m', 'assistant', 'preserved raw', 'needle alpha', '')"
+        "VALUES ('m', 'assistant', 'needle alpha', 'needle alpha', '')"
     )
     conn.execute(
         "INSERT INTO message_state(message_id, role, content, fts_content) "
-        "VALUES ('empty', 'assistant', 'preserved empty', '')"
+        "VALUES ('empty', 'assistant', '', '')"
     )
     conn.close()
     sidecar = open_sidecar(data / "recall.fts.sqlite")

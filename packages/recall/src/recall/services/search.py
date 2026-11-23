@@ -12,7 +12,9 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.fts_text import sql_is_non_blank
 from recall.core.read_cancellation import check_read_cancelled
+from recall.core.snippets import build_search_snippet
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, load_fts_extension
 from recall.db.fts_sidecar import (
@@ -34,6 +36,11 @@ logger = logging.getLogger("recall.search")
 _SIDECAR_CANDIDATE_BATCH_SIZE = 500
 _SIDECAR_FILTER_BATCH_SIZE = 100
 _SIDECAR_SELECTIVE_FRACTION = 0.1
+MIN_VECTOR_SIMILARITY = 0.50
+STRONG_VECTOR_SIMILARITY = 0.75
+LEXICAL_RRF_WEIGHT = 3.0
+SYSTEM_ROLE_QUALITY_MULTIPLIER = 0.75
+_KEYWORD_OVERSAMPLE_FACTOR = 3
 
 
 class KeywordIndexLockedError(RuntimeError):
@@ -89,6 +96,7 @@ class SearchResult:
     lexical_match: bool = False
     # REQ-HOST-API-003: stamped from session_state after the hit set is built.
     host: str = UNATTRIBUTED_HOST
+    snippet: str | None = None
 
 
 def search(
@@ -180,7 +188,7 @@ def _search(
             conn, session, source=source.value if source is not None else None
         ).id
     if tool:
-        return _attach_hosts(
+        return _finalize_results(
             lease,
             conn,
             _mark_lexical(
@@ -202,6 +210,8 @@ def _search(
                     keyword_access=keyword_access,
                 )
             ),
+            query=query,
+            fields=config.fts.fields,
         )
 
     # Only AUTO needs a capability probe. Concrete keyword requests never
@@ -220,7 +230,7 @@ def _search(
     )
 
     if effective_mode == SearchMode.KEYWORD:
-        return _attach_hosts(
+        return _finalize_results(
             lease,
             conn,
             _run_keyword_search(
@@ -240,6 +250,8 @@ def _search(
                 failure_prefix="search failed",
                 keyword_access=keyword_access,
             ),
+            query=query,
+            fields=config.fts.fields,
         )
 
     # Vector or hybrid — resolve the backend and embed the query
@@ -262,7 +274,7 @@ def _search(
                 raise RuntimeError(f"embedding backend unavailable: {err}") from err
             # AUTO remains truthful and useful when model acquisition fails.
             logger.warning("embedding backend unavailable, falling back to keyword: %s", err)
-            return _attach_hosts(
+            return _finalize_results(
                 lease,
                 conn,
                 _run_keyword_search(
@@ -282,17 +294,21 @@ def _search(
                     failure_prefix="search failed",
                     keyword_access=keyword_access,
                 ),
+                query=query,
+                fields=config.fts.fields,
             )
 
     if effective_mode == SearchMode.VECTOR:
-        return _attach_hosts(
+        return _finalize_results(
             lease,
             conn,
             _vector_search_all(conn, query_embedding, source, limit, session=session),
+            query=query,
+            fields=config.fts.fields,
         )
 
     # Hybrid: RRF fusion of BM25 + vector
-    return _attach_hosts(
+    return _finalize_results(
         lease,
         conn,
         _run_keyword_search(
@@ -313,7 +329,46 @@ def _search(
             failure_prefix="hybrid search failed",
             keyword_access=keyword_access,
         ),
+        query=query,
+        fields=config.fts.fields,
     )
+
+
+def _finalize_results(
+    lease: DbLease,
+    conn: duckdb.DuckDBPyConnection,
+    results: list[SearchResult],
+    *,
+    query: str,
+    fields: tuple[str, ...],
+) -> list[SearchResult]:
+    return _attach_snippets(_attach_hosts(lease, conn, results), query=query, fields=fields)
+
+
+def _attach_snippets(
+    results: list[SearchResult],
+    *,
+    query: str,
+    fields: tuple[str, ...],
+) -> list[SearchResult]:
+    if not results:
+        return results
+    return [
+        dataclasses.replace(
+            result,
+            snippet=build_search_snippet(
+                query=query,
+                kind=result.kind,
+                content=result.content,
+                thinking=result.thinking,
+                role=result.role,
+                tool_name=result.tool_name,
+                bash_command=result.bash_command,
+                fields=fields,
+            ),
+        )
+        for result in results
+    ]
 
 
 def _attach_hosts(
@@ -481,8 +536,8 @@ def _hybrid_search(
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
-    """Reciprocal Rank Fusion of BM25 + vector cosine similarity."""
-    fetch_limit = limit * 3
+    """Weighted Reciprocal Rank Fusion of BM25 + vector cosine similarity."""
+    fetch_limit = limit * _KEYWORD_OVERSAMPLE_FACTOR
 
     bm25_results = _search_all(
         conn,
@@ -493,8 +548,16 @@ def _hybrid_search(
         session=session,
         config=config,
         keyword_access=keyword_access,
+        apply_quality_adjustments=False,
     )
-    vector_results = _vector_search_all(conn, query_embedding, source, fetch_limit, session=session)
+    vector_results = _vector_search_all(
+        conn,
+        query_embedding,
+        source,
+        fetch_limit,
+        session=session,
+        apply_quality_adjustments=False,
+    )
 
     rrf_scores: dict[str, float] = {}
     result_map: dict[str, SearchResult] = {}
@@ -502,13 +565,14 @@ def _hybrid_search(
 
     for rank, result in enumerate(bm25_results, 1):
         key = _result_key(result)
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank)
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + LEXICAL_RRF_WEIGHT / (k + rank)
         result_map[key] = result
         _update_component_score(component_scores, key, bm25_score=result.score, vector_score=None)
 
     for rank, result in enumerate(vector_results, 1):
         key = _result_key(result)
-        rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (k + rank)
+        clamped_cosine = max(0.0, min(1.0, float(result.score)))
+        rrf_scores[key] = rrf_scores.get(key, 0.0) + clamped_cosine / (k + rank)
         if key not in result_map:
             result_map[key] = result
         _update_component_score(component_scores, key, bm25_score=None, vector_score=result.score)
@@ -524,7 +588,11 @@ def _hybrid_search(
         )
         for rk in rrf_scores
     ]
-    ranked = _apply_result_quality_adjustments(fused_results, component_scores=component_scores)
+    ranked = _apply_result_quality_adjustments(
+        fused_results,
+        component_scores=component_scores,
+        enforce_lexical_tier=True,
+    )
     return ranked[:limit]
 
 
@@ -548,10 +616,27 @@ def _update_component_score(
     )
 
 
+def _hybrid_tier(
+    result: SearchResult,
+    component_scores: dict[str, tuple[float, float]] | None,
+) -> int:
+    if result.lexical_match:
+        return 0
+    if component_scores is not None:
+        _, vector_score = component_scores.get(
+            _result_key(result),
+            (float("-inf"), float("-inf")),
+        )
+        if vector_score >= STRONG_VECTOR_SIMILARITY:
+            return 0
+    return 1
+
+
 def _apply_result_quality_adjustments(
     results: list[SearchResult],
     *,
     component_scores: dict[str, tuple[float, float]] | None = None,
+    enforce_lexical_tier: bool = False,
 ) -> list[SearchResult]:
     adjusted = [
         dataclasses.replace(result, score=result.score * _result_quality_multiplier(result))
@@ -560,6 +645,7 @@ def _apply_result_quality_adjustments(
     return sorted(
         adjusted,
         key=lambda result: (
+            _hybrid_tier(result, component_scores) if enforce_lexical_tier else 0,
             -result.score,
             *_component_score_key(result, component_scores),
             _stable_result_key(result),
@@ -590,6 +676,8 @@ def _result_quality_multiplier(result: SearchResult) -> float:
         return 0.35
     if result.role == "system" and "## context" in content:
         return 0.5
+    if result.role == "system":
+        return SYSTEM_ROLE_QUALITY_MULTIPLIER
     return 1.0
 
 
@@ -614,11 +702,21 @@ def _vector_search_all(
     source: Source | None,
     limit: int,
     session: str | None = None,
+    *,
+    apply_quality_adjustments: bool = True,
 ) -> list[SearchResult]:
+    fetch_limit = limit * _KEYWORD_OVERSAMPLE_FACTOR if apply_quality_adjustments else limit
     results: list[SearchResult] = []
-    results.extend(_vector_search_messages(conn, query_embedding, source, limit, session=session))
-    results.extend(_vector_search_tool_calls(conn, query_embedding, source, limit, session=session))
-    ranked = _apply_result_quality_adjustments(results)
+    results.extend(
+        _vector_search_messages(conn, query_embedding, source, fetch_limit, session=session)
+    )
+    results.extend(
+        _vector_search_tool_calls(conn, query_embedding, source, fetch_limit, session=session)
+    )
+    if apply_quality_adjustments:
+        ranked = _apply_result_quality_adjustments(results)
+    else:
+        ranked = sorted(results, key=lambda r: (-r.score, _stable_result_key(r)))
     return ranked[:limit]
 
 
@@ -630,15 +728,18 @@ def _vector_search_messages(
     session: str | None = None,
 ) -> list[SearchResult]:
     where_parts = ["TRUE"]
-    params: list[object] = [query_embedding]
+    params: list[object] = [query_embedding, MIN_VECTOR_SIMILARITY, MIN_VECTOR_SIMILARITY]
     if source is not None:
         where_parts.append("s.source = ?")
         params.append(source.value)
     if session is not None:
         where_parts.append("m.session_id = ?")
         params.append(session)
+    params.append(MIN_VECTOR_SIMILARITY)
 
     where_clause = "WHERE " + " AND ".join(where_parts)
+    content_non_blank = sql_is_non_blank("ms.content")
+    thinking_non_blank = sql_is_non_blank("ms.thinking")
 
     embed_dim = len(query_embedding)
     # Materialize scores before identity joins, then rank before wide payloads.
@@ -649,28 +750,48 @@ def _vector_search_messages(
         WITH query_vector AS (
             SELECT ?::FLOAT[{embed_dim}] AS embedding
         ), scores AS MATERIALIZED (
-            SELECT me.message_id, CASE
-                WHEN me.content_embedding IS NOT NULL
-                    AND me.thinking_embedding IS NOT NULL
-                    THEN GREATEST(
-                        array_cosine_similarity(me.content_embedding, q.embedding),
-                        array_cosine_similarity(me.thinking_embedding, q.embedding)
-                    )
-                WHEN me.content_embedding IS NOT NULL THEN array_cosine_similarity(
-                    me.content_embedding, q.embedding
-                )
-                ELSE array_cosine_similarity(me.thinking_embedding, q.embedding)
-            END AS score
-            FROM message_embeddings me
-            CROSS JOIN query_vector q
-            WHERE me.content_embedding IS NOT NULL OR me.thinking_embedding IS NOT NULL
-        ), ranked AS MATERIALIZED (
-            SELECT m.id AS message_id, scores.score
+            SELECT message_id, content_score, thinking_score
+            FROM (
+                SELECT
+                    me.message_id,
+                    CASE
+                        WHEN me.content_embedding IS NOT NULL
+                            THEN array_cosine_similarity(me.content_embedding, q.embedding)
+                        ELSE NULL
+                    END AS content_score,
+                    CASE
+                        WHEN me.thinking_embedding IS NOT NULL
+                            THEN array_cosine_similarity(me.thinking_embedding, q.embedding)
+                        ELSE NULL
+                    END AS thinking_score
+                FROM message_embeddings me
+                CROSS JOIN query_vector q
+                WHERE me.content_embedding IS NOT NULL OR me.thinking_embedding IS NOT NULL
+            )
+            WHERE COALESCE(content_score, -2.0) >= ?
+               OR COALESCE(thinking_score, -2.0) >= ?
+        ), eligible AS (
+            SELECT
+                m.id AS message_id,
+                CASE
+                    WHEN scores.content_score IS NOT NULL AND {content_non_blank}
+                        AND scores.thinking_score IS NOT NULL AND {thinking_non_blank}
+                        THEN GREATEST(scores.content_score, scores.thinking_score)
+                    WHEN scores.content_score IS NOT NULL AND {content_non_blank}
+                        THEN scores.content_score
+                    WHEN scores.thinking_score IS NOT NULL AND {thinking_non_blank}
+                        THEN scores.thinking_score
+                    ELSE NULL
+                END AS score
             FROM scores
             JOIN messages m ON m.id = scores.message_id
             JOIN message_state ms ON ms.message_id = m.id
             JOIN sessions s ON s.id = m.session_id
             {where_clause}
+        ), ranked AS MATERIALIZED (
+            SELECT message_id, score
+            FROM eligible
+            WHERE score IS NOT NULL AND score >= ?
             ORDER BY score DESC, message_id ASC
             LIMIT {limit}
         )
@@ -718,8 +839,8 @@ def _vector_search_tool_calls(
     limit: int,
     session: str | None = None,
 ) -> list[SearchResult]:
-    where_parts = ["TRUE"]
-    params: list[object] = [query_embedding]
+    where_parts = ["scores.score >= ?"]
+    params: list[object] = [query_embedding, MIN_VECTOR_SIMILARITY]
     if source is not None:
         where_parts.append("s.source = ?")
         params.append(source.value)
@@ -793,7 +914,10 @@ def _search_all(
     session: str | None = None,
     config: AppConfig | None = None,
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
+    *,
+    apply_quality_adjustments: bool = True,
 ) -> list[SearchResult]:
+    fetch_limit = limit * _KEYWORD_OVERSAMPLE_FACTOR if apply_quality_adjustments else limit
     results: list[SearchResult] = []
     message_fields = [field for field in ("content", "thinking") if field in fields]
     if message_fields:
@@ -802,7 +926,7 @@ def _search_all(
                 conn,
                 query,
                 source,
-                limit,
+                fetch_limit,
                 message_fields,
                 session=session,
                 config=config,
@@ -816,13 +940,16 @@ def _search_all(
                 query,
                 source,
                 None,
-                limit,
+                fetch_limit,
                 session=session,
                 config=config,
                 keyword_access=keyword_access,
             )
         )
-    ranked = _apply_result_quality_adjustments(results)
+    if apply_quality_adjustments:
+        ranked = _apply_result_quality_adjustments(results)
+    else:
+        ranked = sorted(results, key=lambda r: (-r.score, _stable_result_key(r)))
     # REQ-CLI-017: every row here is a BM25/FTS hit. Hybrid reuses this as its
     # lexical leg and re-derives the flag per-row, so marking here is correct
     # for the keyword path and harmless for the fused path.

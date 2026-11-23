@@ -459,6 +459,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "bash_command",
                     "lexical_match",
                     "host",
+                    "snippet",
                 ],
             }
         ),

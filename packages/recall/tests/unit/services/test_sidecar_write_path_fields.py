@@ -58,7 +58,10 @@ def _create_sidecar_source_tables(conn: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE message_state (
             message_id TEXT PRIMARY KEY,
             fts_content TEXT DEFAULT '',
-            fts_thinking TEXT DEFAULT ''
+            fts_thinking TEXT DEFAULT '',
+            context_text TEXT GENERATED ALWAYS AS (''),
+            content TEXT GENERATED ALWAYS AS (fts_content),
+            thinking TEXT GENERATED ALWAYS AS (fts_thinking)
         )
         """
     )
@@ -520,7 +523,9 @@ def test_startup_sidecar_sync_skips_rescope_when_fields_signature_unchanged(
     run_startup_fts_sidecar_sync(config)
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
-        assert get_fts_fields_signature(sidecar_conn) == "content"
+        from recall.db.fts_sidecar import fts_fields_signature
+
+        assert get_fts_fields_signature(sidecar_conn) == fts_fields_signature(("content",))
     finally:
         sidecar_conn.close()
 

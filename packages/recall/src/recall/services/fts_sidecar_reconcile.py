@@ -9,6 +9,7 @@ from typing import Literal
 import duckdb
 
 from recall.core.failure_observation import FailureObserver
+from recall.core.fts_text import sql_derive_fts
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     KeywordIndexFailure,
@@ -335,14 +336,23 @@ def _rescope_message_rows(
     processed = 0
     last_id = ""
 
+    fts_content_expr = sql_derive_fts("ms.context_text", "ms.content")
+    fts_thinking_expr = sql_derive_fts("ms.context_text", "ms.thinking")
+
     while True:
         batch = duckdb_conn.execute(
-            """
-            SELECT message_id, COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
-            FROM message_state
-            WHERE message_id > ?
-            ORDER BY message_id
-            LIMIT ?
+            f"""
+            WITH page AS MATERIALIZED (
+                SELECT message_id
+                FROM message_state
+                WHERE message_id > ?
+                ORDER BY message_id
+                LIMIT ?
+            )
+            SELECT ms.message_id, {fts_content_expr}, {fts_thinking_expr}
+            FROM page
+            JOIN message_state ms ON ms.message_id = page.message_id
+            ORDER BY ms.message_id
             """,
             [last_id, batch_size],
         ).fetchall()
@@ -514,10 +524,12 @@ def _fetch_pending_rows_after(
     # binding lists or relations instead scans the populated primary tables.
     message_placeholders = ", ".join("?" for _ in message_ids) or "NULL"
     tool_call_placeholders = ", ".join("?" for _ in tool_call_ids) or "NULL"
+    fts_content_expr = sql_derive_fts("context_text", "content")
+    fts_thinking_expr = sql_derive_fts("context_text", "thinking")
     payloads = (
         duckdb_conn.execute(
             f"""
-            SELECT 'message', message_id, COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
+            SELECT 'message', message_id, {fts_content_expr}, {fts_thinking_expr}
             FROM message_state
             WHERE message_id IN ({message_placeholders})
             UNION ALL
@@ -1023,11 +1035,13 @@ def _fetch_message_payloads(
     if not message_ids:
         return []
     placeholders = ", ".join("?" for _ in message_ids)
+    fts_content_expr = sql_derive_fts("context_text", "content")
+    fts_thinking_expr = sql_derive_fts("context_text", "thinking")
     fetched = {
         str(message_id): (str(message_id), str(fts_content), str(fts_thinking))
         for message_id, fts_content, fts_thinking in duckdb_conn.execute(
             f"""
-            SELECT message_id, COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
+            SELECT message_id, {fts_content_expr}, {fts_thinking_expr}
             FROM message_state
             WHERE message_id IN ({placeholders})
             """,

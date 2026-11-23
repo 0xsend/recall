@@ -303,7 +303,7 @@ def test_hybrid_search_assigns_single_ranker_score() -> None:
         search_module._vector_search_all = original_vector_search_all
 
     assert [result.kind for result in results] == ["message", "tool_call"]
-    assert math.isclose(results[0].score, 1.0 / 61.0)
+    assert math.isclose(results[0].score, search_module.LEXICAL_RRF_WEIGHT / 61.0)
     assert math.isclose(results[1].score, 1.0 / 61.0)
 
 
@@ -379,8 +379,8 @@ def test_hybrid_search_breaks_rrf_ties_with_component_scores() -> None:
         bash_command=None,
     )
     vector_ranked = [
-        dataclasses.replace(stronger_vector, score=0.9),
-        dataclasses.replace(stronger_bm25, score=0.1),
+        dataclasses.replace(stronger_vector, score=0.8),
+        dataclasses.replace(stronger_bm25, score=0.8),
     ]
 
     original_search_all = search_module._search_all
@@ -791,3 +791,222 @@ def test_hybrid_search_marks_bm25_lexical_and_vector_only_not() -> None:
     by_kind = {result.kind: result for result in results}
     assert by_kind["message"].lexical_match is True  # matched the BM25 leg
     assert by_kind["tool_call"].lexical_match is False  # vector-only neighbor
+
+
+def test_vector_search_enforces_similarity_floor_and_excludes_blank_body_embeddings(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "vec_floor.duckdb"
+    conn = _native.duckdb_connect(str(db_path))
+    try:
+        ensure_schema(conn, embed_dim=4)
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path) "
+            "VALUES ('s1', 'antigravity_cli', '/tmp/s1.jsonl')"
+        )
+        conn.execute(
+            "INSERT INTO session_state "
+            "(session_id, message_count, tool_count, is_complete, file_mtime, file_size) "
+            "VALUES ('s1', 4, 2, TRUE, 1.0, 10)"
+        )
+        msgs = [
+            # Blank body with high-cosine content embedding (must be excluded)
+            ("m-blank", 0, "assistant", "   \t\n", None, [1.0, 0.0, 0.0, 0.0], None),
+            # Blank content with valid thinking embedding above floor (must match via thinking)
+            (
+                "m-think",
+                1,
+                "assistant",
+                "",
+                "valid thinking",
+                [1.0, 0.0, 0.0, 0.0],
+                [0.8, 0.6, 0.0, 0.0],
+            ),
+            # Non-blank content below floor (cosine 0.25 < 0.50, must be excluded)
+            ("m-weak", 2, "assistant", "unrelated text", None, [0.25, 0.9682, 0.0, 0.0], None),
+            # Non-blank content above floor (cosine 0.9, must match)
+            ("m-strong", 3, "assistant", "relevant text", None, [0.9, 0.4359, 0.0, 0.0], None),
+        ]
+        for msg_id, idx, role, content, thinking, c_emb, t_emb in msgs:
+            conn.execute(
+                "INSERT INTO messages (id, session_id, idx) VALUES (?, 's1', ?)",
+                [msg_id, idx],
+            )
+            conn.execute(
+                "INSERT INTO message_state (message_id, role, content, thinking, has_thinking) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [msg_id, role, content, thinking, thinking is not None],
+            )
+            conn.execute(
+                "INSERT INTO message_embeddings "
+                "(message_id, content_embedding, thinking_embedding) "
+                "VALUES (?, ?::FLOAT[4], ?::FLOAT[4])",
+                [msg_id, c_emb, t_emb],
+            )
+        for tc_id, idx, cmd, emb in [
+            ("tc-strong", 0, "git status", [0.95, 0.3122, 0.0, 0.0]),
+            ("tc-weak", 1, "ls", [0.1, 0.995, 0.0, 0.0]),
+        ]:
+            conn.execute(
+                "INSERT INTO tool_calls "
+                "(id, session_id, message_id, idx, tool_name, bash_command, is_compound) "
+                "VALUES (?, 's1', 'm-strong', ?, 'bash', ?, FALSE)",
+                [tc_id, idx, cmd],
+            )
+            conn.execute(
+                "INSERT INTO tool_call_embeddings (tool_call_id, bash_embedding) "
+                "VALUES (?, ?::FLOAT[4])",
+                [tc_id, emb],
+            )
+
+        config = dataclasses.replace(AppConfig.load(), data_dir=tmp_path, db_path=db_path)
+        results = search_module.search(
+            query="relevant",
+            source=None,
+            tool=None,
+            limit=10,
+            mode=SearchMode.VECTOR,
+            config=config,
+            conn=conn,
+            query_embedding=[1.0, 0.0, 0.0, 0.0],
+        )
+        ids = [r.message_id if r.kind == "message" else r.tool_call_id for r in results]
+        assert ids == ["tc-strong", "m-strong", "m-think"]
+        think_hit = next(r for r in results if r.message_id == "m-think")
+        assert math.isclose(think_hit.score, 0.8, rel_tol=1e-4)
+        assert think_hit.snippet is not None and think_hit.snippet.startswith("[thinking] ")
+    finally:
+        conn.close()
+
+
+def test_hybrid_lexical_hit_outranks_weak_vector_neighbor_even_after_attenuation() -> None:
+    attenuated_lexical = SearchResult(
+        kind="message",
+        session_id="s1",
+        source="claude_code",
+        source_path="/tmp/s1.jsonl",
+        score=5.0,
+        message_id="m-lex",
+        tool_call_id=None,
+        role="user",
+        content="<command-message>recall</command-message>",
+        thinking=None,
+        timestamp=None,
+        tool_name=None,
+        bash_command=None,
+    )
+    weak_vector = SearchResult(
+        kind="message",
+        session_id="s1",
+        source="antigravity_cli",
+        source_path="/tmp/s1.jsonl",
+        score=0.65,
+        message_id="m-vec-weak",
+        tool_call_id=None,
+        role="assistant",
+        content="somewhat similar",
+        thinking=None,
+        timestamp=None,
+        tool_name=None,
+        bash_command=None,
+    )
+
+    original_search_all = search_module._search_all
+    original_vector_search_all = search_module._vector_search_all
+    search_module._search_all = lambda *_args, **_kwargs: [attenuated_lexical]
+    search_module._vector_search_all = lambda *_args, **_kwargs: [weak_vector]
+    try:
+        results = _hybrid_search(
+            conn=_native.duckdb_connect(":memory:"),
+            query="recall",
+            query_embedding=_vec(0),
+            source=None,
+            limit=10,
+            fields=("content", "thinking", "bash"),
+            k=60,
+        )
+    finally:
+        search_module._search_all = original_search_all
+        search_module._vector_search_all = original_vector_search_all
+
+    assert [r.message_id for r in results] == ["m-lex", "m-vec-weak"]
+
+
+def test_system_role_attenuated_once_and_keyword_oversamples_before_limit() -> None:
+    system_msg = SearchResult(
+        kind="message",
+        session_id="s1",
+        source="antigravity_cli",
+        source_path="/tmp/s1.jsonl",
+        score=10.0,
+        message_id="m-sys",
+        tool_call_id=None,
+        role="system",
+        content="tool output mentioning recall",
+        thinking=None,
+        timestamp=None,
+        tool_name=None,
+        bash_command=None,
+    )
+    assistant_msg = SearchResult(
+        kind="message",
+        session_id="s1",
+        source="antigravity_cli",
+        source_path="/tmp/s1.jsonl",
+        score=9.0,
+        message_id="m-asst",
+        tool_call_id=None,
+        role="assistant",
+        content="assistant answer mentioning recall",
+        thinking=None,
+        timestamp=None,
+        tool_name=None,
+        bash_command=None,
+    )
+
+    # Oversampling with limit=1 must pull >1 raw hits so assistant_msg beats downweighted system_msg
+    captured_limits: list[int] = []
+    original_search_messages = search_module._search_messages
+
+    def fake_search_messages(_conn, _query, _source, fetch_limit, *_args, **_kwargs):
+        captured_limits.append(fetch_limit)
+        return [system_msg, assistant_msg][:fetch_limit]
+
+    search_module._search_messages = fake_search_messages
+    try:
+        top_one = search_module._search_all(
+            _native.duckdb_connect(":memory:"),
+            "recall",
+            None,
+            1,
+            ("content",),
+        )
+    finally:
+        search_module._search_messages = original_search_messages
+
+    assert captured_limits == [3]
+    assert [r.message_id for r in top_one] == ["m-asst"]
+
+    # Single-pass attenuation in hybrid: system_msg gets exactly 0.75x once (not 0.75^2)
+    original_search_all = search_module._search_all
+    original_vector_search_all = search_module._vector_search_all
+    search_module._search_all = lambda *_args, **_kwargs: [system_msg]
+    search_module._vector_search_all = lambda *_args, **_kwargs: []
+    try:
+        fused = _hybrid_search(
+            conn=_native.duckdb_connect(":memory:"),
+            query="recall",
+            query_embedding=_vec(0),
+            source=None,
+            limit=5,
+            fields=("content",),
+            k=60,
+        )
+    finally:
+        search_module._search_all = original_search_all
+        search_module._vector_search_all = original_vector_search_all
+
+    expected = (
+        search_module.LEXICAL_RRF_WEIGHT / 61.0
+    ) * search_module.SYSTEM_ROLE_QUALITY_MULTIPLIER
+    assert math.isclose(fused[0].score, expected)

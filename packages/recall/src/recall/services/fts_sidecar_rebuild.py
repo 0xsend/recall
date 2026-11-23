@@ -30,6 +30,7 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
+from recall.core.fts_text import sql_derive_fts
 from recall.core.keyword_maintenance import MARKER_NAME
 from recall.db.connection import advisory_lock
 from recall.db.fts_sidecar import (
@@ -234,12 +235,25 @@ def _canonical_rows(
     kind: Literal["message", "tool_call"],
     fields: tuple[str, ...],
 ) -> Iterator[tuple[str, str]]:
+    fts_content_expr = sql_derive_fts("ms.context_text", "ms.content")
+    fts_thinking_expr = sql_derive_fts("ms.context_text", "ms.thinking")
     last_id = ""
     while True:
         if kind == "message":
             batch = source.execute(
-                "SELECT message_id, COALESCE(fts_content,''), COALESCE(fts_thinking,'') "
-                "FROM message_state WHERE message_id > ? ORDER BY message_id LIMIT ?",
+                f"""
+                WITH page AS MATERIALIZED (
+                    SELECT message_id
+                    FROM message_state
+                    WHERE message_id > ?
+                    ORDER BY message_id
+                    LIMIT ?
+                )
+                SELECT ms.message_id, {fts_content_expr}, {fts_thinking_expr}
+                FROM page
+                JOIN message_state ms ON ms.message_id = page.message_id
+                ORDER BY ms.message_id
+                """,
                 [last_id, BATCH_SIZE],
             ).fetchall()
             rows = [

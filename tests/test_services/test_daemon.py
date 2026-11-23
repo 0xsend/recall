@@ -246,8 +246,8 @@ def _seed_sidecar_sync_rows(config: AppConfig, *, messages: int = 2, tool_calls:
                 [
                     f"msg-{index:03d}",
                     "assistant",
-                    f"raw {index}",
-                    f"thinking {index}",
+                    f"content {index}",
+                    f"thoughts {index}",
                     True,
                     f"content {index}",
                     f"thoughts {index}",

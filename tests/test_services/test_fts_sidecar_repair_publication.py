@@ -129,9 +129,9 @@ def _seed_page(conn: duckdb.DuckDBPyConnection, sidecar: sqlite3.Connection) -> 
     """Seed six pending rows: three message upserts, a tool upsert, and two deletes."""
     for key, content in (("msg-a", "alpha"), ("msg-b", "bravo"), ("msg-c", "charlie")):
         conn.execute(
-            "INSERT INTO message_state(message_id, role, fts_content, fts_thinking) "
-            "VALUES (?, 'assistant', ?, '')",
-            [key, content],
+            "INSERT INTO message_state(message_id, role, content, fts_content, fts_thinking) "
+            "VALUES (?, 'assistant', ?, ?, '')",
+            [key, content, content],
         )
     conn.execute(
         "INSERT INTO tool_calls(id, session_id, idx, tool_name, bash_command, is_compound) "

@@ -255,8 +255,9 @@ def test_reconcile_large_existing_documents_with_bounded_memory(tmp_path: Path, 
         # membership repair must still preserve it and repair the small gaps.
         if kind == "message":
             conn.execute(
-                """INSERT INTO message_state (message_id, role, fts_content, fts_thinking)
-                   SELECT printf('doc-%05d', i), 'assistant', repeat(md5(i::VARCHAR), 2048), ''
+                """INSERT INTO message_state (message_id, role, content, fts_content, fts_thinking)
+                   SELECT printf('doc-%05d', i), 'assistant', repeat(md5(i::VARCHAR), 2048),
+                          repeat(md5(i::VARCHAR), 2048), ''
                    FROM range(2048) AS rows(i)"""
             )
             rows = conn.execute("SELECT message_id, fts_content, fts_thinking FROM message_state")
@@ -415,7 +416,7 @@ def test_pending_repair_preserves_mixed_page_order_and_payloads(
         sidecar = open_sidecar(tmp_path / "keywords.sqlite")
         try:
             _seed_message(conn, "shared", fts_content="updated café")
-            conn.execute("UPDATE message_state SET fts_thinking = NULL")
+            conn.execute("UPDATE message_state SET thinking = NULL, fts_thinking = NULL")
             _seed_message(conn, "empty", fts_content="")
             _seed_tool_calls(conn, 2, null_bash_ids={"tc-001"})
             conn.execute("UPDATE tool_calls SET id = 'shared' WHERE id = 'tc-000'")
@@ -425,8 +426,10 @@ def test_pending_repair_preserves_mixed_page_order_and_payloads(
             for key in ("shared", "missing", "tc-001", "deleted"):
                 upsert_tool_call_fts(sidecar, key, "obsolete")
             # Full pages and a partial final page, with repeated timestamps.
-            conn.execute("""INSERT INTO message_state(message_id, role, fts_content, fts_thinking)
-                SELECT 'bulk-' || i, 'assistant', 'bulk content', '' FROM range(260) r(i)""")
+            conn.execute("""INSERT INTO message_state(
+                    message_id, role, content, fts_content, fts_thinking)
+                SELECT 'bulk-' || i, 'assistant', 'bulk content', 'bulk content', ''
+                FROM range(260) r(i)""")
             conn.execute("""INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)
                 SELECT 'message', 'bulk-' || i, 'upsert', TIMESTAMP '2026-01-01'
                 FROM range(260) r(i)""")
@@ -537,8 +540,8 @@ def _seed_message(
         [
             message_id,
             "assistant",
-            f"raw {message_id}",
-            f"thinking {message_id}",
+            fts_content,
+            f"thoughts {message_id}",
             True,
             fts_content,
             f"thoughts {message_id}",
@@ -777,7 +780,9 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
         assert stats.pending_remaining == {"message": 0, "tool_call": 0}
         assert statistics() == before
         # One empty thinking column needs no rewrite when the field is removed.
-        source.execute("UPDATE message_state SET fts_thinking='' WHERE message_id='msg-000'")
+        source.execute(
+            "UPDATE message_state SET thinking='', fts_thinking='' WHERE message_id='msg-000'"
+        )
         upsert_message_fts(target, "msg-000", "message content 0", "")
         rescope = rescope_sidecar_for_fields(
             source, target, fts_fields=("bash", "content"), batch_size=7
@@ -789,7 +794,10 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
         )
         assert rescope.messages_rewritten == 0
         assert rescope.tool_calls_rewritten == 0
-        source.execute("UPDATE message_state SET fts_content='changed' WHERE message_id='msg-000'")
+        source.execute(
+            "UPDATE message_state SET content='changed', fts_content='changed' "
+            "WHERE message_id='msg-000'"
+        )
         rescope = rescope_sidecar_for_fields(
             source, target, fts_fields=("bash", "content"), batch_size=7
         )

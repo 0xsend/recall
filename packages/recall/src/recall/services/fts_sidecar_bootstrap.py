@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import duckdb
 
+from recall.core.fts_text import sql_derive_fts
 from recall.db.fts_sidecar import publish_sidecar, should_index_bash_fts
 from recall.db.lease import DbLease, StandaloneLifetime
 
@@ -177,14 +178,23 @@ def _bootstrap_messages(
     processed = 0
     last_id = start_after or _MESSAGE_START_ID
 
+    fts_content_expr = sql_derive_fts("ms.context_text", "ms.content")
+    fts_thinking_expr = sql_derive_fts("ms.context_text", "ms.thinking")
+
     while True:
         batch = duckdb_conn.execute(
-            """
-            SELECT message_id, COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
-            FROM message_state
-            WHERE message_id > ?
-            ORDER BY message_id
-            LIMIT ?
+            f"""
+            WITH page AS MATERIALIZED (
+                SELECT message_id
+                FROM message_state
+                WHERE message_id > ?
+                ORDER BY message_id
+                LIMIT ?
+            )
+            SELECT ms.message_id, {fts_content_expr}, {fts_thinking_expr}
+            FROM page
+            JOIN message_state ms ON ms.message_id = page.message_id
+            ORDER BY ms.message_id
             """,
             [last_id, batch_size],
         ).fetchmany(batch_size)

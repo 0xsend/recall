@@ -105,13 +105,14 @@ def semantic_index(tmp_path, monkeypatch):
                         stat.st_size,
                     ],
                 )
+        neighbor = [0.7, 0.71414284, *([0.0] * (len(_vec(0)) - 2))]
         for mid, sid, idx, role, content, embedding in [
             ("a0", MAIN, 0, "user", "needle in the orchard", _vec(0)),
-            ("a1", MAIN, 1, "assistant", "semantic neighbor", _vec(1)),
+            ("a1", MAIN, 1, "assistant", "semantic neighbor", neighbor),
             ("a2", MAIN, 2, "user", "second question", None),
             ("a3", MAIN, 3, "assistant", "final answer", None),
-            ("b0", OTHER, 0, "assistant", "needle in the forest", _vec(1)),
-            ("c0", ARCHIVE, 0, "assistant", "needle in the garden", _vec(1)),
+            ("b0", OTHER, 0, "assistant", "needle in the forest", neighbor),
+            ("c0", ARCHIVE, 0, "assistant", "needle in the garden", neighbor),
         ]:
             conn.execute("INSERT INTO messages VALUES (?, ?, ?, NULL)", [mid, sid, idx])
             conn.execute(

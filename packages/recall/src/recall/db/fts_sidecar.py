@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 import sqlite3
 import tempfile
 import time
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from recall import _native
+from recall.core.fts_text import escape_fts5_query
 from recall.core.read_cancellation import check_read_cancelled, read_cancelled
 from recall.core.telemetry import Span, Stage, measured
 
@@ -38,6 +38,7 @@ _FTS_TABLES: dict[_FtsKind, tuple[str, str]] = {
 }
 
 SIDECAR_SCHEMA_VERSION = 2
+FTS_DERIVATION_VERSION = 2
 FINGERPRINT_FORMAT = "sha256-length-prefixed-utf8-v1"
 
 _TOKENIZER = "porter unicode61"
@@ -403,12 +404,12 @@ def upsert_tool_call_fts_batch(
 
 
 def fts_fields_signature(fields: Iterable[str] | None) -> str:
-    """Return a stable signature for the field set whose content the sidecar stores."""
+    """Return a stable signature for the field set and derivation version stored in the sidecar."""
     if fields is None:
         normalized = _ALL_FTS_FIELDS
     else:
         normalized = tuple(dict.fromkeys(field for field in fields if field))
-    return ",".join(sorted(normalized))
+    return f"{','.join(sorted(normalized))}|v{FTS_DERIVATION_VERSION}"
 
 
 def get_fts_fields_signature(sidecar_conn: sqlite3.Connection) -> str | None:
@@ -573,32 +574,7 @@ def should_index_bash_fts(fields: Iterable[str] | None) -> bool:
     return fields is None or "bash" in set(fields)
 
 
-def _escape_fts5_query(query: str) -> str:
-    """Treat restricted-field queries as terms/phrases, not executable FTS5 syntax."""
-    terms: list[str] = []
-    position = 0
-    for match in re.finditer(r'"([^"]*)"', query):
-        terms.extend(
-            _quote_fts5_term(term) for term in _bare_fts5_terms(query[position : match.start()])
-        )
-        phrase = match.group(1).strip()
-        if phrase:
-            terms.append(_quote_fts5_term(phrase))
-        position = match.end()
-    terms.extend(_quote_fts5_term(term) for term in _bare_fts5_terms(query[position:]))
-    return " ".join(terms)
-
-
-def _bare_fts5_terms(query: str) -> list[str]:
-    return re.findall(r"\w+\*?", query, flags=re.UNICODE)
-
-
-def _quote_fts5_term(term: str) -> str:
-    prefix = term.endswith("*") and len(term) > 1
-    term_value = term[:-1] if prefix else term
-    escaped = term_value.replace('"', '""')
-    suffix = "*" if prefix else ""
-    return f'"{escaped}"{suffix}'
+_escape_fts5_query = escape_fts5_query
 
 
 def content_fingerprint(columns: tuple[str, ...]) -> str:
