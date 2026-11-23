@@ -191,6 +191,17 @@ def test_migration_0043_converts_operational_tables_records_undo_and_reverses_un
             datetime(2026, 11, 22, 18, 5, 0, 222222),
         )
         assert events["ev_null"] == (None, datetime(2026, 11, 22, 18, 10, 0))
+        usage_indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'usage_events'"
+            ).fetchall()
+        }
+        assert {
+            "idx_usage_events_source_sid",
+            "idx_usage_events_session",
+            "idx_usage_events_ts",
+        } <= usage_indexes
 
         cursor_row = conn.execute(
             "SELECT updated_at FROM usage_log_cursors WHERE path = '/tmp/unified.jsonl'"

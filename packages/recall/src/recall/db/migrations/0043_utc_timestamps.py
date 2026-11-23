@@ -131,54 +131,104 @@ def _convert_operational_tables(transaction: TransactionCapability) -> None:
     recorded_at = utcnow_naive()
 
     if transaction.call("utc:has_usage_events", lambda conn: table_exists(conn, "usage_events")):
-        transaction.call(
-            "utc:undo_usage_events_ts",
-            lambda conn: conn.execute(
-                """
-                INSERT OR IGNORE INTO schema_migration_undo
-                    (migration_id, table_name, row_key, column_name, old_value, recorded_at)
-                SELECT ?, 'usage_events', id, 'ts', CAST(ts AS VARCHAR), ?
-                FROM usage_events
-                WHERE ts IS NOT NULL
-                  AND (ts::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM ts
-                """,
-                [MIGRATION_ID, recorded_at],
-            ).fetchone(),
+        needs_usage_events = transaction.call(
+            "utc:needs_usage_events",
+            lambda conn: bool(
+                (
+                    conn.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM usage_events
+                            WHERE (
+                                ts IS NOT NULL
+                                AND (ts::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM ts
+                            ) OR (
+                                harvested_at IS NOT NULL
+                                AND (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
+                                    IS DISTINCT FROM harvested_at
+                            )
+                        )
+                        """
+                    ).fetchone()
+                    or (False,)
+                )[0]
+            ),
         )
-        transaction.call(
-            "utc:undo_usage_events_harvested_at",
-            lambda conn: conn.execute(
-                """
-                INSERT OR IGNORE INTO schema_migration_undo
-                    (migration_id, table_name, row_key, column_name, old_value, recorded_at)
-                SELECT ?, 'usage_events', id, 'harvested_at', CAST(harvested_at AS VARCHAR), ?
-                FROM usage_events
-                WHERE harvested_at IS NOT NULL
-                  AND (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM harvested_at
-                """,
-                [MIGRATION_ID, recorded_at],
-            ).fetchone(),
-        )
-        transaction.call(
-            "utc:update_usage_events",
-            lambda conn: conn.execute(
-                """
-                UPDATE usage_events
-                SET
-                    ts = CASE
-                        WHEN ts IS NULL THEN NULL
-                        ELSE (ts::TIMESTAMPTZ AT TIME ZONE 'UTC')
-                    END,
-                    harvested_at = (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
-                WHERE (ts IS NOT NULL AND (ts::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM ts)
-                   OR (
-                       harvested_at IS NOT NULL
-                       AND (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
-                           IS DISTINCT FROM harvested_at
-                   )
-                """
-            ).fetchone(),
-        )
+        if needs_usage_events:
+            transaction.call(
+                "utc:undo_usage_events_ts",
+                lambda conn: conn.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migration_undo
+                        (migration_id, table_name, row_key, column_name, old_value, recorded_at)
+                    SELECT ?, 'usage_events', id, 'ts', CAST(ts AS VARCHAR), ?
+                    FROM usage_events
+                    WHERE ts IS NOT NULL
+                      AND (ts::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM ts
+                    """,
+                    [MIGRATION_ID, recorded_at],
+                ).fetchone(),
+            )
+            transaction.call(
+                "utc:undo_usage_events_harvested_at",
+                lambda conn: conn.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migration_undo
+                        (migration_id, table_name, row_key, column_name, old_value, recorded_at)
+                    SELECT ?, 'usage_events', id, 'harvested_at', CAST(harvested_at AS VARCHAR), ?
+                    FROM usage_events
+                    WHERE harvested_at IS NOT NULL
+                      AND (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
+                          IS DISTINCT FROM harvested_at
+                    """,
+                    [MIGRATION_ID, recorded_at],
+                ).fetchone(),
+            )
+            # Rebuild usage_events instead of bulk-UPDATEing an ART-indexed column (`ts`)
+            # alongside its PRIMARY KEY: DuckDB 1.5.5 aborts commit with a FATAL internal
+            # duplicate-key error on multi-row-group UPDATEs against PRIMARY_usage_events_0.
+            transaction.call(
+                "utc:rebuild_usage_events",
+                lambda conn: conn.execute(
+                    """
+                    DROP TABLE IF EXISTS usage_events_utc;
+                    CREATE TABLE usage_events_utc (
+                        id TEXT PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        source_session_id TEXT NOT NULL,
+                        session_id TEXT,
+                        ts TIMESTAMP,
+                        prompt_tokens BIGINT,
+                        cached_prompt_tokens BIGINT,
+                        completion_tokens BIGINT,
+                        reasoning_tokens BIGINT,
+                        host TEXT,
+                        harvested_at TIMESTAMP NOT NULL
+                    );
+                    INSERT INTO usage_events_utc (
+                        id, source, source_session_id, session_id, ts,
+                        prompt_tokens, cached_prompt_tokens, completion_tokens,
+                        reasoning_tokens, host, harvested_at
+                    )
+                    SELECT
+                        id, source, source_session_id, session_id,
+                        CASE
+                            WHEN ts IS NULL THEN NULL
+                            ELSE (ts::TIMESTAMPTZ AT TIME ZONE 'UTC')
+                        END,
+                        prompt_tokens, cached_prompt_tokens, completion_tokens,
+                        reasoning_tokens, host,
+                        (harvested_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
+                    FROM usage_events;
+                    DROP TABLE usage_events;
+                    ALTER TABLE usage_events_utc RENAME TO usage_events;
+                    CREATE INDEX idx_usage_events_source_sid
+                        ON usage_events(source, source_session_id);
+                    CREATE INDEX idx_usage_events_session ON usage_events(session_id);
+                    CREATE INDEX idx_usage_events_ts ON usage_events(ts);
+                    """
+                ).fetchone(),
+            )
 
     if transaction.call(
         "utc:has_usage_log_cursors", lambda conn: table_exists(conn, "usage_log_cursors")
