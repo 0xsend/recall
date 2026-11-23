@@ -89,8 +89,80 @@ def _require_any_ok(hosts_ok: int, *, verb: str) -> None:
         )
 
 
+def run_fleet_stats(
+    *,
+    source: str | None,
+    since: str | None,
+    fleet_config: str | None,
+    fleet_inventory_only: bool = False,
+) -> dict[str, object]:
+    """Resolved endpoint overview stats; emit skip warnings on stderr."""
+    from recall.services.fleet_stats import fleet_stats_overview
+
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    result = fleet_stats_overview(executor, source=source, since=since)
+    _emit_skips(result.errors)
+    _require_any_ok(result.hosts_ok, verb="stats")
+    return result.stats  # type: ignore[return-value]
+
+
+def run_fleet_stats_tools(
+    *,
+    source: str | None,
+    since: str | None,
+    fleet_config: str | None,
+    fleet_inventory_only: bool = False,
+) -> list[dict[str, object]]:
+    """Resolved endpoint tool usage breakdown; emit skip warnings on stderr."""
+    from recall.services.fleet_stats import fleet_stats_tools
+
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    result = fleet_stats_tools(executor, source=source, since=since)
+    _emit_skips(result.errors)
+    _require_any_ok(result.hosts_ok, verb="stats tools")
+    return result.rows  # type: ignore[return-value]
+
+
+def run_fleet_stats_bash(
+    *,
+    suggest: bool,
+    source: str | None,
+    since: str | None,
+    fleet_config: str | None,
+    fleet_inventory_only: bool = False,
+) -> list[dict[str, object]] | dict[str, object]:
+    """Resolved endpoint bash breakdown or suggestions; emit skip warnings on stderr."""
+    from recall.services.fleet_stats import FleetBashSuggestionsResult, fleet_stats_bash
+
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    result = fleet_stats_bash(executor, suggest=suggest, source=source, since=since)
+    _emit_skips(result.errors)
+    _require_any_ok(result.hosts_ok, verb="stats bash")
+    if isinstance(result, FleetBashSuggestionsResult):
+        return result.payload  # type: ignore[return-value]
+    return result.rows  # type: ignore[return-value]
+
+
+def run_fleet_stats_tokens(
+    *,
+    source: str | None,
+    since: str | None,
+    fleet_config: str | None,
+    fleet_inventory_only: bool = False,
+) -> list[dict[str, object]]:
+    """Resolved endpoint token usage by repository; emit skip warnings on stderr."""
+    from recall.services.fleet_stats import fleet_stats_tokens
+
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    result = fleet_stats_tokens(executor, source=source, since=since)
+    _emit_skips(result.errors)
+    _require_any_ok(result.hosts_ok, verb="stats tokens")
+    return result.rows  # type: ignore[return-value]
+
+
 def run_fleet_stats_usage(
     *,
+    source: str | None = None,
     since: str | None,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
@@ -99,7 +171,7 @@ def run_fleet_stats_usage(
     from recall.services.fleet_usage import fleet_stats_usage
 
     executor = _query(fleet_config, inventory_only=fleet_inventory_only)
-    result = fleet_stats_usage(executor, since=since)
+    result = fleet_stats_usage(executor, source=source, since=since)
     _emit_skips(result.errors)
     _require_any_ok(result.hosts_ok, verb="stats usage")
     return result.rows  # type: ignore[return-value]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
 
 import duckdb
@@ -12,7 +13,7 @@ from recall.core.rpc_params import ListParams, ShowParams
 from recall.core.rpc_types import APP_NOT_FOUND, INVALID_PARAMS, RpcError
 from recall.core.source_path import SourcePath
 from recall.core.time import parse_since
-from recall.core.types import parse_source
+from recall.core.types import Source, parse_source
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.services.live import (
     Cursor,
@@ -159,16 +160,44 @@ class ShowSelection:
         }
 
 
-def read_overview(config: AppConfig, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+_FILTERED_RUNTIME_CONTEXT_STATS: dict[str, Any] = {
+    "last_index_total": None,
+    "last_index_indexed": None,
+    "last_index_skipped": None,
+    "last_index_failed": None,
+    "last_context_messages": None,
+    "last_context_mode": None,
+    "last_context_input_tokens": None,
+    "last_context_output_tokens": None,
+    "last_context_model": None,
+}
+
+
+def read_overview(
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+) -> dict[str, Any]:
     with StandaloneLifetime().lease(conn) as lease:
-        return read_overview_on(config, lease)
+        return read_overview_on(config, lease, source=source, since=since)
 
 
-def read_overview_on(config: AppConfig, lease: DbLease) -> dict[str, Any]:
+def read_overview_on(
+    config: AppConfig,
+    lease: DbLease,
+    *,
+    source: Source | None = None,
+    since: datetime | None = None,
+) -> dict[str, Any]:
     from recall.services.analytics import overview_on
 
-    stats = asdict(overview_on(lease, config=config))
-    stats.update(runtime_context_stats_on(lease))
+    stats = asdict(overview_on(lease, source=source, since=since, config=config))
+    if source is not None or since is not None:
+        stats.update(_FILTERED_RUNTIME_CONTEXT_STATS)
+    else:
+        stats.update(runtime_context_stats_on(lease))
     return stats
 
 

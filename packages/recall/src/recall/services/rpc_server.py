@@ -54,6 +54,9 @@ from recall.core.rpc_params import (
     SearchParams,
     ShowParams,
     SkillStatsParams,
+    StatsBashFilteredParams,
+    StatsFilteredParams,
+    StatsUsageFilteredParams,
     StatusParams,
     StorageParams,
     UsageStatsParams,
@@ -77,6 +80,7 @@ from recall.core.search_budget import SEARCH_ENRICHMENT_WAIT_SECONDS
 from recall.core.search_filters import normalize_search_filters
 from recall.core.socket_path import validate_socket_path
 from recall.core.source_path import SourcePath
+from recall.core.stats_filters import StatsFilters, normalize_stats_filters
 from recall.core.telemetry import (
     Counter,
     Span,
@@ -169,10 +173,15 @@ _BOUNDED_READ_METHODS = frozenset(
         "recall.list_by_session",
         "recall.show",
         "recall.stats",
+        "recall.stats_filtered",
         "recall.stats_tools",
+        "recall.stats_tools_filtered",
         "recall.stats_bash",
+        "recall.stats_bash_filtered",
         "recall.stats_tokens",
+        "recall.stats_tokens_filtered",
         "recall.stats_usage",
+        "recall.stats_usage_filtered",
         "recall.stats_skills",
         "recall.daemon_status",
         "recall.check_indexes",
@@ -1544,10 +1553,23 @@ class RpcServer:
         self._register_method("recall.list_by_session", ListBySessionParams, self._handle_list)
         self._register_method("recall.show", ShowParams, self._handle_show)
         self._register_method("recall.stats", Params, self._handle_stats)
+        self._register_method("recall.stats_filtered", StatsFilteredParams, self._handle_stats)
         self._register_method("recall.stats_tools", Params, self._handle_stats_tools)
+        self._register_method(
+            "recall.stats_tools_filtered", StatsFilteredParams, self._handle_stats_tools
+        )
         self._register_method("recall.stats_bash", BashStatsParams, self._handle_stats_bash)
+        self._register_method(
+            "recall.stats_bash_filtered", StatsBashFilteredParams, self._handle_stats_bash
+        )
         self._register_method("recall.stats_tokens", Params, self._handle_stats_tokens)
+        self._register_method(
+            "recall.stats_tokens_filtered", StatsFilteredParams, self._handle_stats_tokens
+        )
         self._register_method("recall.stats_usage", UsageStatsParams, self._handle_stats_usage)
+        self._register_method(
+            "recall.stats_usage_filtered", StatsUsageFilteredParams, self._handle_stats_usage
+        )
         self._register_method("recall.stats_skills", SkillStatsParams, self._handle_stats_skills)
         self._register_method("recall.daemon_status", StatusParams, self._handle_daemon_status)
         self._register_method("recall.daemon_pause", Params, self._handle_daemon_pause)
@@ -3118,18 +3140,35 @@ class RpcServer:
             )
         )
 
+    def _parse_stats_filters(self, params: dict[str, Any]) -> StatsFilters:
+        try:
+            return normalize_stats_filters(
+                source=params.get("source"),
+                since=params.get("since"),
+            )
+        except ValueError as err:
+            raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
+
     async def _handle_stats(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.services.read_handlers import read_overview_on
 
-        return await self._run_readonly_on(lambda lease: read_overview_on(self._config, lease))
+        filters = self._parse_stats_filters(params)
+        return await self._run_readonly_on(
+            lambda lease: read_overview_on(
+                self._config, lease, source=filters.source, since=filters.since
+            )
+        )
 
     async def _handle_stats_tools(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
         from recall.services.analytics import tool_usage_on
 
+        filters = self._parse_stats_filters(params)
         return await self._run_readonly_on(
-            lambda lease: tool_usage_on(config=self._config, lease=lease)
+            lambda lease: tool_usage_on(
+                lease, source=filters.source, since=filters.since, config=self._config
+            )
         )
 
     async def _handle_stats_bash(
@@ -3137,13 +3176,18 @@ class RpcServer:
     ) -> Any:
         from recall.services.analytics import bash_breakdown_on, bash_suggestions_on
 
+        filters = self._parse_stats_filters(params)
         suggest = bool(params.get("suggest", False))
 
         def _do(lease: DbLease) -> Any:
             if suggest:
-                sug, skip = bash_suggestions_on(config=self._config, lease=lease)
+                sug, skip = bash_suggestions_on(
+                    lease, source=filters.source, since=filters.since, config=self._config
+                )
                 return {"suggestions": sug, "skipped": skip}
-            return bash_breakdown_on(config=self._config, lease=lease)
+            return bash_breakdown_on(
+                lease, source=filters.source, since=filters.since, config=self._config
+            )
 
         return await self._run_readonly_on(_do)
 
@@ -3152,8 +3196,11 @@ class RpcServer:
     ) -> Any:
         from recall.services.analytics import token_usage_on
 
+        filters = self._parse_stats_filters(params)
         return await self._run_readonly_on(
-            lambda lease: token_usage_on(config=self._config, lease=lease)
+            lambda lease: token_usage_on(
+                lease, source=filters.source, since=filters.since, config=self._config
+            )
         )
 
     async def _handle_stats_usage(
@@ -3161,14 +3208,14 @@ class RpcServer:
     ) -> Any:
         from dataclasses import asdict
 
-        from recall.core.time import parse_since
         from recall.services.analytics import usage_by_source_on
 
-        since_value = params.get("since")
-        since = parse_since(str(since_value)) if since_value else None
+        filters = self._parse_stats_filters(params)
 
         def _do(lease: DbLease) -> Any:
-            rows = usage_by_source_on(since=since, config=self._config, lease=lease)
+            rows = usage_by_source_on(
+                lease, source=filters.source, since=filters.since, config=self._config
+            )
             return [asdict(row) for row in rows]
 
         return await self._run_readonly_on(_do)

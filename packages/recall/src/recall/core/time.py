@@ -13,9 +13,12 @@ def parse_since(value: str, now: datetime | None = None) -> datetime:
     if match:
         amount = int(match.group(1))
         unit = match.group(2)
-        delta = _duration_delta(amount, unit)
-        base = now or datetime.now(UTC)
-        return base - delta
+        try:
+            delta = _duration_delta(amount, unit)
+            base = now or datetime.now(UTC)
+            return base - delta
+        except OverflowError as err:
+            raise ValueError(f"since value out of range: {value}") from err
 
     try:
         parsed = datetime.fromisoformat(value)
@@ -24,7 +27,10 @@ def parse_since(value: str, now: datetime | None = None) -> datetime:
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError as err:
+        raise ValueError(f"since value out of range: {value}") from err
 
 
 def _duration_delta(amount: int, unit: str) -> timedelta:

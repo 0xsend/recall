@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -10,6 +10,7 @@ from recall.cli.contract import (
     OutputFormat,
     emit_data_with_cta,
     emit_error,
+    is_explicit_source,
     parse_fields,
     parse_params,
     render_cta_hints,
@@ -25,11 +26,42 @@ from recall.cli.manifest import output_fields_for, output_fields_for_variant
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
 from recall.cli.utils import format_host
-from recall.core.types import parse_source
+from recall.core.stats_filters import StatsFilters, normalize_stats_filters
+from recall.core.types import SOURCE_HELP, parse_source
 
 app = typer.Typer(help="Analytics commands")
 
 SKILL_CENSUS_RPC_TIMEOUT_SECONDS = 600.0
+
+
+def _call_stats_rpc(method: str, params: dict[str, object]) -> Any:
+    """Invoke a stats RPC method, adding a restart hint when an older daemon lacks filtered RPCs."""
+    try:
+        return rpc_call_or_error(method, params)
+    except CliError as err:
+        if method.endswith("_filtered") and f"method not found: {method}" in err.message:
+            raise CliError(
+                code=err.code,
+                message=(
+                    f"running recall daemon does not support filtered stats ({err.message}); "
+                    "upgrade or run `recall daemon restart`"
+                ),
+                details=err.details,
+                exit_code=err.exit_code,
+                host_message=err.host_message,
+            ) from None
+        raise
+
+
+def _filtered_rpc_params(
+    filters: StatsFilters, extra: dict[str, object] | None = None
+) -> dict[str, object]:
+    rpc_params: dict[str, object] = dict(extra or {})
+    if filters.source is not None:
+        rpc_params["source"] = filters.source.value
+    if filters.since_iso is not None:
+        rpc_params["since"] = filters.since_iso
+    return rpc_params
 
 
 def _emit_status_notice(output_format: OutputFormat) -> None:
@@ -45,9 +77,34 @@ def _emit_status_notice(output_format: OutputFormat) -> None:
         typer.echo(notice, err=True)
 
 
+_ROOT_OPTION_FLAGS: tuple[tuple[str, str], ...] = (
+    ("source", "--source"),
+    ("since", "--since"),
+    ("fleet", "--fleet"),
+    ("fleet_inventory_only", "--fleet-inventory-only"),
+    ("fleet_config", "--fleet-config"),
+    ("format_name", "--format"),
+    ("fields", "--fields"),
+    ("json_output", "--json"),
+    ("cta", "--cta"),
+    ("params", "--params"),
+)
+
+
 @app.callback(invoke_without_command=True)
 def root(
     ctx: typer.Context,
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
+    since: str | None = typer.Option(None, "--since", help="Time window e.g. 30d, 12h"),
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False, "--fleet-inventory-only", help=INVENTORY_ONLY_HELP
+    ),
+    fleet_config: str | None = typer.Option(
+        None,
+        "--fleet-config",
+        help="Fleet inventory path (default: ~/.config/recall/fleet.toml)",
+    ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
     ),
@@ -57,6 +114,29 @@ def root(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
     if ctx.invoked_subcommand is not None:
+        explicit_flags = [
+            flag for param_name, flag in _ROOT_OPTION_FLAGS if is_explicit_source(ctx, param_name)
+        ]
+        if explicit_flags:
+            output_format = resolve_output_format_early(
+                ctx,
+                json_output=json_output,
+                format_name=format_name,
+                raw_params=params,
+            )
+            emit_error(
+                CliError(
+                    code=ErrorCode.VALIDATION,
+                    message=(
+                        f"Place {', '.join(explicit_flags)} after "
+                        f"`recall stats {ctx.invoked_subcommand}` "
+                        "(options before a subcommand are not forwarded)"
+                    ),
+                    exit_code=2,
+                ),
+                output_format=output_format,
+            )
+            raise typer.Exit(code=2) from None
         return
     output_format = resolve_output_format_early(
         ctx,
@@ -67,8 +147,23 @@ def root(
     try:
         payload = parse_params(
             params,
-            allowed={"fields", "format", "json", "cta"},
+            allowed={
+                "source",
+                "since",
+                "fleet",
+                "fleet_inventory_only",
+                "fleet_config",
+                "fields",
+                "format",
+                "json",
+                "cta",
+            },
             types={
+                "source": "string",
+                "since": "string",
+                "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
+                "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
                 "json": "boolean",
@@ -81,10 +176,34 @@ def root(
             json_output=json_output,
             format_name=format_name,
         )
+        source = resolve_param(ctx, payload, "source", source)
+        since = resolve_param(ctx, payload, "since", since)
+        fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx, payload, "fleet_inventory_only", fleet_inventory_only
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
+        fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
-        stats = rpc_call_or_error("recall.stats", {})
+        filters = normalize_stats_filters(source=source, since=since)
+
+        if fleet:
+            from recall.cli.fleet import run_fleet_stats
+
+            stats = run_fleet_stats(
+                source=filters.source.value if filters.source is not None else None,
+                since=filters.since_iso,
+                fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
+            )
+        elif filters.active:
+            stats = _call_stats_rpc("recall.stats_filtered", _filtered_rpc_params(filters))
+        else:
+            stats = _call_stats_rpc("recall.stats", {})
+        assert isinstance(stats, dict)
         _emit_status_notice(output_format)
         ctas = cta_for_stats(None) if (cta or output_format == OutputFormat.TEXT) else []
         if output_format != OutputFormat.TEXT:
@@ -102,21 +221,29 @@ def root(
         typer.echo(f"  Messages: {stats.get('messages', 0)}")
         typer.echo(f"  Tool calls: {stats.get('tool_calls', 0)}")
         typer.echo(f"  Bash calls: {stats.get('bash_calls', 0)}")
-        typer.echo("Last index run:")
-        typer.echo(f"  Messages indexed:                 {stats.get('last_index_indexed', 0):,}")
-        typer.echo(
-            f"  Messages contextualized:           {stats.get('last_context_messages', 0):,}"
-        )
-        typer.echo(f"  Context backend:                   {stats.get('last_context_mode', 'off')}")
-        typer.echo(
-            f"  Context tokens (input):            {stats.get('last_context_input_tokens', 0):,}"
-        )
-        typer.echo(
-            f"  Context tokens (output):           {stats.get('last_context_output_tokens', 0):,}"
-        )
-        typer.echo(
-            f"  Context model:                     {stats.get('last_context_model') or '(none)'}"
-        )
+        if not fleet and not filters.active:
+            typer.echo("Last index run:")
+            typer.echo(
+                f"  Messages indexed:                 {stats.get('last_index_indexed', 0):,}"
+            )
+            typer.echo(
+                f"  Messages contextualized:           {stats.get('last_context_messages', 0):,}"
+            )
+            typer.echo(
+                f"  Context backend:                   {stats.get('last_context_mode', 'off')}"
+            )
+            typer.echo(
+                f"  Context tokens (input):            "
+                f"{stats.get('last_context_input_tokens', 0):,}"
+            )
+            typer.echo(
+                f"  Context tokens (output):           "
+                f"{stats.get('last_context_output_tokens', 0):,}"
+            )
+            typer.echo(
+                f"  Context model:                     "
+                f"{stats.get('last_context_model') or '(none)'}"
+            )
         render_cta_hints(ctas)
     except CliError as err:
         emit_error(err, output_format=output_format)
@@ -132,6 +259,17 @@ def root(
 @app.command("tools")
 def tools(
     ctx: typer.Context,
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
+    since: str | None = typer.Option(None, "--since", help="Time window e.g. 30d, 12h"),
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False, "--fleet-inventory-only", help=INVENTORY_ONLY_HELP
+    ),
+    fleet_config: str | None = typer.Option(
+        None,
+        "--fleet-config",
+        help="Fleet inventory path (default: ~/.config/recall/fleet.toml)",
+    ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
     ),
@@ -140,6 +278,7 @@ def tools(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
+    """Show tool usage counts."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -149,8 +288,23 @@ def tools(
     try:
         payload = parse_params(
             params,
-            allowed={"fields", "format", "json", "cta"},
+            allowed={
+                "source",
+                "since",
+                "fleet",
+                "fleet_inventory_only",
+                "fleet_config",
+                "fields",
+                "format",
+                "json",
+                "cta",
+            },
             types={
+                "source": "string",
+                "since": "string",
+                "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
+                "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
                 "json": "boolean",
@@ -163,10 +317,34 @@ def tools(
             json_output=json_output,
             format_name=format_name,
         )
+        source = resolve_param(ctx, payload, "source", source)
+        since = resolve_param(ctx, payload, "since", since)
+        fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx, payload, "fleet_inventory_only", fleet_inventory_only
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
+        fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
-        stats = rpc_call_or_error("recall.stats_tools", {})
+        filters = normalize_stats_filters(source=source, since=since)
+
+        if fleet:
+            from recall.cli.fleet import run_fleet_stats_tools
+
+            stats = run_fleet_stats_tools(
+                source=filters.source.value if filters.source is not None else None,
+                since=filters.since_iso,
+                fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
+            )
+        elif filters.active:
+            stats = _call_stats_rpc("recall.stats_tools_filtered", _filtered_rpc_params(filters))
+        else:
+            stats = _call_stats_rpc("recall.stats_tools", {})
+        assert isinstance(stats, list)
         _emit_status_notice(output_format)
         ctas = cta_for_stats("tools") if (cta or output_format == OutputFormat.TEXT) else []
         if output_format != OutputFormat.TEXT:
@@ -197,6 +375,17 @@ def tools(
 def bash(
     ctx: typer.Context,
     suggest: bool = typer.Option(False, "--suggest", help="Generate permission suggestions"),
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
+    since: str | None = typer.Option(None, "--since", help="Time window e.g. 30d, 12h"),
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False, "--fleet-inventory-only", help=INVENTORY_ONLY_HELP
+    ),
+    fleet_config: str | None = typer.Option(
+        None,
+        "--fleet-config",
+        help="Fleet inventory path (default: ~/.config/recall/fleet.toml)",
+    ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
     ),
@@ -205,6 +394,7 @@ def bash(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
+    """Show bash command usage or permission suggestions."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -214,9 +404,25 @@ def bash(
     try:
         payload = parse_params(
             params,
-            allowed={"suggest", "fields", "format", "json", "cta"},
+            allowed={
+                "suggest",
+                "source",
+                "since",
+                "fleet",
+                "fleet_inventory_only",
+                "fleet_config",
+                "fields",
+                "format",
+                "json",
+                "cta",
+            },
             types={
                 "suggest": "boolean",
+                "source": "string",
+                "since": "string",
+                "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
+                "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
                 "json": "boolean",
@@ -230,12 +436,38 @@ def bash(
             format_name=format_name,
         )
         suggest = resolve_bool_param(ctx, payload, "suggest", suggest)
+        source = resolve_param(ctx, payload, "source", source)
+        since = resolve_param(ctx, payload, "since", since)
+        fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx, payload, "fleet_inventory_only", fleet_inventory_only
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
+        fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
+        filters = normalize_stats_filters(source=source, since=since)
         ctas = cta_for_stats("bash") if (cta or output_format == OutputFormat.TEXT) else []
         if suggest:
-            result = rpc_call_or_error("recall.stats_bash", {"suggest": True})
+            if fleet:
+                from recall.cli.fleet import run_fleet_stats_bash
+
+                result = run_fleet_stats_bash(
+                    suggest=True,
+                    source=filters.source.value if filters.source is not None else None,
+                    since=filters.since_iso,
+                    fleet_config=fleet_config,
+                    fleet_inventory_only=fleet_inventory_only,
+                )
+            elif filters.active:
+                result = _call_stats_rpc(
+                    "recall.stats_bash_filtered",
+                    _filtered_rpc_params(filters, {"suggest": True}),
+                )
+            else:
+                result = _call_stats_rpc("recall.stats_bash", {"suggest": True})
             _emit_status_notice(output_format)
             if output_format != OutputFormat.TEXT:
                 emit_data_with_cta(
@@ -250,8 +482,10 @@ def bash(
                     ),
                 )
                 return
-            suggestions = result.get("suggestions", []) if isinstance(result, dict) else []
-            skipped = result.get("skipped", []) if isinstance(result, dict) else []
+            raw_suggestions = result.get("suggestions") if isinstance(result, dict) else None
+            raw_skipped = result.get("skipped") if isinstance(result, dict) else None
+            suggestions = raw_suggestions if isinstance(raw_suggestions, list) else []
+            skipped = raw_skipped if isinstance(raw_skipped, list) else []
             typer.echo("Suggested Bash Permissions")
             typer.echo("=" * 26)
             for suggestion in suggestions:
@@ -271,7 +505,21 @@ def bash(
             render_cta_hints(ctas)
             return
 
-        stats = rpc_call_or_error("recall.stats_bash", {})
+        if fleet:
+            from recall.cli.fleet import run_fleet_stats_bash
+
+            stats = run_fleet_stats_bash(
+                suggest=False,
+                source=filters.source.value if filters.source is not None else None,
+                since=filters.since_iso,
+                fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
+            )
+        elif filters.active:
+            stats = _call_stats_rpc("recall.stats_bash_filtered", _filtered_rpc_params(filters))
+        else:
+            stats = _call_stats_rpc("recall.stats_bash", {})
+        assert isinstance(stats, list)
         _emit_status_notice(output_format)
         if output_format != OutputFormat.TEXT:
             emit_data_with_cta(
@@ -306,6 +554,17 @@ def bash(
 @app.command("tokens")
 def tokens(
     ctx: typer.Context,
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
+    since: str | None = typer.Option(None, "--since", help="Time window e.g. 30d, 12h"),
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False, "--fleet-inventory-only", help=INVENTORY_ONLY_HELP
+    ),
+    fleet_config: str | None = typer.Option(
+        None,
+        "--fleet-config",
+        help="Fleet inventory path (default: ~/.config/recall/fleet.toml)",
+    ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
     ),
@@ -314,6 +573,7 @@ def tokens(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
+    """Show token usage grouped by repository."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -323,8 +583,23 @@ def tokens(
     try:
         payload = parse_params(
             params,
-            allowed={"fields", "format", "json", "cta"},
+            allowed={
+                "source",
+                "since",
+                "fleet",
+                "fleet_inventory_only",
+                "fleet_config",
+                "fields",
+                "format",
+                "json",
+                "cta",
+            },
             types={
+                "source": "string",
+                "since": "string",
+                "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
+                "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
                 "json": "boolean",
@@ -337,10 +612,34 @@ def tokens(
             json_output=json_output,
             format_name=format_name,
         )
+        source = resolve_param(ctx, payload, "source", source)
+        since = resolve_param(ctx, payload, "since", since)
+        fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx, payload, "fleet_inventory_only", fleet_inventory_only
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
+        fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
-        stats = rpc_call_or_error("recall.stats_tokens", {})
+        filters = normalize_stats_filters(source=source, since=since)
+
+        if fleet:
+            from recall.cli.fleet import run_fleet_stats_tokens
+
+            stats = run_fleet_stats_tokens(
+                source=filters.source.value if filters.source is not None else None,
+                since=filters.since_iso,
+                fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
+            )
+        elif filters.active:
+            stats = _call_stats_rpc("recall.stats_tokens_filtered", _filtered_rpc_params(filters))
+        else:
+            stats = _call_stats_rpc("recall.stats_tokens", {})
+        assert isinstance(stats, list)
         _emit_status_notice(output_format)
         ctas = cta_for_stats("tokens") if (cta or output_format == OutputFormat.TEXT) else []
         if output_format != OutputFormat.TEXT:
@@ -373,6 +672,7 @@ def tokens(
 @app.command("usage")
 def usage(
     ctx: typer.Context,
+    source: str | None = typer.Option(None, "--source", help=SOURCE_HELP),
     since: str | None = typer.Option(None, "--since", help="Time window e.g. 30d, 12h"),
     fleet: bool = typer.Option(
         False,
@@ -408,6 +708,7 @@ def usage(
         payload = parse_params(
             params,
             allowed={
+                "source",
                 "since",
                 "fleet",
                 "fleet_inventory_only",
@@ -418,6 +719,7 @@ def usage(
                 "cta",
             },
             types={
+                "source": "string",
                 "since": "string",
                 "fleet": "boolean",
                 "fleet_inventory_only": "boolean",
@@ -434,6 +736,7 @@ def usage(
             json_output=json_output,
             format_name=format_name,
         )
+        source = resolve_param(ctx, payload, "source", source)
         since = resolve_param(ctx, payload, "since", since)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
         fleet_inventory_only = resolve_bool_param(
@@ -448,18 +751,25 @@ def usage(
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
+        filters = normalize_stats_filters(source=source, since=since)
 
         if fleet:
             from recall.cli.fleet import run_fleet_stats_usage
 
             stats = run_fleet_stats_usage(
-                since=since, fleet_config=fleet_config, fleet_inventory_only=fleet_inventory_only
+                source=filters.source.value if filters.source is not None else None,
+                since=filters.since_iso,
+                fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
             )
+        elif filters.source is not None:
+            stats = _call_stats_rpc("recall.stats_usage_filtered", _filtered_rpc_params(filters))
         else:
             rpc_params: dict[str, object] = {}
-            if since is not None:
-                rpc_params["since"] = since
-            stats = rpc_call_or_error("recall.stats_usage", rpc_params)
+            if filters.since_iso is not None:
+                rpc_params["since"] = filters.since_iso
+            stats = _call_stats_rpc("recall.stats_usage", rpc_params)
+        assert isinstance(stats, list)
 
         _emit_status_notice(output_format)
         ctas = cta_for_stats("usage") if (cta or output_format == OutputFormat.TEXT) else []
@@ -478,14 +788,14 @@ def usage(
             render_cta_hints(ctas)
             return
         for stat in stats:
-            source = stat.get("source") or "unknown"
+            row_source = stat.get("source") or "unknown"
             model = stat.get("model") or "-"
             host_value = stat.get("host") or "-"
             host = host_value if isinstance(host_value, str) else str(host_value)
             fresh = stat.get("fresh_input_tokens")
             cached = stat.get("cached_input_tokens", 0)
             parts = [
-                f"{source}",
+                f"{row_source}",
                 f"model={model}",
                 f"host={format_host(host)}",
                 f"in={stat.get('input_tokens', 0)}",

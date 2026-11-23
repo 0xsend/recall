@@ -18,6 +18,9 @@ from recall.core.rpc_params import (
     SearchParams,
     ShowParams,
     SkillStatsParams,
+    StatsBashFilteredParams,
+    StatsFilteredParams,
+    StatsUsageFilteredParams,
     UsageStatsParams,
 )
 
@@ -52,14 +55,33 @@ class StatsRead(Params):
     params: Params
 
 
+class StatsFilteredRead(Params):
+    method: Literal[
+        "recall.stats_filtered",
+        "recall.stats_tools_filtered",
+        "recall.stats_tokens_filtered",
+    ]
+    params: StatsFilteredParams
+
+
 class BashRead(Params):
     method: Literal["recall.stats_bash"]
     params: BashStatsParams
 
 
+class BashFilteredRead(Params):
+    method: Literal["recall.stats_bash_filtered"]
+    params: StatsBashFilteredParams
+
+
 class UsageRead(Params):
     method: Literal["recall.stats_usage"]
     params: UsageStatsParams
+
+
+class UsageFilteredRead(Params):
+    method: Literal["recall.stats_usage_filtered"]
+    params: StatsUsageFilteredParams
 
 
 class SkillsRead(Params):
@@ -74,8 +96,11 @@ PollRead = (
     | SessionListRead
     | ShowRead
     | StatsRead
+    | StatsFilteredRead
     | BashRead
+    | BashFilteredRead
     | UsageRead
+    | UsageFilteredRead
     | SkillsRead
 )
 _ADAPTER = TypeAdapter(PollRead)
