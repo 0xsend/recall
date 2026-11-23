@@ -353,7 +353,41 @@ def test_interrupted_rescope_refuses_poll_reads_and_forces_union_recovery(tmp_pa
             assert sidecar.execute(
                 "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'secretthought'"
             ).fetchone() == (0,)
-            verify_candidate(conn, sidecar, ("content", "bash"))
+            assert sidecar.execute(
+                "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'body'"
+            ).fetchone() == (1,)
+            assert sidecar.execute(
+                "SELECT COUNT(*) FROM tool_calls_fts WHERE tool_calls_fts MATCH 'edit_target'"
+            ).fetchone() == (1,)
+            # Verify post-rescope FTS integrity, rowid membership, and exact fingerprints.
+            # (Offline verify_candidate's *_data averages check applies to freshly built
+            # candidates; SQLite <= 3.53 contentless_delete=1 does not decrement averages
+            # on in-place REPLACE.)
+            assert sidecar.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            with sidecar:
+                sidecar.execute("INSERT INTO message_fts(message_fts) VALUES ('integrity-check')")
+                sidecar.execute(
+                    "INSERT INTO tool_calls_fts(tool_calls_fts) VALUES ('integrity-check')"
+                )
+            assert sidecar.execute(
+                "SELECT message_id, content_fingerprint FROM message_fts_rowid ORDER BY message_id"
+            ).fetchall() == [("m1", content_fingerprint(("body", "")))]
+            assert sidecar.execute(
+                "SELECT tool_call_id, content_fingerprint FROM tool_calls_fts_rowid "
+                "ORDER BY tool_call_id"
+            ).fetchall() == [("tc1", content_fingerprint(("/repo/edit_target.py",)))]
+            assert (
+                sidecar.execute(
+                    "SELECT rowid FROM message_fts EXCEPT SELECT rowid FROM message_fts_rowid"
+                ).fetchone()
+                is None
+            )
+            assert (
+                sidecar.execute(
+                    "SELECT rowid FROM tool_calls_fts EXCEPT SELECT rowid FROM tool_calls_fts_rowid"
+                ).fetchone()
+                is None
+            )
         finally:
             sidecar.close()
 
@@ -637,7 +671,7 @@ def test_streamed_hydration_pending_repair_and_orphan_backfill_respect_chunk_bou
 
             # Reconcile orphan backfill also streams bounded chunks
             sidecar.execute("DELETE FROM tool_calls_fts_rowid")
-            sidecar.execute("DELETE FROM tool_calls_fts")
+            sidecar.execute("INSERT INTO tool_calls_fts(tool_calls_fts) VALUES ('delete-all')")
             sidecar.commit()
             stats = reconcile_sidecar(conn, sidecar, fts_fields=("content", "thinking", "bash"))
             assert stats.orphans_backfilled["tool_call"] == 5
