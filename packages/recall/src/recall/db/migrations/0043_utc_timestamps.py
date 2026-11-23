@@ -23,23 +23,53 @@ All DDL defaults, pre-image inserts, data updates, schema-version advance, and
 audit insert commit atomically inside one observed lease transaction after
 verifying schema 42 and the schema-41 recovery fence.
 
-To reverse the operational table mutations from ``schema_migration_undo``:
+To reverse the operational table mutations from ``schema_migration_undo`` (using
+an atomic rebuild for ``usage_events`` to avoid DuckDB 1.5.5's multi-row-group
+ART ``UPDATE`` bug on ``idx_usage_events_ts``):
 
-    UPDATE usage_events
-    SET ts = CAST(u.old_value AS TIMESTAMP)
-    FROM schema_migration_undo u
-    WHERE u.migration_id = '0043_utc_timestamps'
-      AND u.table_name = 'usage_events'
-      AND u.column_name = 'ts'
-      AND u.row_key = usage_events.id;
-
-    UPDATE usage_events
-    SET harvested_at = CAST(u.old_value AS TIMESTAMP)
-    FROM schema_migration_undo u
-    WHERE u.migration_id = '0043_utc_timestamps'
-      AND u.table_name = 'usage_events'
-      AND u.column_name = 'harvested_at'
-      AND u.row_key = usage_events.id;
+    BEGIN;
+    DROP TABLE IF EXISTS usage_events_restore;
+    CREATE TABLE usage_events_restore (
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        source_session_id TEXT NOT NULL,
+        session_id TEXT,
+        ts TIMESTAMP,
+        prompt_tokens BIGINT,
+        cached_prompt_tokens BIGINT,
+        completion_tokens BIGINT,
+        reasoning_tokens BIGINT,
+        host TEXT,
+        harvested_at TIMESTAMP NOT NULL
+    );
+    INSERT INTO usage_events_restore (
+        id, source, source_session_id, session_id, ts,
+        prompt_tokens, cached_prompt_tokens, completion_tokens,
+        reasoning_tokens, host, harvested_at
+    )
+    SELECT
+        e.id, e.source, e.source_session_id, e.session_id,
+        COALESCE(CAST(u_ts.old_value AS TIMESTAMP), e.ts),
+        e.prompt_tokens, e.cached_prompt_tokens, e.completion_tokens,
+        e.reasoning_tokens, e.host,
+        COALESCE(CAST(u_h.old_value AS TIMESTAMP), e.harvested_at)
+    FROM usage_events e
+    LEFT JOIN schema_migration_undo u_ts
+      ON u_ts.migration_id = '0043_utc_timestamps'
+     AND u_ts.table_name = 'usage_events'
+     AND u_ts.column_name = 'ts'
+     AND u_ts.row_key = e.id
+    LEFT JOIN schema_migration_undo u_h
+      ON u_h.migration_id = '0043_utc_timestamps'
+     AND u_h.table_name = 'usage_events'
+     AND u_h.column_name = 'harvested_at'
+     AND u_h.row_key = e.id;
+    DROP TABLE usage_events;
+    ALTER TABLE usage_events_restore RENAME TO usage_events;
+    CREATE INDEX idx_usage_events_source_sid
+        ON usage_events(source, source_session_id);
+    CREATE INDEX idx_usage_events_session ON usage_events(session_id);
+    CREATE INDEX idx_usage_events_ts ON usage_events(ts);
 
     UPDATE usage_log_cursors
     SET updated_at = CAST(u.old_value AS TIMESTAMP)
@@ -58,6 +88,7 @@ To reverse the operational table mutations from ``schema_migration_undo``:
       AND json_extract_string(u.row_key, '$[0]') = live_marks.source
       AND json_extract_string(u.row_key, '$[1]') = live_marks.source_session_id
       AND json_extract_string(u.row_key, '$[2]') = live_marks.host;
+    COMMIT;
 """
 
 from __future__ import annotations
@@ -288,6 +319,25 @@ def _convert_operational_tables(transaction: TransactionCapability) -> None:
                 SET marked_at = (marked_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
                 WHERE marked_at IS NOT NULL
                   AND (marked_at::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM marked_at
+                """
+            ).fetchone(),
+        )
+
+    # Convert transient pending keyword intents so pre-upgrade local timestamps
+    # cannot sort after post-upgrade UTC intents on UTC+N hosts (queued_at has
+    # no ART index, so in-place UPDATE touches zero secondary indexes).
+    if transaction.call(
+        "utc:has_fts_sidecar_pending",
+        lambda conn: table_exists(conn, "fts_sidecar_pending"),
+    ):
+        transaction.call(
+            "utc:update_fts_sidecar_pending",
+            lambda conn: conn.execute(
+                """
+                UPDATE fts_sidecar_pending
+                SET queued_at = (queued_at::TIMESTAMPTZ AT TIME ZONE 'UTC')
+                WHERE queued_at IS NOT NULL
+                  AND (queued_at::TIMESTAMPTZ AT TIME ZONE 'UTC') IS DISTINCT FROM queued_at
                 """
             ).fetchone(),
         )

@@ -96,14 +96,26 @@ def find_moved_predecessors(
         signature = transcript_file(Path(source_path)).stat()
     except OSError:
         return ()
-    # Native identity handles cross-device moves without timestamps; inode
-    # identity also handles sources whose native id came from the filename.
-    # Both are candidate keys only: absence and committed bytes decide proof.
+    # Native identity handles cross-device moves without timestamps and across
+    # the schema-43 UTC cutover (bounded to timezone offsets <= 14h with matching
+    # sub-minute seconds so unrelated sessions sharing a filename-derived native
+    # id cannot flood the candidate set). Inode identity handles same-device
+    # moves. Legacy host-local timestamp fallback covers timestamped sources
+    # without a native id across the cutover. All are candidate keys only:
+    # absence and committed bytes decide proof.
     candidates = (
         _ROW_SELECT + " AND s.source = ? AND ("
-        " (f.dev = ? AND f.inode = ?) OR (s.source_session_id = ?"
-        " AND (ss.started_at IS NULL OR CAST(? AS TIMESTAMP) IS NULL))"
-        " OR ss.started_at = CAST(? AS TIMESTAMP)) AND s.source_path <> ?"
+        " (f.dev = ? AND f.inode = ?)"
+        " OR (s.source_session_id = ? AND ("
+        "     ss.started_at IS NULL OR CAST(? AS TIMESTAMP) IS NULL"
+        "     OR (ss.started_at BETWEEN (CAST(? AS TIMESTAMP) - INTERVAL 14 HOUR)"
+        "         AND (CAST(? AS TIMESTAMP) + INTERVAL 14 HOUR)"
+        "         AND SECOND(ss.started_at) = SECOND(CAST(? AS TIMESTAMP))"
+        "         AND MICROSECOND(ss.started_at) = MICROSECOND(CAST(? AS TIMESTAMP)))))"
+        " OR ss.started_at = CAST(? AS TIMESTAMP)"
+        " OR (ss.started_at IS NOT NULL AND CAST(? AS TIMESTAMP) IS NOT NULL"
+        "     AND (ss.started_at::TIMESTAMPTZ AT TIME ZONE 'UTC') = CAST(? AS TIMESTAMP)))"
+        " AND s.source_path <> ?"
     )
     parameters = [
         False,
@@ -113,6 +125,12 @@ def find_moved_predecessors(
         signature.st_dev,
         signature.st_ino,
         source_session_id,
+        started_at,
+        started_at,
+        started_at,
+        started_at,
+        started_at,
+        started_at,
         started_at,
         started_at,
         source_path,

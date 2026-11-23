@@ -284,21 +284,49 @@ def test_migration_0043_converts_operational_tables_records_undo_and_reverses_un
         # Documented reverse SQL restores exact pre-upgrade values bit-for-bit.
         conn.execute(
             """
-            UPDATE usage_events
-            SET ts = CAST(u.old_value AS TIMESTAMP)
-            FROM schema_migration_undo u
-            WHERE u.migration_id = '0043_utc_timestamps'
-              AND u.table_name = 'usage_events'
-              AND u.column_name = 'ts'
-              AND u.row_key = usage_events.id;
-
-            UPDATE usage_events
-            SET harvested_at = CAST(u.old_value AS TIMESTAMP)
-            FROM schema_migration_undo u
-            WHERE u.migration_id = '0043_utc_timestamps'
-              AND u.table_name = 'usage_events'
-              AND u.column_name = 'harvested_at'
-              AND u.row_key = usage_events.id;
+            BEGIN;
+            DROP TABLE IF EXISTS usage_events_restore;
+            CREATE TABLE usage_events_restore (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_session_id TEXT NOT NULL,
+                session_id TEXT,
+                ts TIMESTAMP,
+                prompt_tokens BIGINT,
+                cached_prompt_tokens BIGINT,
+                completion_tokens BIGINT,
+                reasoning_tokens BIGINT,
+                host TEXT,
+                harvested_at TIMESTAMP NOT NULL
+            );
+            INSERT INTO usage_events_restore (
+                id, source, source_session_id, session_id, ts,
+                prompt_tokens, cached_prompt_tokens, completion_tokens,
+                reasoning_tokens, host, harvested_at
+            )
+            SELECT
+                e.id, e.source, e.source_session_id, e.session_id,
+                COALESCE(CAST(u_ts.old_value AS TIMESTAMP), e.ts),
+                e.prompt_tokens, e.cached_prompt_tokens, e.completion_tokens,
+                e.reasoning_tokens, e.host,
+                COALESCE(CAST(u_h.old_value AS TIMESTAMP), e.harvested_at)
+            FROM usage_events e
+            LEFT JOIN schema_migration_undo u_ts
+              ON u_ts.migration_id = '0043_utc_timestamps'
+             AND u_ts.table_name = 'usage_events'
+             AND u_ts.column_name = 'ts'
+             AND u_ts.row_key = e.id
+            LEFT JOIN schema_migration_undo u_h
+              ON u_h.migration_id = '0043_utc_timestamps'
+             AND u_h.table_name = 'usage_events'
+             AND u_h.column_name = 'harvested_at'
+             AND u_h.row_key = e.id;
+            DROP TABLE usage_events;
+            ALTER TABLE usage_events_restore RENAME TO usage_events;
+            CREATE INDEX idx_usage_events_source_sid
+                ON usage_events(source, source_session_id);
+            CREATE INDEX idx_usage_events_session ON usage_events(session_id);
+            CREATE INDEX idx_usage_events_ts ON usage_events(ts);
 
             UPDATE usage_log_cursors
             SET updated_at = CAST(u.old_value AS TIMESTAMP)
@@ -317,6 +345,7 @@ def test_migration_0043_converts_operational_tables_records_undo_and_reverses_un
               AND json_extract_string(u.row_key, '$[0]') = live_marks.source
               AND json_extract_string(u.row_key, '$[1]') = live_marks.source_session_id
               AND json_extract_string(u.row_key, '$[2]') = live_marks.host;
+            COMMIT;
             """
         )
         assert conn.execute(
@@ -432,3 +461,41 @@ def test_rollback_migration_accepts_schema_43_and_refuses_schema_42(tmp_path: Pa
     restored = rollback_migration(config, preserve=tmp_path / "preserve_ok")
     assert restored.exists()
     assert (config.data_dir / "daemon-refused").exists()
+
+
+def test_migration_0043_converts_pending_sidecar_queue_preserving_utc_plus_9_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-upgrade local delete at 19:00 JST must sort before post-upgrade 10:05Z upsert."""
+    from recall.db.fts_sidecar import open_sidecar
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch_on
+
+    _set_tz(monkeypatch, "Asia/Tokyo")
+    path = tmp_path / "v42_tokyo.duckdb"
+    _seed_schema_42_db(path, tz_name="Asia/Tokyo", version=42)
+
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("SET TimeZone = 'Asia/Tokyo'")
+        # Pre-upgrade delete queued at 19:00 local JST (= 10:00 UTC).
+        conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at) "
+            "VALUES ('message', 'm1', 'delete', TIMESTAMP '2026-07-15 19:00:00')"
+        )
+        ensure_schema(conn)
+        assert conn.execute(
+            "SELECT queued_at FROM fts_sidecar_pending WHERE id = 'm1' AND op = 'delete'"
+        ).fetchone() == (datetime(2026, 7, 15, 10, 0, 0),)
+
+        # Post-upgrade recreation upsert queued at 10:05 UTC.
+        conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at) "
+            "VALUES ('message', 'm1', 'upsert', TIMESTAMP '2026-07-15 10:05:00')"
+        )
+        sidecar = open_sidecar(Path(":memory:"))
+        try:
+            with StandaloneLifetime().lease(conn) as lease:
+                result = repair_pending_batch_on(lease, sidecar)
+            assert result.applied == 2 and result.remaining == 0
+            assert sidecar.execute("SELECT COUNT(*) FROM message_fts").fetchone() == (1,)
+        finally:
+            sidecar.close()

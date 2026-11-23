@@ -659,3 +659,60 @@ def test_live_roster_and_liveness_use_utc_cutoffs_under_chicago(
         rows = conn.execute(sql + " SELECT * FROM classified WHERE matches", params).fetchall()
         assert len(rows) == 1
         assert to_utc(rows[0][11]) == datetime.fromtimestamp(mtime, tz=UTC).replace(microsecond=0)
+
+
+def test_cross_device_move_across_schema_42_to_43_transition_retains_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-v2 legacy local-naive started_at must still adopt moved transcript across devices."""
+    _set_tz(monkeypatch, "America/Chicago")
+    root = tmp_path / "move_cutover"
+    root.mkdir()
+    old_path = root / "old.jsonl"
+    old_path.write_text(_codex_lines(session_id="native_cutover"), encoding="utf-8")
+    parser = CodexParser(roots=(root,))
+    orig_capture = parser.parse(old_path)
+    assert orig_capture is not None
+
+    # Move across devices: new path, new inode, original departed.
+    new_path = root / "new.jsonl"
+    new_path.write_text(old_path.read_text(encoding="utf-8"), encoding="utf-8")
+    old_path.unlink()
+    moved_capture = parser.parse(new_path)
+    assert moved_capture is not None
+
+    with duckdb.connect(str(tmp_path / "move_cutover.duckdb")) as conn:
+        conn.execute("SET TimeZone = 'America/Chicago'")
+        ensure_schema(conn)
+        # Seed legacy schema-42 row with local-naive Chicago started_at (13:00 for 18:00Z).
+        for sid, native_id in (("sess_with_native", "native_cutover"), ("sess_no_native", None)):
+            conn.execute("DELETE FROM source_files")
+            conn.execute("DELETE FROM session_state")
+            conn.execute("DELETE FROM sessions")
+            conn.execute(
+                "INSERT INTO sessions(id, source, source_path, source_session_id) "
+                "VALUES (?, 'codex', ?, ?)",
+                [sid, str(old_path), native_id],
+            )
+            conn.execute(
+                "INSERT INTO session_state(session_id, started_at, file_mtime, file_size, host) "
+                "VALUES (?, TIMESTAMP '2026-07-15 13:00:00', 1.0, 100, 'h1')",
+                [sid],
+            )
+            conn.execute(
+                """INSERT INTO source_files(
+                    source_key, source, source_path, root_path, session_id,
+                    dev, inode, ctime_ns, mtime_ns, size,
+                    committed_offset, committed_prefix_sha256, observed_at
+                ) VALUES (?, 'codex', ?, ?, ?, 0, 0, 1, 1, ?, ?, ?, 1.0)""",
+                [
+                    source_key("codex", str(old_path)),
+                    str(old_path),
+                    str(root),
+                    sid,
+                    orig_capture.next_byte_offset,
+                    orig_capture.next_byte_offset,
+                    orig_capture.committed_prefix_sha256,
+                ],
+            )
+            assert find_moved_predecessors(conn, moved_capture, host="h1") == (sid,)
