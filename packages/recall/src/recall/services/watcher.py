@@ -744,7 +744,9 @@ class _SessionPathMatcher:
 
 
 def _datetime_from_wall(wall_now: float) -> datetime:
-    return datetime.fromtimestamp(wall_now)
+    from datetime import UTC
+
+    return datetime.fromtimestamp(wall_now, tz=UTC)
 
 
 def _live_member_paths_by_subscription(live_set: LiveSessionSet) -> dict[str, set[str]]:

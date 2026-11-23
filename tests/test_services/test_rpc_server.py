@@ -642,7 +642,7 @@ class TestSerialization:
         from recall.services.rpc_server import _serialize
 
         dt = datetime(2024, 1, 15, 10, 30, 0)
-        assert _serialize(dt) == "2024-01-15T10:30:00"
+        assert _serialize(dt) == "2024-01-15T10:30:00Z"
 
     def test_serialize_handles_enum(self) -> None:
         from recall.core.types import Source

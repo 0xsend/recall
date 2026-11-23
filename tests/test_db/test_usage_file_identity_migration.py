@@ -37,6 +37,7 @@ def _legacy(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConne
 def test_usage_file_identity_migration_preserves_rows_and_reopens(tmp_path: Path) -> None:
     path = tmp_path / "legacy.duckdb"
     with _legacy(path) as conn:
+        conn.execute("SET TimeZone = 'UTC'")
         cursors = conn.execute("SELECT * FROM usage_log_cursors").fetchall()
         events = conn.execute("SELECT * FROM usage_events").fetchall()
         sessions = conn.execute("SELECT * FROM sessions").fetchall()

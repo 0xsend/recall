@@ -104,11 +104,12 @@ def test_sidecar_edit_reindexes_an_otherwise_unchanged_session(tmp_path, monkeyp
 
     # Compare against the parser's own conversion rather than a literal: the
     # stored value is localized, so a hard-coded UTC date is timezone-dependent.
+    from recall.core.time import to_naive_utc
     from recall.parsers.common import parse_timestamp
 
     parsed = parse_timestamp("2026-07-04T01:02:03.000000Z")
     assert parsed is not None
-    expected = parsed.astimezone().replace(tzinfo=None)
+    expected = to_naive_utc(parsed)
 
     refreshed = _started_at(tmp_path)
     assert refreshed is not None

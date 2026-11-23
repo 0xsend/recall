@@ -273,7 +273,7 @@ def test_large_tool_batches_preserve_fields_fact_ownership_and_atomic_rollback()
         assert conn.execute(
             "SELECT result_summary, is_error, completed_at FROM tool_results "
             "WHERE tool_call_id='t0'"
-        ).fetchone() == ("first λ", False, datetime(2026, 2, 3, 10, 10))
+        ).fetchone() == ("first λ", False, datetime(2026, 2, 3, 9, 10))
         assert conn.execute(
             "SELECT reason, ends_turn FROM session_stop_markers WHERE message_idx=0"
         ).fetchone() == ("latest", False)
@@ -290,7 +290,7 @@ def test_large_tool_batches_preserve_fields_fact_ownership_and_atomic_rollback()
             "WHERE tool_call_id IN ('t0', 'naive', 'undated') ORDER BY tool_call_id"
         ).fetchall() == [
             ("naive", datetime(2026, 2, 3, 9, 10)),
-            ("first λ", datetime(2026, 2, 3, 10, 10)),
+            ("first λ", datetime(2026, 2, 3, 9, 10)),
             ("undated", None),
         ]
         # A duplicate at the end of a multi-batch insert aborts the enclosing

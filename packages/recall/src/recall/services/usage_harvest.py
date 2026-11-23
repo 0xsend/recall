@@ -14,12 +14,13 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
+from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import Source
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
@@ -260,9 +261,7 @@ def _apply_grok_usage_batch(
             byte_offset=batch.start.byte_offset,
             log_size_bytes=batch.end.file_size,
         )
-    events_upserted = _insert_new_events(
-        conn, batch.events, host=host, harvested_at=datetime.now(UTC)
-    )
+    events_upserted = _insert_new_events(conn, batch.events, host=host, harvested_at=utcnow_naive())
     if batch.end != batch.start:
         _save_cursor(conn, batch.path, batch.end)
     # Every call rolls up every sid, not only this batch's, so a session row
@@ -415,7 +414,7 @@ def _load_cursor(conn: duckdb.DuckDBPyConnection, path: str) -> LogCursor:
 
 
 def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) -> None:
-    now = datetime.now(UTC)
+    now = utcnow_naive()
     device = cursor.file_identity.device if cursor.file_identity is not None else None
     inode = cursor.file_identity.inode if cursor.file_identity is not None else None
     existing = conn.execute(
@@ -510,9 +509,6 @@ def _insert_new_events(
 
     if not events:
         return 0
-    # An aware timestamp is cast to TIMESTAMP in the session time zone, the
-    # same conversion a bound aware datetime receives; naive ones pass through.
-    aware = [event.ts is not None and event.ts.utcoffset() is not None for event in events]
     table = pa.table(
         {
             "id": pa.array([event.id for event in events], type=pa.string()),
@@ -520,18 +516,8 @@ def _insert_new_events(
                 [event.source_session_id for event in events], type=pa.string()
             ),
             "ts": pa.array(
-                [
-                    None if is_aware else event.ts
-                    for event, is_aware in zip(events, aware, strict=True)
-                ],
+                [to_naive_utc(event.ts) if event.ts is not None else None for event in events],
                 type=pa.timestamp("us"),
-            ),
-            "ts_utc": pa.array(
-                [
-                    event.ts if is_aware else None
-                    for event, is_aware in zip(events, aware, strict=True)
-                ],
-                type=pa.timestamp("us", tz="UTC"),
             ),
             "prompt_tokens": pa.array([event.prompt_tokens for event in events], type=pa.int64()),
             "cached_prompt_tokens": pa.array(
@@ -556,13 +542,13 @@ def _insert_new_events(
                 host, harvested_at
             )
             SELECT id, ?, source_session_id, NULL,
-                   COALESCE(CAST(ts_utc AS TIMESTAMP), ts),
+                   ts,
                    prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens,
                    ?, ?
             FROM _recall_usage_event_inserts
             ON CONFLICT DO NOTHING
             """,
-            [_GROK_SOURCE, host, harvested_at],
+            [_GROK_SOURCE, host, to_naive_utc(harvested_at)],
         )
     finally:
         conn.unregister("_recall_usage_event_inserts")

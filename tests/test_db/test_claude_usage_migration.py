@@ -56,7 +56,7 @@ def test_migration_0042_upgrades_schema_41_preserving_historical_totals_and_repl
     _schema_41_db(path)
     with duckdb.connect(str(path)) as conn:
         ensure_schema(conn)
-        assert get_schema_version(conn) == SCHEMA_VERSION == 42
+        assert get_schema_version(conn) == SCHEMA_VERSION == 43
         assert conn.execute(
             "SELECT migration_id FROM schema_migrations WHERE migration_id = ?",
             ["0042_claude_response_usage"],
@@ -248,8 +248,8 @@ def test_rollback_migration_accepts_schema_42_and_refuses_schema_41_backup(tmp_p
         rollback_migration(config, preserve=tmp_path / "failed-41")
     assert config.db_path.read_bytes() == before
 
-    # Restoring the backup to schema 42 succeeds cleanly.
+    # Restoring the backup to current SCHEMA_VERSION succeeds cleanly.
     with duckdb.connect(str(Path(job.backup_path) / "recall.duckdb")) as backup:
-        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (42)")
+        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (?)", [SCHEMA_VERSION])
     rollback_migration(config, preserve=tmp_path / "failed-42")
     assert (config.data_dir / "daemon-refused").exists()

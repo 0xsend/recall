@@ -422,6 +422,9 @@ def _store_cached_embeddings(
 ) -> None:
     if not entries:
         return
+    from recall.core.time import utcnow_naive
+
+    created_at = utcnow_naive()
     rows = [
         (
             entry.cache_key,
@@ -431,6 +434,7 @@ def _store_cached_embeddings(
             embeddings_by_key[entry.cache_key],
             NORMALIZATION_VERSION,
             entry.context_version,
+            created_at,
         )
         for entry in entries
     ]
@@ -438,8 +442,8 @@ def _store_cached_embeddings(
         """
         INSERT OR IGNORE INTO embedding_cache (
             cache_key, kind, raw_text, normalized_text, embedding,
-            normalization_version, context_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            normalization_version, context_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )

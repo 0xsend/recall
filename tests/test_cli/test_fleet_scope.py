@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from recall.cli.app import app
+from recall.cli.utils import format_datetime as _format_local_dt
 from recall.core.rpc_client import RpcConnectionError
 from recall.core.types import Source
 from recall.services.fleet_transport import FleetRemoteResult
@@ -597,19 +598,22 @@ def test_stats_skills_default_unavailable_never_starts_or_snapshots(
     assert json.loads(ordinary.stdout)["rows"] == payload("skills", "caller-item")["rows"]
 
 
+_FIXTURE_LOCAL_TS = _format_local_dt("2026-11-10T12:00:00Z")
+
 TEXT_ROWS = {
-    "list": "[2026-11-10 12:00] {label} (codex) unknown messages=0 tools=0",
+    "list": f"[{_FIXTURE_LOCAL_TS}] {{label}} (codex) unknown messages=0 tools=0",
     "search": "[{score:.2f}] {label} (codex)",
-    "show": "[2026-11-10 12:00] Session {label} (codex)",
-    "live": "[2026-11-10 12:00] active {label} (codex) None turn=unknown lag=?",
+    "show": f"[{_FIXTURE_LOCAL_TS}] Session {{label}} (codex)",
+    "live": f"[{_FIXTURE_LOCAL_TS}] active {{label}} (codex) None turn=unknown lag=?",
 }
 ORDINARY_TEXT = {
-    "list": "[2026-11-10 12:00] caller-item (codex) unknown messages=0 tools=0\n",
+    "list": f"[{_FIXTURE_LOCAL_TS}] caller-item (codex) unknown messages=0 tools=0\n",
     "search": "[2.00] caller-item (codex)\n  [tool]\n\n",
     "show": (
-        "[2026-11-10 12:00] Session caller-item (codex)\nDuration: 0s | Messages: 0 | Tools: 0\n\n"
+        f"[{_FIXTURE_LOCAL_TS}] Session caller-item (codex)\n"
+        "Duration: 0s | Messages: 0 | Tools: 0\n\n"
     ),
-    "live": "[2026-11-10 12:00] active caller-item (codex) None turn=unknown lag=?\n",
+    "live": f"[{_FIXTURE_LOCAL_TS}] active caller-item (codex) None turn=unknown lag=?\n",
 }
 
 

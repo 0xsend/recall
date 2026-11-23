@@ -1246,7 +1246,7 @@ def _commit_raw_content(
     turn = OwnedKeywordTurn.for_config(lease, config)
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
-        mark_captured_complete,
+        mark_captured_complete_in_tx,
         maybe_complete_migration,
         migration_status,
         require_original_backup,
@@ -1257,10 +1257,6 @@ def _commit_raw_content(
     catalog = SourceCatalog(conn, clock=time.time)
     committed = 0
     searchable_changed = False
-
-    def settle_captured(source: str, source_path: str) -> None:
-        if migration_status(conn).phase == "running":
-            mark_captured_complete(conn, catalog_key(source, source_path))
 
     for capture in prepared:
         if is_paused(config):
@@ -1377,6 +1373,10 @@ def _commit_raw_content(
                         catalog.defer_until_changed(
                             source.source, source.source_path, "incomplete capture", details
                         )
+                if result.reached_end and migration_status(conn).phase == "running":
+                    mark_captured_complete_in_tx(
+                        conn, catalog_key(source.source, source.source_path)
+                    )
 
             result = index_single_session_on(
                 lease,
@@ -1392,8 +1392,6 @@ def _commit_raw_content(
             )
             committed += int(result.changed)
             searchable_changed = searchable_changed or result.searchable_changed
-            if capture.result.reached_end:
-                settle_captured(item.source, item.source_path)
         except Exception as err:
             if lease.observe(err, "source_commit"):
                 raise

@@ -45,6 +45,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
             ("0036_usage_file_identity",),
             ("0041_daemon_index_repair",),
             ("0042_claude_response_usage",),
+            ("0043_utc_timestamps",),
         ]
     with _native.duckdb_connect(str(path)) as reopened:
         reopened.execute("INSERT INTO sessions VALUES ('other', 'codex', '/shared', 'native')")

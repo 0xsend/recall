@@ -133,7 +133,9 @@ def serialize_rpc_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, datetime):
-        return value.isoformat()
+        from recall.core.time import format_utc_iso
+
+        return format_utc_iso(value)
     if isinstance(value, Enum):
         return value.value
     try:

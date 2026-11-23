@@ -1523,7 +1523,7 @@ def fts_rebuild_backoff_status(
 def _datetime_from_timestamp(value: float | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(value)
+    return datetime.fromtimestamp(value, tz=UTC)
 
 
 def _package_version() -> str | None:

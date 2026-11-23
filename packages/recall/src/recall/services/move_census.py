@@ -103,9 +103,11 @@ def census_moved_duplicates(
 
 
 def _describe_row(row: _Row) -> dict[str, Any]:
+    from recall.core.time import format_utc_iso
+
     return {
         **asdict(row),
-        "started_at": row.started_at.isoformat() if row.started_at is not None else None,
+        "started_at": format_utc_iso(row.started_at) if row.started_at is not None else None,
         "departed": _has_departed(row.source_path),
     }
 
@@ -135,9 +137,13 @@ def _describe_group(rows: list[_Row]) -> dict[str, Any]:
                 classes.add("multiple_proven_survivors")
             else:
                 classes.update(reason for proof in proofs for reason in proof)
+    from recall.core.time import format_utc_iso
+
     return {
         "source": rows[0].source,
-        "started_at": rows[0].started_at.isoformat() if rows[0].started_at is not None else None,
+        "started_at": (
+            format_utc_iso(rows[0].started_at) if rows[0].started_at is not None else None
+        ),
         "classes": sorted(classes),
         "rows": [_describe_row(row) for row in rows],
     }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from recall.core.host_text import HostValue
@@ -17,6 +17,7 @@ from recall.core.rpc_params import (
     ShowParams,
 )
 from recall.core.search_filters import has_filtered_search_params
+from recall.core.time import format_utc_iso, to_utc
 from recall.core.types import Role, is_attributed_host
 from recall.services.fleet_endpoints import (
     EndpointFailure,
@@ -55,19 +56,122 @@ def stamp_host(row: dict[str, Any], inventory_name: str) -> dict[str, Any]:
     return {**row, "host": inventory_name}
 
 
+def _parse_fleet_timestamp(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return to_utc(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            return to_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_timestamp_value(value: Any) -> Any:
+    parsed = _parse_fleet_timestamp(value)
+    return format_utc_iso(parsed) if parsed is not None else value
+
+
+_TOP_LEVEL_TIMESTAMP_KEYS = (
+    "started_at",
+    "ended_at",
+    "indexed_at",
+    "last_activity_at",
+    "timestamp",
+)
+
+
+def _normalize_fleet_timestamps(row: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize typed timestamp fields to RFC3339 UTC (`...Z`) at the fleet reader boundary."""
+    updated: dict[str, Any] | None = None
+    for key in _TOP_LEVEL_TIMESTAMP_KEYS:
+        if key in row and row[key] is not None:
+            normalized = _normalize_timestamp_value(row[key])
+            if normalized != row[key]:
+                if updated is None:
+                    updated = dict(row)
+                updated[key] = normalized
+
+    turn = row.get("turn")
+    if isinstance(turn, dict):
+        turn_updated: dict[str, Any] | None = None
+        for key in ("last_user_at", "last_assistant_at"):
+            if key in turn and turn[key] is not None:
+                normalized = _normalize_timestamp_value(turn[key])
+                if normalized != turn[key]:
+                    if turn_updated is None:
+                        turn_updated = dict(turn)
+                    turn_updated[key] = normalized
+        running_tool = turn.get("running_tool")
+        if isinstance(running_tool, dict) and running_tool.get("started_at") is not None:
+            normalized = _normalize_timestamp_value(running_tool["started_at"])
+            if normalized != running_tool["started_at"]:
+                if turn_updated is None:
+                    turn_updated = dict(turn)
+                turn_updated["running_tool"] = {**running_tool, "started_at": normalized}
+        if turn_updated is not None:
+            if updated is None:
+                updated = dict(row)
+            updated["turn"] = turn_updated
+
+    messages = row.get("messages")
+    if isinstance(messages, list):
+        messages_changed = False
+        normalized_messages: list[Any] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                normalized_messages.append(msg)
+                continue
+            msg_updated: dict[str, Any] | None = None
+            if msg.get("timestamp") is not None:
+                normalized = _normalize_timestamp_value(msg["timestamp"])
+                if normalized != msg["timestamp"]:
+                    msg_updated = dict(msg)
+                    msg_updated["timestamp"] = normalized
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                tc_changed = False
+                normalized_tcs: list[Any] = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        normalized_tcs.append(tc)
+                        continue
+                    tc_updated: dict[str, Any] | None = None
+                    for key in ("completed_at", "result_completed_at"):
+                        if tc.get(key) is not None:
+                            normalized = _normalize_timestamp_value(tc[key])
+                            if normalized != tc[key]:
+                                if tc_updated is None:
+                                    tc_updated = dict(tc)
+                                tc_updated[key] = normalized
+                    if tc_updated is not None:
+                        tc_changed = True
+                        normalized_tcs.append(tc_updated)
+                    else:
+                        normalized_tcs.append(tc)
+                if tc_changed:
+                    if msg_updated is None:
+                        msg_updated = dict(msg)
+                    msg_updated["tool_calls"] = normalized_tcs
+            if msg_updated is not None:
+                messages_changed = True
+                normalized_messages.append(msg_updated)
+            else:
+                normalized_messages.append(msg)
+        if messages_changed:
+            if updated is None:
+                updated = dict(row)
+            updated["messages"] = normalized_messages
+
+    return updated if updated is not None else row
+
+
 def _recency_key(row: dict[str, Any]) -> datetime:
     for key in ("ended_at", "started_at", "indexed_at"):
-        raw = row.get(key)
-        if not raw:
-            continue
-        if isinstance(raw, datetime):
-            return raw
-        if isinstance(raw, str):
-            try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-    return datetime.min
+        parsed = _parse_fleet_timestamp(row.get(key))
+        if parsed is not None:
+            return parsed
+    return datetime.min.replace(tzinfo=UTC)
 
 
 def merge_list_rows(
@@ -92,24 +196,15 @@ _LIVENESS_LAST = len(_LIVENESS_ORDER)
 def _live_sort_key(row: dict[str, Any]) -> tuple[int, float]:
     """Rank by liveness, then most recent activity first.
 
-    Activity is compared as seconds since the epoch rather than as a
-    `datetime`: rows arrive from several hosts and one may stamp an aware value
-    while another stamps a naive one, which raises on comparison. A row with no
-    stamp at all -- a transcript the daemon promoted but has not indexed yet --
-    is still live, so it sorts last within its rank instead of being dropped.
+    Activity is compared as seconds since the epoch in UTC rather than as a
+    mixed naive/aware `datetime`: rows arrive from peers across versions and
+    timezones. A row with no stamp at all -- a transcript the daemon promoted
+    but has not indexed yet -- is still live, so it sorts last within its rank
+    instead of being dropped.
     """
     liveness = str(row.get("liveness") or "unknown")
     rank = _LIVENESS_ORDER.get(liveness, _LIVENESS_LAST)
-    raw = row.get("last_activity_at")
-    if isinstance(raw, datetime):
-        activity: datetime | None = raw
-    elif isinstance(raw, str):
-        try:
-            activity = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            activity = None
-    else:
-        activity = None
+    activity = _parse_fleet_timestamp(row.get("last_activity_at"))
     return rank, float("inf") if activity is None else -activity.timestamp()
 
 
@@ -155,8 +250,9 @@ def decode_array(value: Any) -> list[dict[str, Any]]:
 def decode_object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object, got {type(value).__name__}")
-    host = value.get("host")
-    return {**value, "host": HostValue(host)} if isinstance(host, str) else value
+    normalized = _normalize_fleet_timestamps(value)
+    host = normalized.get("host")
+    return {**normalized, "host": HostValue(host)} if isinstance(host, str) else normalized
 
 
 def _arrays(

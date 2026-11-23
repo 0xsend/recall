@@ -677,8 +677,7 @@ def test_harvest_failure_leaves_events_and_cursor_unchanged(
 
 
 def test_harvest_stores_timestamps_as_bound_datetimes_are_stored(tmp_path: Path) -> None:
-    """Offset timestamps are stored in the session time zone and offset-less
-    ones as written, matching what a bound datetime parameter stores."""
+    """Both offset-aware and offset-less ISO timestamps store as naive UTC."""
     from datetime import datetime
 
     conn = _connect(tmp_path)
@@ -693,14 +692,8 @@ def test_harvest_stores_timestamps_as_bound_datetimes_are_stored(tmp_path: Path)
         harvest_grok_unified_log(conn, log)
 
         stored = dict(conn.execute("SELECT source_session_id, ts FROM usage_events").fetchall())
-        bound = conn.execute(
-            "SELECT ?::TIMESTAMP, ?::TIMESTAMP",
-            [
-                datetime.fromisoformat("2026-07-22T03:21:43.681+00:00"),
-                datetime.fromisoformat("2026-07-22T03:21:43.681"),
-            ],
-        ).fetchone()
-        assert (stored["a"], stored["b"]) == bound
+        expected = datetime(2026, 7, 22, 3, 21, 43, 681000)
+        assert (stored["a"], stored["b"]) == (expected, expected)
     finally:
         conn.close()
 

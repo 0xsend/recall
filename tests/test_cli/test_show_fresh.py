@@ -153,13 +153,16 @@ def test_text_show_names_unreadable_transcript(
 def test_text_show_readable_transcript_keeps_output(
     monkeypatch: pytest.MonkeyPatch, fresh: bool
 ) -> None:
+    from recall.cli.utils import format_datetime
+
     monkeypatch.setattr(show_cli, "cta_for_show", lambda _session, **_kwargs: [])
     _install_rpc(monkeypatch, _session(current=True))
     result = CliRunner().invoke(
         app, ["show", "abc123", "--format", "text", *(["--fresh"] if fresh else [])]
     )
     assert result.exit_code == 0, result.output
+    expected_ts = format_datetime("2026-09-08T12:00:00Z")
     assert result.stdout == (
-        "[2026-09-08 12:00] Session abc123 (claude_code)\nDuration: 0s | Messages: 4 | Tools: 1\n\n"
+        f"[{expected_ts}] Session abc123 (claude_code)\nDuration: 0s | Messages: 4 | Tools: 1\n\n"
     )
     assert result.stderr == ""

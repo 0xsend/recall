@@ -634,4 +634,4 @@ class TestCheckIndexesRpc:
         assert status["index_divergence"] is not None
         assert status["index_divergence"]["diverged_count"] == 1
         assert status["index_divergence"]["diverged"][0]["key"] == "/Users/dev/code/app"
-        assert status["index_divergence"]["checked_at"] == "2026-08-30T12:00:00"
+        assert status["index_divergence"]["checked_at"] == "2026-08-30T12:00:00Z"

@@ -67,12 +67,11 @@ def _upgrade(lease: DbLease) -> bool | AlreadyAudited:
             transaction.call(
                 "claude_usage:version", lambda conn: set_schema_version_to(conn, TARGET_VERSION)
             )
+        from recall.db.migrations import record_migration_audit
+
         transaction.call(
             "claude_usage:audit",
-            lambda conn: conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
-                [MIGRATION_ID],
-            ).fetchone(),
+            lambda conn: record_migration_audit(conn, MIGRATION_ID),
         )
     return AlreadyAudited(MIGRATION_ID, TARGET_VERSION)
 

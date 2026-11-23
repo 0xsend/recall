@@ -11,14 +11,15 @@ from recall.core.schema_version import (
     RecoveryStateUnavailableError,
     SchemaTooNewError,
 )
+from recall.core.time import utcnow_naive
 from recall.db.lease import DbLease, StandaloneLifetime, TransactionCapability
 
 from .migrations import run_pending_migrations_on
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 42
-INDEX_MIGRATION_VERSION = 1
+SCHEMA_VERSION = 43
+INDEX_MIGRATION_VERSION = 2
 
 
 class SchemaChange(Enum):
@@ -155,7 +156,7 @@ def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -
             embedding FLOAT[{embed_dim}] NOT NULL,
             normalization_version INTEGER NOT NULL DEFAULT 1,
             context_version INTEGER NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
         )
         """
     )
@@ -217,7 +218,22 @@ def _set_schema_version(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _set_schema_version_to(conn: duckdb.DuckDBPyConnection, version: int) -> None:
-    conn.execute("INSERT INTO schema_version (version) VALUES (?)", [version])
+    has_applied_at = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = 'main'
+          AND table_name = 'schema_version'
+          AND column_name = 'applied_at'
+        """
+    ).fetchone()
+    if has_applied_at and has_applied_at[0]:
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            [version, utcnow_naive()],
+        )
+    else:
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", [version])
 
 
 def _get_schema_version(conn: duckdb.DuckDBPyConnection) -> int:

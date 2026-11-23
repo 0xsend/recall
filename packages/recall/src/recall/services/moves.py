@@ -24,6 +24,7 @@ from recall.core.fts_text import sql_derive_fts, sql_is_non_blank
 from recall.core.ids import message_id, tool_call_id
 from recall.core.models import ParseResult
 from recall.core.source_io import open_source
+from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
@@ -87,7 +88,7 @@ def find_moved_predecessors(
     source = session.source.value
     source_path = session.source_path
     source_session_id = session.source_session_id
-    started_at = session.started_at
+    started_at = to_naive_utc(session.started_at) if session.started_at is not None else None
     indexed_bytes = capture.next_byte_offset
     if capture.committed_prefix_sha256 is None:
         return ()
@@ -289,7 +290,7 @@ def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
     groups: dict[tuple[str, str], list[_Row]] = defaultdict(list)
     for row in rows:
         if row.started_at is not None:
-            groups[(row.source, "time:" + row.started_at.isoformat())].append(row)
+            groups[(row.source, "time:" + to_naive_utc(row.started_at).isoformat())].append(row)
         elif row.source_session_id:
             groups[(row.source, "native:" + row.source_session_id)].append(row)
     return groups
@@ -588,7 +589,14 @@ def _rows_started_at(
         _ROW_SELECT
         + " AND s.source = ? AND (ss.started_at IN (SELECT CAST(UNNEST(?) AS TIMESTAMP))"
         " OR (ss.started_at IS NULL AND s.source_session_id IN (SELECT UNNEST(?))))",
-        [host is None, host, UNATTRIBUTED_HOST, source, started_ats, native_ids or []],
+        [
+            host is None,
+            host,
+            UNATTRIBUTED_HOST,
+            source,
+            [to_naive_utc(stamp) for stamp in started_ats],
+            native_ids or [],
+        ],
     ).fetchall()
     return [_row(values) for values in rows]
 
@@ -748,11 +756,12 @@ def supersede_moved_duplicate(
             "AND source = (SELECT source FROM sessions WHERE id = ?)",
             [plan.predecessor_id, plan.successor_path, plan.predecessor_id],
         )
+        queued_at = utcnow_naive()
         for kind, table in (("message", "messages"), ("tool_call", "tool_calls")):
             conn.execute(
-                f"INSERT INTO fts_sidecar_pending(kind, id, op)"
-                f" SELECT '{kind}', id, 'upsert' FROM {table} WHERE session_id = ?",
-                [plan.predecessor_id],
+                f"INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)"
+                f" SELECT '{kind}', id, 'upsert', ? FROM {table} WHERE session_id = ?",
+                [queued_at, plan.predecessor_id],
             )
         conn.execute("COMMIT")
     except Exception:
@@ -908,7 +917,8 @@ def _carry_stored_contexts(
         """
     )
     conn.execute(
-        "INSERT INTO fts_sidecar_pending(kind, id, op)"
-        " SELECT DISTINCT 'message', successor_message, 'upsert' FROM carried_contexts"
+        "INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)"
+        " SELECT DISTINCT 'message', successor_message, 'upsert', ? FROM carried_contexts",
+        [utcnow_naive()],
     )
     conn.execute("DROP TABLE carried_contexts")

@@ -43,11 +43,11 @@ def _upgrade(lease: DbLease) -> bool:
                 "0036_usage_file_identity:_upgrade",
                 lambda conn: set_schema_version_to(conn, TARGET_VERSION),
             )
+        from recall.db.migrations import record_migration_audit
+
         lease.call(
             "0036_usage_file_identity:_upgrade",
-            lambda conn: conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
-            ).fetchone(),
+            lambda conn: record_migration_audit(conn, MIGRATION_ID),
         )
     return True
 
