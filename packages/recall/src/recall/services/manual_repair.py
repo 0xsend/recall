@@ -1020,11 +1020,14 @@ class ManualRepair(RepairProtocol):
                 transaction.call(
                     "manual:certificate", lambda conn: save_repair_row(conn, completed)
                 )
-                if self.last_probe is not None and self.last_probe.coverage_verified:
-                    transaction.call(
-                        "manual:negative_verification",
-                        lambda conn: set_needs_index_verification(conn, False),
-                    )
+                # Manual rebuild recreated and verified every saved ART target
+                # against the oracle, satisfying any prior disk-full verification
+                # obligation even when compound or low-cardinality indexes leave
+                # probe samples unverifiable.
+                transaction.call(
+                    "manual:negative_verification",
+                    lambda conn: set_needs_index_verification(conn, False),
+                )
                 self._barrier("before_manual_completion_commit")
                 self._matching_attempt(lease, capability.arm, Event.MANUAL_RELEASE)
             self._barrier("after_manual_completion_commit")

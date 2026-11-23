@@ -85,8 +85,11 @@ def test_cursors_the_daemon_did_not_issue_are_rejected(lane: Lane) -> None:
     assert first == [str(lane.watched)]
     assert cursor is not None
     mangled = {
-        "visible form, separator lost": cursor.replace("\x1f", ""),
+        "visible form, separator lost": "claude_code" + str(lane.watched),
         "garbage": "garbage",
+        "bad v2 charset": "v2:not!valid!base64",
+        "v2 with padding": cursor + "=",
+        "non-canonical v2 trailing bits": cursor[:-1] + ("B" if cursor[-1] != "B" else "C"),
         "unknown source": "zzzz_unknown_source",
         "unknown source with a path": "zzzz\x1f/elsewhere/a.jsonl",
         "empty": "",
@@ -94,7 +97,9 @@ def test_cursors_the_daemon_did_not_issue_are_rejected(lane: Lane) -> None:
         "source with no path": "codex\x1f",
         "truncated": cursor[: len(cursor) // 2],
         "last character dropped": cursor[:-1],
-        "one-character typo in the path": cursor.replace("live.jsonl", "livf.jsonl"),
+        "one-character typo in the path": (
+            f"claude_code\x1f{str(lane.watched).replace('live.jsonl', 'livf.jsonl')}"
+        ),
         "forged path in a known source": "codex\x1f/nonexistent/path.jsonl",
         "forged path sorting after a source": "claude_code\x1f~",
     }
@@ -110,8 +115,12 @@ def test_a_valid_cursor_pages_the_whole_catalog_once(lane: Lane) -> None:
 
 def test_a_cursor_whose_row_left_the_catalog_is_rejected(lane: Lane) -> None:
     """Catalog rows are only removed by resetting the index, which ends any walk."""
+    from recall.core.types import Source
+    from recall.db.source_files import CatalogCursor
+
     _, cursor = _page("--limit", "3")
-    assert cursor == "codex\x1f/elsewhere/codex/a.jsonl"
+    assert cursor == CatalogCursor(Source.CODEX, "/elsewhere/codex/a.jsonl").token
+    assert cursor.startswith("v2:") and "\x1f" not in cursor
     lane.server._database.call(
         "fixture",
         lambda conn: conn.execute(

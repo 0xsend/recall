@@ -1297,9 +1297,11 @@ def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: R
     assert all(row["scan_current_process"] is False for row in before_walk["coverage"])
     assert all(row["scan_current_process"] is True for row in after_walk["coverage"])
     assert not any(before_walk[flag] for flag in flags), before_walk
-    # The walk found the append, so the catalog now says so itself.
+    # The walk found the append, so raw indexing is pending while the healthy
+    # keyword sidecar (0 pending intents) stays ready.
     assert after_walk["pending"] == 1
-    assert not any(after_walk[flag] for flag in flags), after_walk
+    assert after_walk["raw_indexing_ready"] is False
+    assert after_walk["keyword_search_ready"] is True
 
 
 @pytest.mark.parametrize("queue_name", ["queue", "discovered"])
@@ -1797,7 +1799,8 @@ def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
             status = (await server._handle_daemon_status({}, None))["reconciliation"]
             assert status["pending"] == 2
             assert status["raw_indexing_ready"] is False
-            assert status["keyword_search_ready"] is False
+            # Keyword sidecar has no pending intents or errors while raw files wait
+            assert status["keyword_search_ready"] is True
         finally:
             server._shutdown_event.set()
             server._raw_slots.release()

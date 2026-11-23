@@ -241,6 +241,11 @@ class DaemonSchedulerStatus:
     # cached by the daemon at startup and on each `recall.check_indexes` call
     # (REQ-RESIL-018). None when no daemon has probed yet.
     index_divergence: dict[str, Any] | None = None
+    # Non-null when this daemon's startup probe ran without finding divergence
+    # yet could not certify all indexes (e.g. unverifiable samples or budget
+    # expiry). Never updated by live `recall.check_indexes`; reset to None on
+    # any mid-run disk-full error so advisories reflect startup accurately.
+    index_verification_probe_reason: str | None = None
     # Message left by a refused start (`<data_dir>/daemon-refused`); while it
     # exists the scheduler will not relaunch the daemon, so the status the
     # operator can still run must say why (REQ-RESIL-024).
