@@ -24,7 +24,7 @@ from recall.core.fts_text import sql_derive_fts, sql_is_non_blank
 from recall.core.ids import message_id, tool_call_id
 from recall.core.models import ParseResult
 from recall.core.source_io import open_source
-from recall.core.time import to_naive_utc, utcnow_naive
+from recall.core.time import to_naive_utc, to_utc, utcnow_naive
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
@@ -89,6 +89,11 @@ def find_moved_predecessors(
     source_path = session.source_path
     source_session_id = session.source_session_id
     started_at = to_naive_utc(session.started_at) if session.started_at is not None else None
+    local_started_at = (
+        to_utc(session.started_at).astimezone().replace(tzinfo=None)
+        if session.started_at is not None
+        else None
+    )
     indexed_bytes = capture.next_byte_offset
     if capture.committed_prefix_sha256 is None:
         return ()
@@ -96,102 +101,89 @@ def find_moved_predecessors(
         signature = transcript_file(Path(source_path)).stat()
     except OSError:
         return ()
-
-    def _resolve_candidates(where_clause: str, query_params: list[object]) -> tuple[str, ...]:
-        candidates = _ROW_SELECT + where_clause + " AND s.source_path <> ?"
-        full_params = [*query_params, source_path]
-        limit = 2 * _PREDECESSORS_MAX + 1
-        values = conn.execute(candidates + " LIMIT ?", [*full_params, limit]).fetchall()
-        group = _MoveGroup.partition([_row(value) for value in values])
-        exact_boundary = len(values) > 2 * _PREDECESSORS_MAX or group.overflows(
-            pending_successor=True
-        )
-        if exact_boundary:
-            # Only an equal-boundary mismatch rules out both an exact predecessor
-            # and a committed holder of its full prefix. Unknown and unequal-length
-            # histories must remain in the complete, bounded comparison set.
-            values = conn.execute(
-                candidates + " AND (f.committed_offset IS NULL OR f.committed_offset <> ?"
-                " OR f.committed_prefix_sha256 IS NULL OR f.committed_prefix_sha256 = ?) LIMIT ?",
-                [*full_params, indexed_bytes, capture.committed_prefix_sha256, limit],
-            ).fetchall()
-            if len(values) > 2 * _PREDECESSORS_MAX:
-                return ()
-            group = _MoveGroup.partition([_row(value) for value in values])
-        # The pending insert is another survivor. A timestamp collision cannot
-        # authorize removing a predecessor that another committed copy also holds.
-        if not group.departed or group.overflows(pending_successor=True):
-            return ()
-        # Hash all eligible predecessor boundaries in one pass. The final digest
-        # binds every shorter prefix to the same captured bytes as the SQL filter.
-        offsets = tuple(
-            sorted(
-                {
-                    indexed_bytes,
-                    *(
-                        row.committed_offset
-                        for row in group.departed
-                        if row.committed_offset is not None
-                        and row.committed_offset <= indexed_bytes
-                    ),
-                }
-            )
-        )
-        digests = _prefix_digests(source_path, offsets)
-        if digests is None or digests[-1] != capture.committed_prefix_sha256:
-            return ()
-        prefixes = dict(zip(offsets, digests, strict=True))
-        proven = tuple(
-            row
-            for row in group.departed
-            if row.committed_offset is not None
-            and row.committed_offset <= indexed_bytes
-            and row.committed_prefix_sha256 is not None
-            and _has_departed(row.source_path)
-            and prefixes[row.committed_offset] == row.committed_prefix_sha256
-            and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
-        )
-        # Several departed byte-identical copies do not identify which one moved.
-        if len(proven) != 1:
-            return ()
-        predecessor = proven[0]
-        # Shorter departed prefixes still veto uniqueness, but the overflow
-        # fallback may only adopt an identity at the verified exact boundary.
-        if exact_boundary and predecessor.committed_offset != indexed_bytes:
-            return ()
-        return (predecessor.session_id,)
-
     # Native identity handles cross-device moves without timestamps; inode
     # identity also handles sources whose native id came from the filename.
-    # Both are candidate keys only: absence and committed bytes decide proof.
-    primary = _resolve_candidates(
-        " AND s.source = ? AND ("
+    # Matching both the exact UTC instant and its exact host-local wall clock
+    # keeps pre-v2 legacy rows (including both DST fall-back occurrences) in
+    # the same bounded uniqueness set without widening the time window.
+    # All keys are candidate filters only: absence and committed bytes decide proof.
+    candidates = (
+        _ROW_SELECT + " AND s.source = ? AND ("
         " (f.dev = ? AND f.inode = ?) OR (s.source_session_id = ?"
         " AND (ss.started_at IS NULL OR CAST(? AS TIMESTAMP) IS NULL))"
-        " OR ss.started_at = CAST(? AS TIMESTAMP))",
-        [
-            False,
-            host,
-            UNATTRIBUTED_HOST,
-            source,
-            signature.st_dev,
-            signature.st_ino,
-            source_session_id,
-            started_at,
-            started_at,
-        ],
+        " OR ss.started_at = CAST(? AS TIMESTAMP)"
+        " OR ss.started_at = CAST(? AS TIMESTAMP)) AND s.source_path <> ?"
     )
-    if primary or started_at is None:
-        return primary
-    # Before version-2 historical reparse runs on a non-UTC host, legacy
-    # schema-42 rows still hold host-local naive started_at. Narrowly match
-    # only rows whose host-local timestamp converts to the exact UTC instant,
-    # keeping the primary UTC candidate set completely unwidened.
-    return _resolve_candidates(
-        " AND s.source = ? AND ss.started_at IS NOT NULL"
-        " AND (ss.started_at::TIMESTAMPTZ AT TIME ZONE 'UTC') = CAST(? AS TIMESTAMP)",
-        [False, host, UNATTRIBUTED_HOST, source, started_at],
+    params: list[object] = [
+        False,
+        host,
+        UNATTRIBUTED_HOST,
+        source,
+        signature.st_dev,
+        signature.st_ino,
+        source_session_id,
+        started_at,
+        started_at,
+        local_started_at,
+        source_path,
+    ]
+    limit = 2 * _PREDECESSORS_MAX + 1
+    values = conn.execute(candidates + " LIMIT ?", [*params, limit]).fetchall()
+    group = _MoveGroup.partition([_row(value) for value in values])
+    exact_boundary = len(values) > 2 * _PREDECESSORS_MAX or group.overflows(pending_successor=True)
+    if exact_boundary:
+        # Only an equal-boundary mismatch rules out both an exact predecessor
+        # and a committed holder of its full prefix. Unknown and unequal-length
+        # histories must remain in the complete, bounded comparison set.
+        values = conn.execute(
+            candidates + " AND (f.committed_offset IS NULL OR f.committed_offset <> ?"
+            " OR f.committed_prefix_sha256 IS NULL OR f.committed_prefix_sha256 = ?) LIMIT ?",
+            [*params, indexed_bytes, capture.committed_prefix_sha256, limit],
+        ).fetchall()
+        if len(values) > 2 * _PREDECESSORS_MAX:
+            return ()
+        group = _MoveGroup.partition([_row(value) for value in values])
+    # The pending insert is another survivor. A timestamp collision cannot
+    # authorize removing a predecessor that another committed copy also holds.
+    if not group.departed or group.overflows(pending_successor=True):
+        return ()
+    # Hash all eligible predecessor boundaries in one pass. The final digest
+    # binds every shorter prefix to the same captured bytes as the SQL filter.
+    offsets = tuple(
+        sorted(
+            {
+                indexed_bytes,
+                *(
+                    row.committed_offset
+                    for row in group.departed
+                    if row.committed_offset is not None and row.committed_offset <= indexed_bytes
+                ),
+            }
+        )
     )
+    digests = _prefix_digests(source_path, offsets)
+    if digests is None or digests[-1] != capture.committed_prefix_sha256:
+        return ()
+    prefixes = dict(zip(offsets, digests, strict=True))
+    proven = tuple(
+        row
+        for row in group.departed
+        if row.committed_offset is not None
+        and row.committed_offset <= indexed_bytes
+        and row.committed_prefix_sha256 is not None
+        and _has_departed(row.source_path)
+        and prefixes[row.committed_offset] == row.committed_prefix_sha256
+        and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
+    )
+    # Several departed byte-identical copies do not identify which one moved.
+    if len(proven) != 1:
+        return ()
+    predecessor = proven[0]
+    # Shorter departed prefixes still veto uniqueness, but the overflow
+    # fallback may only adopt an identity at the verified exact boundary.
+    if exact_boundary and predecessor.committed_offset != indexed_bytes:
+        return ()
+    return (predecessor.session_id,)
 
 
 def _has_departed(source_path: str) -> bool:

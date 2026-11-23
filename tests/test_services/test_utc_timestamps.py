@@ -770,3 +770,106 @@ def test_cross_device_move_across_schema_42_to_43_transition_retains_session_id(
                     [source_key("codex", other_path), other_path, str(root), f"other_{idx}"],
                 )
             assert find_moved_predecessors(conn, moved_capture, host="h1") == ("true_pred",)
+
+        # Regression (REQ-INDEX-027): two departed qualifying copies for the same transcript —
+        # one holding legacy Chicago local started_at and one holding UTC started_at — must
+        # evaluate in a single uniqueness set and refuse ambiguous adoption.
+        conn.execute("DELETE FROM source_files")
+        conn.execute("DELETE FROM session_state")
+        conn.execute("DELETE FROM sessions")
+        for sid, p_name, stored_ts in (
+            ("pred_legacy", "old_legacy.jsonl", datetime(2026, 7, 15, 13, 0, 0)),
+            ("pred_utc", "old_utc.jsonl", datetime(2026, 7, 15, 18, 0, 0)),
+        ):
+            dep_path = str(root / p_name)
+            conn.execute(
+                "INSERT INTO sessions(id, source, source_path, source_session_id) "
+                "VALUES (?, 'codex', ?, 'native_cutover')",
+                [sid, dep_path],
+            )
+            conn.execute(
+                "INSERT INTO session_state(session_id, started_at, file_mtime, file_size, host) "
+                "VALUES (?, ?, 1.0, 100, 'h1')",
+                [sid, stored_ts],
+            )
+            conn.execute(
+                """INSERT INTO source_files(
+                    source_key, source, source_path, root_path, session_id,
+                    dev, inode, ctime_ns, mtime_ns, size,
+                    committed_offset, committed_prefix_sha256, observed_at
+                ) VALUES (?, 'codex', ?, ?, ?, 0, 0, 1, 1, ?, ?, ?, 1.0)""",
+                [
+                    source_key("codex", dep_path),
+                    dep_path,
+                    str(root),
+                    sid,
+                    orig_capture.next_byte_offset,
+                    orig_capture.next_byte_offset,
+                    orig_capture.committed_prefix_sha256,
+                ],
+            )
+        assert find_moved_predecessors(conn, moved_capture, host="h1") == ()
+
+        # Regression (DST fall-back hour): a departed legacy row stored at Chicago 01:30 on
+        # Nov 1, 2026 must still be uniquely adopted when moved during the FIRST fall-back
+        # occurrence (06:30Z) as well as the second (07:30Z).
+        for fallback_iso in ("2026-11-01T06:30:00Z", "2026-11-01T07:30:00Z"):
+            fb_old = root / f"fb_old_{fallback_iso[11:13]}.jsonl"
+            fb_new = root / f"fb_new_{fallback_iso[11:13]}.jsonl"
+            fb_lines = (
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "timestamp": fallback_iso,
+                                "payload": {"id": "fb_native", "cwd": "/tmp/proj"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "timestamp": fallback_iso,
+                                "payload": {"type": "user_message", "message": "fallback move"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+            fb_old.write_text(fb_lines, encoding="utf-8")
+            fb_orig = parser.parse(fb_old)
+            assert fb_orig is not None
+            fb_new.write_text(fb_lines, encoding="utf-8")
+            fb_old.unlink()
+            fb_moved = parser.parse(fb_new)
+            assert fb_moved is not None
+
+            conn.execute("DELETE FROM source_files")
+            conn.execute("DELETE FROM session_state")
+            conn.execute("DELETE FROM sessions")
+            conn.execute(
+                "INSERT INTO sessions(id, source, source_path, source_session_id) "
+                "VALUES ('pred_fb', 'codex', ?, 'fb_native')",
+                [str(fb_old)],
+            )
+            conn.execute(
+                "INSERT INTO session_state(session_id, started_at, file_mtime, file_size, host) "
+                "VALUES ('pred_fb', TIMESTAMP '2026-11-01 01:30:00', 1.0, 100, 'h1')"
+            )
+            conn.execute(
+                """INSERT INTO source_files(
+                    source_key, source, source_path, root_path, session_id,
+                    dev, inode, ctime_ns, mtime_ns, size,
+                    committed_offset, committed_prefix_sha256, observed_at
+                ) VALUES (?, 'codex', ?, ?, 'pred_fb', 0, 0, 1, 1, ?, ?, ?, 1.0)""",
+                [
+                    source_key("codex", str(fb_old)),
+                    str(fb_old),
+                    str(root),
+                    fb_orig.next_byte_offset,
+                    fb_orig.next_byte_offset,
+                    fb_orig.committed_prefix_sha256,
+                ],
+            )
+            assert find_moved_predecessors(conn, fb_moved, host="h1") == ("pred_fb",)
