@@ -15,7 +15,14 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
-from recall.core.models import Message, Session, TailFacts, ToolCall
+from recall.core.models import (
+    ClaudeUsageFull,
+    Message,
+    ParseResult,
+    Session,
+    TailFacts,
+    ToolCall,
+)
 from recall.core.poll_reads import poll_read_request
 from recall.core.snippets import SNIPPET_MAX_CHARS, build_search_snippet
 from recall.core.tool_format import (
@@ -243,7 +250,7 @@ def test_v2_to_v3_rescope_skips_messages_preserves_bash_and_indexes_non_bash(
                     sidecar_existed=True,
                 )
 
-            assert get_schema_version(conn) == SCHEMA_VERSION == 41
+            assert get_schema_version(conn) == SCHEMA_VERSION
             assert FTS_DERIVATION_VERSION == 3
             assert get_fts_fields_signature(sidecar) == fts_fields_signature(
                 ("content", "thinking", "bash")
@@ -451,12 +458,20 @@ def test_indexer_searchable_signature_and_pending_repair_for_non_bash_tools(tmp_
         messages=[msg1],
     )
 
+    capture = ParseResult(
+        session=session,
+        next_byte_offset=100,
+        is_full_parse=True,
+        committed_prefix_sha256="a" * 64,
+        claude_usage=ClaudeUsageFull(responses=()),
+    )
     with connect(config) as conn:
         _write_session(
             conn,
             session,
             turn=without_keyword_index(),
             tail_facts=TailFacts(),
+            capture=capture,
         )
         # Unchanged re-index must report NO searchable change (symmetric persisted/session sigs)
         snapshot = _load_session_write_snapshot(conn, session, host=None)
