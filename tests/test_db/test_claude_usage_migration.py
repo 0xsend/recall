@@ -106,7 +106,7 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
         tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
         assert "claude_usage_scopes" not in tables
 
-    for mode in ("table_absent", "column_missing", "column_wrong_type"):
+    for mode in ("table_absent", "column_missing", "column_wrong_type", "column_wrong_type_null"):
         damaged = tmp_path / f"v41_damaged_{mode}.duckdb"
         _schema_41_db(damaged)
         with duckdb.connect(str(damaged)) as conn:
@@ -114,7 +114,7 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
             if mode == "column_missing":
                 conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
                 conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
-            elif mode == "column_wrong_type":
+            elif mode in {"column_wrong_type", "column_wrong_type_null"}:
                 conn.execute(
                     "CREATE TABLE daemon_index_repair ("
                     "singleton BOOLEAN, attempt_no UBIGINT, phase VARCHAR, trigger_id UUID, "
@@ -124,9 +124,10 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
                     "success_since_failure BOOLEAN, acknowledged_events JSON, "
                     "release_certificate JSON)"
                 )
+                trigger_val = "NULL" if mode == "column_wrong_type_null" else "1"
                 conn.execute(
                     "INSERT INTO daemon_index_repair VALUES "
-                    "(TRUE, 0, 'idle', NULL, NULL, NULL, 1, NULL, NULL, NULL, "
+                    f"(TRUE, 0, 'idle', NULL, NULL, NULL, {trigger_val}, NULL, NULL, NULL, "
                     "TRUE, NULL, TRUE, '[]', NULL)"
                 )
             with StandaloneLifetime().lease(conn) as lease:
@@ -142,7 +143,15 @@ def test_migration_0042_refuses_pre_fence_and_damaged_schema_41(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
-    "damage", ["table_absent", "column_missing", "column_wrong_type", "row_absent", "row_invalid"]
+    "damage",
+    [
+        "table_absent",
+        "column_missing",
+        "column_wrong_type",
+        "column_wrong_type_null",
+        "row_absent",
+        "row_invalid",
+    ],
 )
 @pytest.mark.parametrize("lenient", [False, True])
 def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
@@ -157,7 +166,7 @@ def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
             conn.execute("DROP TABLE daemon_index_repair")
             conn.execute("CREATE TABLE daemon_index_repair (singleton BOOLEAN)")
             conn.execute("INSERT INTO daemon_index_repair VALUES (TRUE)")
-        elif damage == "column_wrong_type":
+        elif damage in {"column_wrong_type", "column_wrong_type_null"}:
             conn.execute("DROP TABLE daemon_index_repair")
             conn.execute(
                 "CREATE TABLE daemon_index_repair ("
@@ -168,9 +177,10 @@ def test_ensure_schema_refuses_damaged_schema_41_before_running_0042(
                 "success_since_failure BOOLEAN, acknowledged_events JSON, "
                 "release_certificate JSON)"
             )
+            trigger_val = "NULL" if damage == "column_wrong_type_null" else "1"
             conn.execute(
                 "INSERT INTO daemon_index_repair VALUES "
-                "(TRUE, 0, 'idle', NULL, NULL, NULL, 1, NULL, NULL, NULL, "
+                f"(TRUE, 0, 'idle', NULL, NULL, NULL, {trigger_val}, NULL, NULL, NULL, "
                 "TRUE, NULL, TRUE, '[]', NULL)"
             )
         elif damage == "row_absent":

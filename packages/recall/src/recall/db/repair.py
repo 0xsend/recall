@@ -263,23 +263,44 @@ def require_schema_fence(conn: duckdb.DuckDBPyConnection) -> SchemaFence:
     return SchemaFence(int(row[0]))
 
 
+_EXPECTED_COLUMN_TYPES: dict[str, str] = {
+    "singleton": "BOOLEAN",
+    "attempt_no": "UBIGINT",
+    "phase": "VARCHAR",
+    "trigger_id": "UUID",
+    "trigger_kind": "VARCHAR",
+    "signature": "VARCHAR",
+    "trigger_json": "JSON",
+    "target_manifest": "JSON",
+    "oracle_ref": "VARCHAR",
+    "oracle_hash": "VARCHAR",
+    "success_since_attempt": "BOOLEAN",
+    "last_folded_event_id": "UUID",
+    "success_since_failure": "BOOLEAN",
+    "acknowledged_events": "JSON",
+    "release_certificate": "JSON",
+}
+
+
 def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
-    try:
-        rows = conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
+    columns = {
+        str(name): str(col_type)
+        for _, name, col_type, *_ in conn.execute(
+            "PRAGMA table_info('daemon_index_repair')"
         ).fetchall()
-    except (duckdb.BinderException, duckdb.ConversionException) as error:
-        raise ValueError(f"recovery singleton schema is invalid: {error}") from error
+    }
+    if not columns:
+        raise ValueError("recovery singleton table is missing")
+    if columns != _EXPECTED_COLUMN_TYPES:
+        raise ValueError("recovery singleton schema does not match expected columns/types")
+    rows = conn.execute(
+        f"SELECT {', '.join(_COLUMNS)} FROM daemon_index_repair WHERE singleton"
+    ).fetchall()
     if len(rows) != 1:
         raise ValueError("recovery singleton is missing or duplicated")
     payload = dict(zip(_COLUMNS, rows[0], strict=True))
     for name in _JSON_COLUMNS:
         if payload[name] is not None:
-            if not isinstance(payload[name], str):
-                raise ValueError(
-                    f"recovery singleton column {name} must be JSON text, got "
-                    f"{type(payload[name]).__name__}"
-                )
             payload[name] = json.loads(payload[name])
     return RepairRow.model_validate(payload)
 
