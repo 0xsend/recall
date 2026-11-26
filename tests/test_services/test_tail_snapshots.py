@@ -20,7 +20,10 @@ def population(tmp_path: Path) -> Iterator[tuple[AppConfig, duckdb.DuckDBPyConne
     config = replace(AppConfig.load(), data_dir=tmp_path, db_path=tmp_path / "recall.duckdb")
     conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
-    conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/source', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s', 'codex', '/owned/source', NULL)"
+    )
     conn.execute(
         "INSERT INTO session_state (session_id, message_count, file_mtime, file_size)"
         " VALUES ('s', 600, 0, 0)"

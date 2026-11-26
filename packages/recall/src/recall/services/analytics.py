@@ -635,7 +635,10 @@ def _usage_by_source(
             SUM(COALESCE(ss.input_tokens, 0)) AS input_tokens,
             {cached_expr} AS cached_input_tokens,
             SUM(COALESCE(ss.output_tokens, 0)) AS output_tokens,
-            COUNT(*) AS session_count
+            -- One per spawn tree: a root and its linked sessions share the key
+            -- (REQ-CLI-031); tokens still sum over every session.
+            COUNT(DISTINCT COALESCE(s.root_source_session_id, s.source_session_id, s.id))
+                AS session_count
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         WHERE {where_sql}

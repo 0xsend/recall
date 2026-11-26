@@ -294,6 +294,7 @@ def fleet_list(
     source: str | None = None,
     project: str | None = None,
     limit: int = 50,
+    subagents: bool = False,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetQueryResult:
@@ -301,11 +302,15 @@ def fleet_list(
     for flag, value in (("--since", since), ("--source", source), ("--project", project)):
         if value:
             argv.extend([flag, value])
+    if subagents:
+        argv.append("--subagents")
     raw = _arrays(
         executor,
         FleetOperation(
             "recall.list",
-            ListParams(since=since, source=source, project=project, limit=limit),
+            ListParams(
+                since=since, source=source, project=project, limit=limit, subagents=subagents
+            ),
             argv,
             decode_array,
             local_seconds=timeout,

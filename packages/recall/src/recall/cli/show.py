@@ -441,6 +441,7 @@ def command(
     msg_count = session.get("message_count", 0)
     tool_count = session.get("tool_count", 0)
     typer.echo(f"Duration: {duration}s | Messages: {msg_count} | Tools: {tool_count}")
+    _echo_session_tree(session)
     typer.echo("")
 
     messages = session.get("messages") or []
@@ -484,3 +485,34 @@ def command(
             typer.echo(f"  {format_tool_call_line(tool_call)}")
 
     render_cta_hints(ctas)
+
+
+def _echo_session_tree(session: dict[str, Any]) -> None:
+    """The root a linked session files under, or a root's subagents (REQ-CLI-031)."""
+    lineage = session.get("lineage")
+    if isinstance(lineage, dict):
+        root = session.get("root_session_id") or "not indexed"
+        agent = " ".join(
+            str(value)
+            for value in (lineage.get("agent_type"), lineage.get("agent_description"))
+            if value
+        )
+        typer.echo(f"Root session: {root}" + (f" | Agent: {agent}" if agent else ""))
+        return
+    subagents = session.get("subagents")
+    if not isinstance(subagents, list) or not subagents:
+        return
+    total = session.get("subagent_count")
+    shown = len(subagents)
+    suffix = f" (first {shown})" if isinstance(total, int) and total > shown else ""
+    typer.echo(f"Subagents: {total if isinstance(total, int) else shown}{suffix}")
+    for subagent in subagents:
+        if not isinstance(subagent, dict):
+            continue
+        label = " ".join(
+            str(value)
+            for value in (subagent.get("agent_type"), subagent.get("agent_description"))
+            if value
+        )
+        messages = subagent.get("message_count", 0)
+        typer.echo(f"  {subagent.get('id', '?')} {label or '-'} messages={messages}")

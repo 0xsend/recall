@@ -58,7 +58,8 @@ def semantic_index(tmp_path, monkeypatch):
             path.write_text("application-owned transcript\n")
             stat = path.stat()
             conn.execute(
-                "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                "INSERT INTO sessions (id, source, source_path, source_session_id)"
+                " VALUES (?, ?, ?, ?)",
                 [sid, source, str(path), source_id],
             )
             conn.execute(

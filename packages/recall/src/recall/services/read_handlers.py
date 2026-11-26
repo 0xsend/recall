@@ -27,6 +27,7 @@ from recall.services.sessions import (
     load_session_on,
     load_session_tail_on,
     resolve_session_header_on,
+    session_tree_on,
 )
 
 
@@ -44,6 +45,7 @@ def read_list_on(config: AppConfig, lease: DbLease, params: ListParams) -> Any:
         host=params.host,
         session=params.session,
         limit=params.limit,
+        subagents=params.subagents,
         config=config,
     )
 
@@ -140,12 +142,16 @@ class ShowSelection:
                 message_limit=params.message_limit,
                 config=config,
             )
+        root_session_id, subagent_count, subagents = session_tree_on(lease, session)
         last_seen = max(
             (message.idx for message in session.messages),
             default=self.after_idx if self.after_idx is not None and not reset else -1,
         )
         return {
             **session.model_dump(),
+            "root_session_id": root_session_id,
+            "subagent_count": subagent_count,
+            "subagents": subagents,
             "freshness": derive_freshness(
                 session.source_path,
                 indexed_mtime=session.file_mtime,

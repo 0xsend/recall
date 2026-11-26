@@ -56,6 +56,9 @@ def command(
         None, "--fleet-config", help="Fleet inventory path (default: ~/.config/recall/fleet.toml)"
     ),
     limit: int = typer.Option(50, "--limit", help="Maximum sessions to return"),
+    subagents: bool = typer.Option(
+        False, "--subagents", help="Also list subagent sessions under an indexed root session"
+    ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
     ),
@@ -83,6 +86,7 @@ def command(
                 "fleet_inventory_only",
                 "fleet_config",
                 "limit",
+                "subagents",
                 "fields",
                 "format",
                 "json",
@@ -98,6 +102,7 @@ def command(
                 "fleet_inventory_only": "boolean",
                 "fleet_config": "string",
                 "limit": "integer",
+                "subagents": "boolean",
                 "fields": "string",
                 "format": "string",
                 "json": "boolean",
@@ -127,6 +132,7 @@ def command(
             raise ValueError("--fleet-inventory-only requires --fleet")
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         limit = resolve_int_param(ctx, payload, "limit", limit)
+        subagents = resolve_bool_param(ctx, payload, "subagents", subagents)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -146,6 +152,7 @@ def command(
                 project=project,
                 host=host,
                 limit=limit,
+                subagents=subagents,
                 fleet_config=fleet_config,
                 fleet_inventory_only=fleet_inventory_only,
             )
@@ -161,6 +168,8 @@ def command(
                 rpc_params["host"] = host
             if session is not None:
                 rpc_params["session"] = session
+            if subagents:
+                rpc_params["subagents"] = True
 
             # A distinct method fails closed on daemons that ignore unknown filters.
             method = "recall.list" if session is None else "recall.list_by_session"
@@ -208,10 +217,11 @@ def command(
             src = row.get("source", "?")
             msg_count = row.get("message_count", 0)
             tool_count = row.get("tool_count", 0)
+            tree = _tree_label(row)
             typer.echo(
                 with_fleet_host(
                     f"[{started}] {sid} ({src}) {project_label} "
-                    f"messages={msg_count} tools={tool_count}",
+                    f"messages={msg_count} tools={tool_count}{tree}",
                     row,
                     fleet=fleet,
                 )
@@ -227,3 +237,12 @@ def command(
             output_format=output_format,
         )
         raise typer.Exit(code=2) from None
+
+
+def _tree_label(row: dict[str, Any]) -> str:
+    """` subagents=N` on a root with linked sessions, ` root=<id>` on a linked one."""
+    root = row.get("root_session_id")
+    if isinstance(root, str):
+        return f" root={root}"
+    count = row.get("subagent_count")
+    return f" subagents={count}" if isinstance(count, int) and count > 0 else ""

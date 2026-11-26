@@ -34,7 +34,10 @@ def poll_index(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(config_path))
     config = AppConfig.load()
     with connect(config) as conn:
-        conn.execute("INSERT INTO sessions VALUES ('fixture', 'codex', '/fixture/session', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('fixture', 'codex', '/fixture/session', NULL)"
+        )
     directory = Path.home() / ".config/systemd/user"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "recall-daemon.service").write_text(

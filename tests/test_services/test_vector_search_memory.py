@@ -18,7 +18,10 @@ def test_vector_search_bounds_wide_candidate_payloads(tmp_path: Path, kind: str)
     path = tmp_path / "vectors.duckdb"
     with _native.duckdb_connect(str(path)) as conn:
         ensure_schema(conn)
-        conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/source', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('s', 'codex', '/owned/source', NULL)"
+        )
         conn.execute(
             "INSERT INTO messages (id, session_id, idx) "
             "SELECT i::TEXT, 's', i FROM range(8192) r(i)"
@@ -67,7 +70,10 @@ def test_vector_search_bounds_vectors_during_identity_joins(tmp_path: Path, kind
     path = tmp_path / "joined-vectors.duckdb"
     with _native.duckdb_connect(str(path)) as conn:
         ensure_schema(conn)
-        conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/join-source', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('s', 'codex', '/owned/join-source', NULL)"
+        )
         conn.execute(
             "INSERT INTO messages (id, session_id, idx) "
             "SELECT i::TEXT, 's', i FROM range(32768) r(i)"

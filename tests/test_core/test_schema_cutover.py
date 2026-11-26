@@ -58,7 +58,10 @@ def _create_v13_db_with_blocked_0014() -> duckdb.DuckDBPyConnection:
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
     conn.execute(
         "INSERT INTO message_state (message_id, role, content) VALUES ('m1', 'user', 'hello')"
     )
@@ -274,6 +277,10 @@ def test_sessions_and_messages_tables_keep_only_identity_columns() -> None:
         "source",
         "source_path",
         "source_session_id",
+        "root_source_session_id",
+        "agent_id",
+        "agent_type",
+        "agent_description",
     ]
     assert _table_columns(conn, "messages") == [
         "id",
@@ -351,7 +358,10 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
     conn.execute(
         "INSERT INTO message_state (message_id, role, content) VALUES ('m1', 'user', 'hello')"
     )
@@ -402,7 +412,10 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
 
     # Before: grok insert fails
     with pytest.raises(Exception, match="CHECK constraint failed"):
-        conn.execute("INSERT INTO sessions VALUES ('s2', 'grok', '/tmp/s2', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('s2', 'grok', '/tmp/s2', NULL)"
+        )
 
     # Call public ensure (triggers framework + 0014 migration)
     ensure_schema(conn)
@@ -419,7 +432,10 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
     assert "0015_contextual_retrieval" in migration_ids
 
     # Now grok + system role work, old data preserved
-    conn.execute("INSERT INTO sessions VALUES ('s2', 'grok', '/tmp/s2', 'grok-uuid-123')")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s2', 'grok', '/tmp/s2', 'grok-uuid-123')"
+    )
     row = conn.execute("SELECT COUNT(*) FROM sessions WHERE source = 'grok'").fetchone()
     assert (row[0] if row is not None else 0) == 1
     conn.execute(
@@ -457,7 +473,10 @@ def test_v11_simulated_db_still_requires_recreate_after_mig_attempt() -> None:
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
 
     with pytest.raises(RuntimeError, match="schema version mismatch"):
         ensure_schema(conn)
@@ -515,7 +534,10 @@ def test_v13_with_pre_relaxed_checks_completes_to_current_schema() -> None:
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
 
     # Minimal supporting tables so ensure_schema can complete
     conn.execute(
@@ -610,7 +632,10 @@ def test_v13_with_one_table_already_relaxed_completes_to_current_schema() -> Non
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
 
     # Minimal supporting tables
     conn.execute(
@@ -710,7 +735,10 @@ def test_partial_failure_during_migration_does_not_record_as_applied() -> None:
         )
         """
     )
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'claude_code', '/tmp/s1', NULL)")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'claude_code', '/tmp/s1', NULL)"
+    )
 
     # Pre-create message_state_new so the migration's CREATE TABLE will fail.
     # This simulates a real DDL failure on the second table after the first
@@ -793,7 +821,7 @@ def test_fresh_schema_omits_retired_catalog_index_and_column() -> None:
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
 
-    assert SCHEMA_VERSION == 43
+    assert SCHEMA_VERSION == 44
     assert "inventory_generation" not in _table_columns(conn, "source_files")
     indexes = {
         str(row[0])

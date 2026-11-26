@@ -108,7 +108,8 @@ def test_indexed_roster_join_keeps_every_member(tmp_path: Path, names: tuple[str
         ensure_schema(conn, embed_dim=8)
         for number, path in enumerate(indexed):
             conn.execute(
-                "INSERT INTO sessions VALUES (?, 'codex', ?, NULL)",
+                "INSERT INTO sessions (id, source, source_path, source_session_id)"
+                " VALUES (?, 'codex', ?, NULL)",
                 [f"session-{number}", str(path)],
             )
         expected_ids = {str(path): f"session-{number}" for number, path in enumerate(indexed)}

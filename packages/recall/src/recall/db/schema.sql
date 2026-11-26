@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     source TEXT NOT NULL,
     source_path TEXT NOT NULL,
     source_session_id TEXT,
+    -- Subagent lineage (REQ-SCHEMA-007); all NULL for a root session. The
+    -- parent's recall id is resolved at read time, never stored.
+    root_source_session_id TEXT,
+    agent_id TEXT,
+    agent_type TEXT,
+    agent_description TEXT,
     UNIQUE (source, source_path)
 );
 

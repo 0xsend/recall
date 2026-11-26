@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +21,7 @@ from recall.core.models import (
     ParseDiagnostic,
     ParseResult,
     Session,
+    SessionLineage,
     StopMarker,
     TailFacts,
     ToolCall,
@@ -33,6 +35,7 @@ from recall.parsers.checkpoint import (
     ChunkBudget,
     ChunkTarget,
     UnsupportedResumeState,
+    read_resume_flag,
     read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
@@ -98,6 +101,64 @@ _KNOWN_RECORD_TYPES = frozenset(
 # harness-injected context the adapter does not index (REQ-PARSE-033). These
 # records are routed away before any message, tool or token normalization.
 _REQUEST_LOG_RECORD_TYPES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
+
+# Subagent transcripts live at <project>/<parent sessionId>/subagents/agent-<id>.jsonl
+# beside agent-<id>.meta.json (REQ-PARSE-046).
+_SUBAGENT_DIRECTORY = "subagents"
+_AGENT_FILE_PREFIX = "agent-"
+_TRANSCRIPT_SUFFIX = ".jsonl"
+_AGENT_META_SUFFIX = ".meta.json"
+# Observed meta files are under 1 KiB; anything larger is not one.
+_AGENT_META_BYTES_MAX = 64 * 1024
+_FORK_CONTEXT_RECORD_TYPE = "fork-context-ref"
+
+
+def _subagent_agent_id(path: Path) -> str | None:
+    """The agent id a subagent transcript's path names, else None for a root transcript."""
+    name = path.name
+    if (
+        path.parent.name != _SUBAGENT_DIRECTORY
+        or not name.startswith(_AGENT_FILE_PREFIX)
+        or not name.endswith(_TRANSCRIPT_SUFFIX)
+    ):
+        return None
+    agent_id = name[len(_AGENT_FILE_PREFIX) : -len(_TRANSCRIPT_SUFFIX)]
+    return agent_id or None
+
+
+def _agent_meta_path(path: Path, agent_id: str) -> Path:
+    return path.with_name(f"{_AGENT_FILE_PREFIX}{agent_id}{_AGENT_META_SUFFIX}")
+
+
+def _read_agent_meta(path: Path) -> dict[str, Any]:
+    """The meta object, or empty when it cannot be one; the file is optional enrichment."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_AGENT_META_BYTES_MAX + 1)
+    except OSError:
+        return {}
+    if len(raw) > _AGENT_META_BYTES_MAX:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _subagent_lineage(path: Path) -> SessionLineage | None:
+    agent_id = _subagent_agent_id(path)
+    if agent_id is None:
+        return None
+    meta = _read_agent_meta(_agent_meta_path(path, agent_id))
+    agent_type = meta.get("agentType")
+    description = meta.get("description")
+    return SessionLineage(
+        root_source_session_id=path.parent.parent.name,
+        agent_id=agent_id,
+        agent_type=agent_type if isinstance(agent_type, str) else None,
+        agent_description=description if isinstance(description, str) else None,
+    )
 
 
 def _first_admitted_counter(entry: dict[str, Any], *paths: str | tuple[str, ...]) -> int | None:
@@ -205,8 +266,9 @@ class ClaudeCodeParser:
         return default_discover(self)
 
     def sidecar_paths(self, path: Path) -> list[Path]:
-        """No sidecars: all metadata comes from the session file itself."""
-        return []
+        """A subagent transcript's meta file; a root transcript has none."""
+        agent_id = _subagent_agent_id(path)
+        return [] if agent_id is None else [_agent_meta_path(path, agent_id)]
 
     def live_candidates(self, *, now: datetime, idle_threshold: float) -> list[Path]:
         return default_live_candidates(self, now=now, idle_threshold=idle_threshold)
@@ -221,8 +283,17 @@ class ClaudeCodeParser:
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
     ) -> ParseResult:
-        state = read_resume_state(resume_state, offset=offset, supported=frozenset({"usage_scope"}))
+        state = read_resume_state(
+            resume_state,
+            offset=offset,
+            supported=frozenset({"usage_scope", "fork_copy_pending"}),
+        )
         scope_token = _usage_scope(state, offset=offset)
+        # True while the next record is a fork's copy of the parent's spawning
+        # response, whose usage the parent transcript owns (REQ-PARSE-047).
+        fork_copy_pending = offset > 0 and read_resume_flag(
+            state, "fork_copy_pending", required=True
+        )
         usage = _ResponseUsage()
         metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
@@ -247,7 +318,10 @@ class ClaudeCodeParser:
                     capture,
                     diagnostics=diagnostics,
                     metadata=metadata,
-                    adapter_state={"usage_scope": {"format": 1, "token": scope_token}},
+                    adapter_state={
+                        "usage_scope": {"format": 1, "token": scope_token},
+                        "fork_copy_pending": fork_copy_pending,
+                    },
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(),
                     message_idx_base=message_idx_base + len(messages),
@@ -265,6 +339,8 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
+                is_fork_copy = fork_copy_pending
+                fork_copy_pending = record_type == _FORK_CONTEXT_RECORD_TYPE
                 if record_type == "session-owner":
                     # Ownership metadata cannot establish conversation identity
                     # or contribute any session, usage or conversation fields.
@@ -311,7 +387,8 @@ class ClaudeCodeParser:
                 if metadata.source_session_id is None:
                     metadata.source_session_id = first_of(entry, "sessionId")
 
-                usage.add(entry)
+                if not is_fork_copy:
+                    usage.add(entry)
 
                 # -- Subagent progress: extract nested messages with agent_id --
                 # Progress entries have a top-level `message` key containing
@@ -406,6 +483,7 @@ class ClaudeCodeParser:
             published.git_repo = published.cwd
 
         published.source_session_id = metadata.source_session_id or path.stem
+        published.lineage = _subagent_lineage(path)
 
         message_count = len(messages)
         tool_count = len(tool_calls)

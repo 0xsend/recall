@@ -8,7 +8,14 @@ from typing import Any, cast
 import duckdb
 
 from recall.core.config import AppConfig
-from recall.core.models import Message, Session, SessionSummary, ToolCall
+from recall.core.models import (
+    Message,
+    Session,
+    SessionLineage,
+    SessionSummary,
+    SubagentSummary,
+    ToolCall,
+)
 from recall.core.time import to_naive_utc
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
@@ -26,6 +33,40 @@ def _session_host_label(raw: object) -> str:
     return UNATTRIBUTED_HOST
 
 
+# Root sessions keyed the way a lineage names them (REQ-SCHEMA-007). Copies
+# sharing a key (a moved transcript beside its original) resolve to the smallest
+# recall id.
+LINEAGE_ROOTS = """
+    SELECT s.source, s.source_session_id, ss.host, MIN(s.id) AS root_id
+    FROM sessions s JOIN session_state ss ON ss.session_id = s.id
+    WHERE s.root_source_session_id IS NULL AND s.source_session_id IS NOT NULL
+    GROUP BY s.source, s.source_session_id, ss.host
+"""
+_LINEAGE_CHILDREN = """
+    SELECT s.source, s.root_source_session_id, ss.host, COUNT(*) AS subagent_count
+    FROM sessions s JOIN session_state ss ON ss.session_id = s.id
+    WHERE s.root_source_session_id IS NOT NULL
+    GROUP BY s.source, s.root_source_session_id, ss.host
+"""
+# The projection `lineage_from_row` decodes, qualified by the `s` alias.
+LINEAGE_COLUMNS = "s.root_source_session_id, s.agent_id, s.agent_type, s.agent_description"
+# `show` lists at most this many linked sessions; `subagent_count` is the total.
+SUBAGENTS_LISTED_MAX = 1000
+
+
+def lineage_from_row(values: tuple[Any, ...]) -> SessionLineage | None:
+    """Decode the four `LINEAGE_COLUMNS`; a root session has none."""
+    root, agent_id, agent_type, agent_description = values
+    if root is None:
+        return None
+    return SessionLineage(
+        root_source_session_id=root,
+        agent_id=agent_id,
+        agent_type=agent_type,
+        agent_description=agent_description,
+    )
+
+
 def list_sessions(
     *,
     source: Source | None,
@@ -34,6 +75,7 @@ def list_sessions(
     host: str | None = None,
     session: str | None = None,
     limit: int = 50,
+    subagents: bool = False,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[SessionSummary]:
@@ -47,6 +89,7 @@ def list_sessions(
             host=host,
             session=session,
             limit=limit,
+            subagents=subagents,
             config=config,
         )
 
@@ -60,6 +103,7 @@ def list_sessions_on(
     host: str | None = None,
     session: str | None = None,
     limit: int = 50,
+    subagents: bool = False,
     config: AppConfig,
 ) -> list[SessionSummary]:
     return lease.call(
@@ -72,6 +116,7 @@ def list_sessions_on(
             host=host,
             session=session,
             limit=limit,
+            subagents=subagents,
             config=config,
         ),
     )
@@ -86,6 +131,7 @@ def _list_sessions(
     host: str | None = None,
     session: str | None = None,
     limit: int = 50,
+    subagents: bool = False,
     config: AppConfig,
 ) -> list[SessionSummary]:
     where_parts: list[str] = []
@@ -108,16 +154,28 @@ def _list_sessions(
     if host is not None:
         where_parts.append("ss.host = ?")
         params.append(host)
+    if not subagents and session is None:
+        # A linked session lists under its root; one whose root is not indexed
+        # stays visible on its own (REQ-CLI-031).
+        where_parts.append("(s.root_source_session_id IS NULL OR r.root_id IS NULL)")
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     sql = f"""
+        WITH lineage_roots AS ({LINEAGE_ROOTS}), lineage_children AS ({_LINEAGE_CHILDREN})
         SELECT s.id, s.source, s.source_session_id, ss.started_at, ss.ended_at,
                ss.cwd, ss.git_repo, ss.git_branch,
                ss.model, ss.message_count, ss.tool_count, ss.input_tokens, ss.output_tokens,
                ss.is_complete, ss.host, ss.file_mtime, ss.file_size, ss.indexed_at,
                GREATEST(ss.ended_at, to_timestamp(ss.file_mtime) AT TIME ZONE 'UTC')
-                 AS last_activity_at
+                 AS last_activity_at,
+               {LINEAGE_COLUMNS}, r.root_id, COALESCE(c.subagent_count, 0)
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
+        LEFT JOIN lineage_roots r
+          ON r.source = s.source AND r.source_session_id = s.root_source_session_id
+         AND r.host = ss.host
+        LEFT JOIN lineage_children c
+          ON s.root_source_session_id IS NULL AND c.source = s.source
+         AND c.root_source_session_id = s.source_session_id AND c.host = ss.host
         {where_clause}
         ORDER BY ss.started_at DESC NULLS LAST, ss.indexed_at DESC
         LIMIT {limit}
@@ -144,18 +202,21 @@ def _list_sessions(
             file_size=int(row[16]),
             indexed_at=row[17],
             last_activity_at=row[18],
+            lineage=lineage_from_row(row[19:23]),
+            root_session_id=row[23],
+            subagent_count=int(row[24]),
         )
         for row in rows
     ]
 
 
-_SESSION_SELECT = """
+_SESSION_SELECT = f"""
     SELECT s.id, s.source, s.source_path, s.source_session_id,
            ss.started_at, ss.ended_at, ss.duration_seconds,
            ss.model, ss.cwd, ss.git_repo, ss.git_branch,
            ss.message_count, ss.tool_count, ss.input_tokens,
            ss.output_tokens, ss.is_complete, ss.file_mtime, ss.file_size, ss.indexed_at,
-           ss.host
+           ss.host, {LINEAGE_COLUMNS}
     FROM sessions s
     JOIN session_state ss ON ss.session_id = s.id
 """
@@ -224,6 +285,7 @@ def _session_from_row(row: tuple[Any, ...]) -> Session:
         file_size=int(row[17]),
         indexed_at=row[18],
         host=_session_host_label(row[19]),
+        lineage=lineage_from_row(row[20:24]),
         messages=[],
         orphan_tool_calls=[],
     )
@@ -525,3 +587,46 @@ def load_session_tail_on(
             conn, session_id, tail=tail, after_idx=after_idx, tools=tools
         ),
     )
+
+
+def session_tree_on(
+    lease: DbLease, session: Session
+) -> tuple[str | None, int, list[SubagentSummary]]:
+    """The resolved root of a linked session, or a root's linked sessions (REQ-CLI-031)."""
+    return lease.call("sessions:session_tree", lambda conn: _session_tree(conn, session))
+
+
+def _session_tree(
+    conn: duckdb.DuckDBPyConnection, session: Session
+) -> tuple[str | None, int, list[SubagentSummary]]:
+    if session.lineage is not None:
+        row = conn.execute(
+            f"""WITH lineage_roots AS ({LINEAGE_ROOTS})
+                SELECT root_id FROM lineage_roots
+                WHERE source = ? AND source_session_id = ? AND host = ?""",
+            [session.source.value, session.lineage.root_source_session_id, session.host],
+        ).fetchone()
+        return (str(row[0]) if row is not None else None, 0, [])
+    if session.source_session_id is None:
+        return (None, 0, [])
+    rows = conn.execute(
+        """SELECT s.id, s.agent_id, s.agent_type, s.agent_description, ss.started_at,
+                  ss.message_count, COUNT(*) OVER () AS total
+           FROM sessions s JOIN session_state ss ON ss.session_id = s.id
+           WHERE s.source = ? AND s.root_source_session_id = ? AND ss.host = ?
+           ORDER BY ss.started_at NULLS LAST, s.id
+           LIMIT ?""",
+        [session.source.value, session.source_session_id, session.host, SUBAGENTS_LISTED_MAX],
+    ).fetchall()
+    subagents = [
+        SubagentSummary(
+            id=str(row[0]),
+            agent_id=row[1],
+            agent_type=row[2],
+            agent_description=row[3],
+            started_at=row[4],
+            message_count=int(row[5] or 0),
+        )
+        for row in rows
+    ]
+    return (None, int(rows[0][6]) if rows else 0, subagents)

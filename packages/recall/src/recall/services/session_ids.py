@@ -36,7 +36,10 @@ def resolve_session_identifier(
 ) -> SessionIdentity:
     """Resolve exact recall ID, exact source ID, then a 6-31 hex recall prefix.
 
-    Source and host restrict the lookup. Ambiguity reports bounded candidates
+    A source ID resolves to the one root session carrying it before linked
+    sessions are considered, so a transcript and its subagents, which share the
+    harness's session id, select the transcript (REQ-CLI-031). Source and host
+    restrict the lookup. Ambiguity reports bounded candidates
     with canonical IDs callers can use to select one without guessing.
     """
     scope: list[str] = []
@@ -47,11 +50,16 @@ def resolve_session_identifier(
     if host is not None:
         scope.append("ss.host = ?")
         values.append(host)
-    predicates = [("s.id = ?", identifier, "session id")]
-    predicates.append(("s.source_session_id = ?", identifier, "source_session_id"))
+    predicates = [
+        ("s.id = ?", identifier, "session id"),
+        ("s.source_session_id = ? AND s.root_source_session_id IS NULL", identifier, "root"),
+        ("s.source_session_id = ?", identifier, "source_session_id"),
+    ]
     if _HEX_ID_PREFIX_RE.fullmatch(identifier):
         predicates.append(("s.id LIKE ?", identifier + "%", "session id prefix"))
-    for predicate, value, kind in predicates:
+    for predicate, value, step in predicates:
+        # Root and linked sessions share the source ID: both report as such.
+        kind = "source_session_id" if step == "root" else step
         exact_id = kind == "session id"
         where = " AND ".join([predicate, *([] if exact_id else scope)])
         rows = conn.execute(
@@ -60,7 +68,7 @@ def resolve_session_identifier(
                 WHERE {where} ORDER BY s.id LIMIT ?""",
             [value, *([] if exact_id else values), _CANDIDATE_LIMIT + 1],
         ).fetchall()
-        if not rows and scope and kind == "source_session_id":
+        if not rows and scope and step == "source_session_id":
             excluded = conn.execute(
                 """SELECT s.id, s.source, ss.host FROM sessions s
                     LEFT JOIN session_state ss ON ss.session_id = s.id
