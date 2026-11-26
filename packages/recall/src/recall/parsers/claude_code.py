@@ -168,10 +168,12 @@ class _ParentResponse:
     A fork's first record is `fork-context-ref`, and the record after it repeats
     the parent's response that spawned the fork. The parent transcript counts
     that response, so every record carrying its id adds no usage here.
-    `awaiting` holds between the two records, across a checkpoint if one falls
-    there.
+    `awaiting` holds between the two records, and `opened` once any record has
+    been seen; both cross a checkpoint, since a byte offset past blank lines
+    does not mean a record was seen.
     """
 
+    opened: bool = False
     awaiting: bool = False
     response_id: str | None = None
 
@@ -190,21 +192,29 @@ class _ParentResponse:
         raw = state.get(cls._STATE_KEY)
         if (
             not isinstance(raw, dict)
-            or set(raw) != {"awaiting", "response_id"}
+            or set(raw) != {"opened", "awaiting", "response_id"}
+            or not isinstance(raw["opened"], bool)
             or not isinstance(raw["awaiting"], bool)
             or not (raw["response_id"] is None or isinstance(raw["response_id"], str))
         ):
             raise UnsupportedResumeState("unsupported Claude fork parent response")
-        return cls(raw["awaiting"], raw["response_id"])
+        return cls(raw["opened"], raw["awaiting"], raw["response_id"])
 
     def state(self) -> dict[str, Any]:
-        return {self._STATE_KEY: {"awaiting": self.awaiting, "response_id": self.response_id}}
+        return {
+            self._STATE_KEY: {
+                "opened": self.opened,
+                "awaiting": self.awaiting,
+                "response_id": self.response_id,
+            }
+        }
 
-    def owns(self, entry: dict[str, Any], *, first_record: bool, fork_capable: bool) -> bool:
+    def owns(self, entry: dict[str, Any], *, fork_capable: bool) -> bool:
         """Whether `entry`'s usage belongs to the parent transcript."""
         response_id = first_of(entry, ("message", "id"))
         response_id = response_id if isinstance(response_id, str) else None
-        if first_record:
+        if not self.opened:
+            self.opened = True
             self.awaiting = fork_capable and entry.get("type") == _FORK_CONTEXT_RECORD_TYPE
             return False
         if self.awaiting:
@@ -347,7 +357,6 @@ class ClaudeCodeParser:
         scope_token = _usage_scope(state, offset=offset)
         parent_response = _ParentResponse.resume(state, offset=offset)
         fork_capable = _subagent_agent_id(path) is not None
-        first_record = offset == 0
         usage = _ResponseUsage()
         metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
@@ -393,10 +402,7 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
-                owned_by_parent = parent_response.owns(
-                    entry, first_record=first_record, fork_capable=fork_capable
-                )
-                first_record = False
+                owned_by_parent = parent_response.owns(entry, fork_capable=fork_capable)
                 if record_type == "session-owner":
                     # Ownership metadata cannot establish conversation identity
                     # or contribute any session, usage or conversation fields.

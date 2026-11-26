@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from recall.core.config import AppConfig
 from recall.core.models import NormalizationCheckpoint, SessionLineage
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -132,8 +133,9 @@ def test_fork_rule_applies_only_to_a_subagent_that_opens_with_the_marker(tmp_pat
     assert parser.parse(late).session.output_tokens == 34
 
 
-def test_fork_copy_across_a_resumed_boundary(tmp_path: Path) -> None:
-    """A checkpoint between the ref and the copy still keeps the copy uncounted."""
+@pytest.mark.parametrize("prefix", ["ref", "blank"])
+def test_fork_copy_across_a_resumed_boundary(tmp_path: Path, prefix: str) -> None:
+    """A checkpoint between the ref and the copy, or after only blank lines, keeps the rule."""
     harness = _first_wins_harness(
         "claude-code",
         f"-Users-me-repo/{ROOT_SID}/subagents/agent-f1.jsonl",
@@ -142,12 +144,13 @@ def test_fork_copy_across_a_resumed_boundary(tmp_path: Path) -> None:
     )
     items = fork_records()
     try:
-        harness.path.write_bytes(encoded(items[:1]))
+        blank = b"\n" if prefix == "blank" else b""
+        harness.path.write_bytes(blank + (encoded(items[:1]) if prefix == "ref" else b""))
         harness.reconcile()
         checkpoint = NormalizationCheckpoint.decode(harness.stored_checkpoint())
         assert checkpoint is not None
         harness.set_checkpoint(checkpoint.encode())
-        harness.path.write_bytes(encoded(items))
+        harness.path.write_bytes(blank + encoded(items))
         assert harness.reconcile() is True
 
         query = "SELECT output_tokens, message_count FROM session_state"
