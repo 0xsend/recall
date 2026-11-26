@@ -8,8 +8,10 @@ declared meta sidecar. Codex lineage arrives with each rollout's next full parse
 
 DDL, backfill, schema version and audit commit together inside one observed
 lease transaction after verifying schema 43 and the schema-41 recovery fence.
-No transcript is read. Rollback restores the paired pre-upgrade backup and old
-binary; an old binary ignores the added columns.
+No transcript is read. A schema-43 binary refuses the upgraded database as too
+new, so going back means restoring a schema-43 copy of the database made before
+the upgrade together with the matching old install; `rollback_migration` does not
+lower the logical schema.
 """
 
 from __future__ import annotations

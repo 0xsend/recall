@@ -304,3 +304,31 @@ def test_fleet_live_host_filter_selects_which_machines_to_reach(
     )
 
     assert reached == ["b"]
+
+
+def test_fleet_list_subagents_reads_a_host_that_predates_the_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-CLI-031: an older host's plain list already returns every transcript."""
+    hosts = (FleetHost(name="current", ssh="current"), FleetHost(name="older", ssh="older"))
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_run(host: FleetHost, remote_argv: list[str], **_k: object) -> FleetRemoteResult:
+        calls.append((host.name, list(remote_argv)))
+        if host.name == "older" and "--subagents" in remote_argv:
+            error = "Usage: recall list [OPTIONS]\nError: No such option: --subagents"
+            return FleetRemoteResult(ok=False, stdout="", stderr=error, returncode=2, error=error)
+        row = {
+            "id": f"{host.name}-1",
+            "source": "claude_code",
+            "started_at": "2026-11-20T10:00:00Z",
+        }
+        return FleetRemoteResult(ok=True, stdout=json.dumps([row]), stderr="", returncode=0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_list(inventory_executor(hosts), limit=10, subagents=True)
+
+    assert (result.hosts_ok, result.hosts_failed) == (2, 0)
+    assert sorted(row["id"] for row in result.rows) == ["current-1", "older-1"]
+    older = [argv for name, argv in calls if name == "older"]
+    assert ["--subagents" in argv for argv in older] == [True, False]

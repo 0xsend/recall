@@ -689,3 +689,7 @@ def test_forked_rollout_carries_parent_thread_lineage(tmp_path: Path) -> None:
     assert without_tree.root_source_session_id == "root"
     assert without_tree.agent_id is None
     assert lineage("root", {"id": "root", "session_id": "root"}) is None
+    # An unpaired surrogate decodes from JSON but cannot be stored as UTF-8.
+    broken = lineage("broken", {"id": "child", "session_id": "\ud800", "parent_thread_id": "p"})
+    assert broken is not None
+    assert broken.root_source_session_id.encode() == "\ufffd".encode()

@@ -302,6 +302,9 @@ def fleet_list(
     for flag, value in (("--since", since), ("--source", source), ("--project", project)):
         if value:
             argv.extend([flag, value])
+    # A host older than REQ-CLI-031 has no `--subagents`; its plain list already
+    # returns every transcript, linked or not.
+    legacy_argv = list(argv) if subagents else None
     if subagents:
         argv.append("--subagents")
     raw = _arrays(
@@ -315,6 +318,7 @@ def fleet_list(
             decode_array,
             local_seconds=timeout,
             remote_seconds=timeout,
+            legacy_remote_argv=legacy_argv,
         ),
         concurrency,
     )

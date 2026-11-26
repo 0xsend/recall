@@ -35,7 +35,6 @@ from recall.parsers.checkpoint import (
     ChunkBudget,
     ChunkTarget,
     UnsupportedResumeState,
-    read_resume_flag,
     read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
@@ -141,7 +140,8 @@ def _read_agent_meta(path: Path) -> dict[str, Any]:
         return {}
     try:
         value = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deep nesting exhausts the decoder's recursion; it is not a meta object.
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -159,6 +159,52 @@ def _subagent_lineage(path: Path) -> SessionLineage | None:
         agent_type=agent_type if isinstance(agent_type, str) else None,
         agent_description=description if isinstance(description, str) else None,
     )
+
+
+@dataclass
+class _ParentResponse:
+    """The parent's spawning response a fork transcript repeats (REQ-PARSE-047).
+
+    A fork's first record is `fork-context-ref`, and the record after it repeats
+    the parent's response that spawned the fork. The parent transcript counts
+    that response, so every record carrying its id adds no usage here.
+    `awaiting` holds between the two records, across a checkpoint if one falls
+    there.
+    """
+
+    awaiting: bool = False
+    response_id: str | None = None
+
+    _STATE_KEY = "fork_parent_response"
+
+    @classmethod
+    def resume(cls, state: Mapping[str, Any], *, offset: int) -> _ParentResponse:
+        if offset == 0:
+            return cls()
+        raw = state.get(cls._STATE_KEY)
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"awaiting", "response_id"}
+            or not isinstance(raw["awaiting"], bool)
+            or not (raw["response_id"] is None or isinstance(raw["response_id"], str))
+        ):
+            raise UnsupportedResumeState("unsupported Claude fork parent response")
+        return cls(raw["awaiting"], raw["response_id"])
+
+    def state(self) -> dict[str, Any]:
+        return {self._STATE_KEY: {"awaiting": self.awaiting, "response_id": self.response_id}}
+
+    def owns(self, entry: dict[str, Any], *, first_record: bool, fork_capable: bool) -> bool:
+        """Whether `entry`'s usage belongs to the parent transcript."""
+        response_id = first_of(entry, ("message", "id"))
+        response_id = response_id if isinstance(response_id, str) else None
+        if first_record:
+            self.awaiting = fork_capable and entry.get("type") == _FORK_CONTEXT_RECORD_TYPE
+            return False
+        if self.awaiting:
+            self.awaiting = False
+            self.response_id = response_id
+        return response_id is not None and response_id == self.response_id
 
 
 def _first_admitted_counter(entry: dict[str, Any], *paths: str | tuple[str, ...]) -> int | None:
@@ -286,14 +332,12 @@ class ClaudeCodeParser:
         state = read_resume_state(
             resume_state,
             offset=offset,
-            supported=frozenset({"usage_scope", "fork_copy_pending"}),
+            supported=frozenset({"usage_scope", "fork_parent_response"}),
         )
         scope_token = _usage_scope(state, offset=offset)
-        # True while the next record is a fork's copy of the parent's spawning
-        # response, whose usage the parent transcript owns (REQ-PARSE-047).
-        fork_copy_pending = offset > 0 and read_resume_flag(
-            state, "fork_copy_pending", required=True
-        )
+        parent_response = _ParentResponse.resume(state, offset=offset)
+        fork_capable = _subagent_agent_id(path) is not None
+        first_record = offset == 0
         usage = _ResponseUsage()
         metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
@@ -320,7 +364,7 @@ class ClaudeCodeParser:
                     metadata=metadata,
                     adapter_state={
                         "usage_scope": {"format": 1, "token": scope_token},
-                        "fork_copy_pending": fork_copy_pending,
+                        **parent_response.state(),
                     },
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(),
@@ -339,8 +383,10 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
-                is_fork_copy = fork_copy_pending
-                fork_copy_pending = record_type == _FORK_CONTEXT_RECORD_TYPE
+                owned_by_parent = parent_response.owns(
+                    entry, first_record=first_record, fork_capable=fork_capable
+                )
+                first_record = False
                 if record_type == "session-owner":
                     # Ownership metadata cannot establish conversation identity
                     # or contribute any session, usage or conversation fields.
@@ -387,7 +433,7 @@ class ClaudeCodeParser:
                 if metadata.source_session_id is None:
                     metadata.source_session_id = first_of(entry, "sessionId")
 
-                if not is_fork_copy:
+                if not owned_by_parent:
                     usage.add(entry)
 
                 # -- Subagent progress: extract nested messages with agent_id --

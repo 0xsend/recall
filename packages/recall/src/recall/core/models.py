@@ -50,7 +50,7 @@ class SessionLineage(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    root_source_session_id: str
+    root_source_session_id: AgentText
     agent_id: OptionalAgentText = None
     agent_type: OptionalAgentText = None
     agent_description: OptionalAgentText = None

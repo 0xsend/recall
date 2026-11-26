@@ -71,7 +71,8 @@ def test_subagent_without_meta_keeps_its_path_lineage(tmp_path: Path) -> None:
     parser = ClaudeCodeParser(roots=(tmp_path,))
     expected = SessionLineage(root_source_session_id=ROOT_SID, agent_id="a1b2c3")
 
-    for meta in (None, "not json", json.dumps(["list"]), " " * (64 * 1024 + 1)):
+    nested = "[" * 10_000 + "]" * 10_000
+    for meta in (None, "not json", json.dumps(["list"]), " " * (64 * 1024 + 1), nested):
         if meta is None:
             oversized.unlink(missing_ok=True)
         else:
@@ -93,12 +94,30 @@ def test_root_transcript_has_no_lineage(tmp_path: Path) -> None:
 
 def test_fork_copy_of_parent_response_is_not_counted(tmp_path: Path) -> None:
     path = subagent_path(tmp_path)
-    path.write_bytes(encoded(fork_records()))
+    # A later content block of the copied response repeats its id.
+    path.write_bytes(encoded([*fork_records(), response("copied-block", "msg_parent_spawn", 9)]))
 
     session = ClaudeCodeParser(roots=(tmp_path,)).parse(path).session
 
     assert session.output_tokens == 24
-    assert [message.content for message in session.messages] == ["copied", "own-1", "own-2"]
+    assert [message.content for message in session.messages] == [
+        "copied",
+        "own-1",
+        "own-2",
+        "copied-block",
+    ]
+
+
+def test_fork_rule_applies_only_to_a_subagent_that_opens_with_the_marker(tmp_path: Path) -> None:
+    parser = ClaudeCodeParser(roots=(tmp_path,))
+    root = tmp_path / "-Users-me-repo" / f"{ROOT_SID}.jsonl"
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.write_bytes(encoded(fork_records()))
+    late = subagent_path(tmp_path, "late")
+    late.write_bytes(encoded([response("first", "msg_first", 3), *fork_records()]))
+
+    assert parser.parse(root).session.output_tokens == 31
+    assert parser.parse(late).session.output_tokens == 34
 
 
 def test_fork_copy_across_a_resumed_boundary(tmp_path: Path) -> None:

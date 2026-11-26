@@ -118,3 +118,26 @@ def test_usage_counts_one_session_per_spawn_tree(indexed) -> None:
     conn, config = indexed
     stats = usage_by_source(config=config, conn=conn)
     assert sum(stat.session_count for stat in stats) == 2
+
+
+def test_a_database_without_lineage_columns_reads_as_all_roots(indexed) -> None:
+    """Read-only opens may precede the daemon's upgrade; reads degrade, not fail."""
+    conn, config = indexed
+    ids = _ids(conn)
+    conn.execute(
+        "CREATE TABLE identity AS SELECT id, source, source_path, source_session_id FROM sessions"
+    )
+    conn.execute("DROP TABLE sessions")
+    conn.execute("ALTER TABLE identity RENAME TO sessions")
+
+    rows = list_sessions(source=None, since=None, project=None, config=config, conn=conn)
+    assert len(rows) == 4
+    assert all(row.lineage is None and row.subagent_count == 0 for row in rows)
+    with StandaloneLifetime().lease(conn) as lease:
+        child = resolve_session_header(ids["agent-plan1"], conn=conn)
+        assert child.lineage is None
+        assert session_tree_on(lease, child) == (None, 0, [])
+    with pytest.raises(ValueError, match="ambiguous"):
+        resolve_session_identifier(conn, ROOT_SID)
+    # Claude subagents carry their root's source session id, so trees still count once.
+    assert sum(stat.session_count for stat in usage_by_source(config=config, conn=conn)) == 2

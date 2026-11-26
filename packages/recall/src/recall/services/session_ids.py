@@ -9,6 +9,7 @@ import duckdb
 
 from recall.core.host_text import HostMessage, HostMessageError, HostText, HostValue
 from recall.core.types import UNATTRIBUTED_HOST
+from recall.services.lineage_sql import lineage_sql
 
 _HEX_ID_PREFIX_RE = re.compile(r"[0-9a-f]{6,31}")
 _CANDIDATE_LIMIT = 20
@@ -52,7 +53,7 @@ def resolve_session_identifier(
         values.append(host)
     predicates = [
         ("s.id = ?", identifier, "session id"),
-        ("s.source_session_id = ? AND s.root_source_session_id IS NULL", identifier, "root"),
+        (f"s.source_session_id = ? AND {lineage_sql(conn).root} IS NULL", identifier, "root"),
         ("s.source_session_id = ?", identifier, "source_session_id"),
     ]
     if _HEX_ID_PREFIX_RE.fullmatch(identifier):

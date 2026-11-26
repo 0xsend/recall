@@ -72,6 +72,10 @@ class FleetOperation:
     # Whether empty/whitespace-only SSH stdout decodes as `[]` (legacy behavior)
     # or fails closed as an invalid reply.
     allow_blank_reply: bool = True
+    # Run once in place of `remote_argv` when an older remote CLI rejects an
+    # option `remote_argv` adds. It must ask for the same rows; the older host
+    # returns them without the fields it does not know.
+    legacy_remote_argv: Sequence[str] | None = None
 
 
 def _repair_notice(config: AppConfig) -> str | None:
@@ -139,6 +143,16 @@ class FleetExecutor:
                 operation.remote_argv,
                 timeout=operation.remote_seconds,
             )
+            if (
+                not result.ok
+                and operation.legacy_remote_argv is not None
+                and "no such option:" in (result.error or "").lower()
+            ):
+                result = fleet_transport.run_remote(
+                    endpoint.host,
+                    operation.legacy_remote_argv,
+                    timeout=operation.remote_seconds,
+                )
             if not result.ok:
                 error = result.error or "remote failed"
                 if operation.not_found and "not found" in error.lower():
