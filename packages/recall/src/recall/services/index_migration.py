@@ -27,7 +27,7 @@ from recall.db.connection import (
 from recall.db.lease import DbLifetime, StandaloneLifetime, owned_connection
 from recall.db.repair import FENCE_VERSION
 from recall.db.schema import INDEX_MIGRATION_VERSION, SCHEMA_VERSION
-from recall.db.source_files import SourceCatalog
+from recall.db.source_files import SOURCE_PARKED_UNSUPPORTED_LIMIT, SourceCatalog
 from recall.services.migration_backup import original_backup
 from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
 from recall.services.recreation import (
@@ -309,6 +309,33 @@ def mark_captured_complete_in_tx(conn: duckdb.DuckDBPyConnection, source_key: st
     )
 
 
+def settle_limit_parked_scope(conn: duckdb.DuckDBPyConnection, *, observer: FailureObserver) -> int:
+    """Settle captured keys whose sources are parked at a capture limit (REQ-RECON-014).
+
+    A capture-limit park keeps prior history and leaves no supported content for
+    the migration to rewrite, and nothing reselects it until its bytes or parser
+    change. Settling it wherever completion is evaluated covers parks recorded
+    before or during this run alike. Returns the number of keys settled.
+    """
+    conn.execute("BEGIN")
+    with rollback_on_failure(observer, "index_migration", lambda: conn.execute("ROLLBACK")):
+        keys = [
+            str(row[0])
+            for row in conn.execute(
+                f"""SELECT source_key FROM index_migration_scope
+                    WHERE NOT completed AND source_key IN (
+                        SELECT source_key FROM source_files
+                        WHERE {SOURCE_PARKED_UNSUPPORTED_LIMIT}
+                    )
+                    ORDER BY source_key"""
+            ).fetchall()
+        ]
+        for key in keys:
+            mark_captured_complete_in_tx(conn, key)
+        conn.execute("COMMIT")
+    return len(keys)
+
+
 def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:
     """Atomically mark one captured migration source complete for standalone callers."""
     conn.execute("BEGIN")
@@ -339,6 +366,7 @@ def verify_and_complete(
         if current is None or storage_upgrade_needed(current, target):
             raise RuntimeError("persisted storage format has not been verified")
     storage_only = target is not None and job["captured_count"] == 0
+    settle_limit_parked_scope(conn, observer=observer)
     remaining = migration_status(conn).remaining
     if remaining > 0 or (int(job["captured_count"]) <= 0 and not storage_only):
         raise RuntimeError("captured scope is not complete")
@@ -370,7 +398,11 @@ def maybe_complete_migration(
     conn: duckdb.DuckDBPyConnection, *, observer: FailureObserver
 ) -> IndexMigrationStatus:
     status = migration_status(conn)
-    if status.phase != "running" or status.remaining > 0 or status.captured <= 0:
+    if status.phase != "running" or status.captured <= 0:
+        return status
+    if status.remaining > 0 and settle_limit_parked_scope(conn, observer=observer) > 0:
+        status = migration_status(conn)
+    if status.remaining > 0:
         return status
     if not _captured_catalog_current(conn):
         return status
