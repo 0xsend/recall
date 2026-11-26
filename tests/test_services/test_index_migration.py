@@ -19,6 +19,7 @@ from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, s
 from recall.parsers.antigravity_cli import AntigravityCliParser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
+from recall.parsers.compressed import zstd
 from recall.parsers.grok import GrokParser
 from recall.parsers.kimi_code import KimiCodeParser
 from recall.parsers.pi_agent import PiAgentParser
@@ -575,6 +576,64 @@ def test_unsupported_settlement_survives_interrupt_and_resume(
     assert blocked_item.committed_generation == blocked_item.desired_generation
     assert blocked_item.committed_offset == blocked.stat().st_size
     assert _catalog_row(conn, supported_parser, supported).current is True
+
+
+_CODEX_RECORD = b'{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n'
+
+
+@pytest.mark.parametrize("key_left_open", [False, True])
+def test_capture_limit_park_settles_its_captured_key(
+    key_left_open: bool,
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supported = _install_fixture(tmp_path, "claude_code/session1.jsonl", "supported.jsonl")
+    supported_parser = _parser_for(ClaudeCodeParser, supported)
+    _reconcile(supported_parser, supported, config, conn)
+    rollout = tmp_path / "codex" / "rollout-2026-08-18T09-39-09-0000.jsonl"
+    rollout.parent.mkdir()
+    compressed = rollout.with_suffix(".jsonl.zst")
+    compressed.write_bytes(zstd.compress(_CODEX_RECORD))
+    rollout_parser = _parser_for(CodexParser, rollout)
+    _reconcile(rollout_parser, rollout, config, conn)
+    messages = _message_snapshot(conn)
+    conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
+    assert begin_migration(conn, config, observer=StandaloneLifetime()).remaining == 2
+
+    compressed.write_bytes(zstd.compress(_CODEX_RECORD * 50))
+    monkeypatch.setattr(
+        "recall.parsers.compressed.MAX_COMPRESSED_CAPTURE_BYTES", len(_CODEX_RECORD) * 2
+    )
+    _reconcile(rollout_parser, rollout, config, conn)
+    parked = _catalog_row(conn, rollout_parser, rollout)
+    assert parked.last_error == "unsupported"
+    assert parked.committed_generation < parked.desired_generation
+    assert migration_status(conn).remaining == 1
+    rollout_key = source_key(rollout_parser.source.value, str(rollout))
+    if key_left_open:
+        # A resumed run can find an open key beside an existing park. Nothing
+        # reselects a parked source, so completion must settle it.
+        conn.execute(
+            "UPDATE index_migration_scope SET completed = FALSE WHERE source_key = ?",
+            [rollout_key],
+        )
+        conn.execute(
+            """UPDATE index_migration_jobs SET completed_count = (
+                   SELECT COUNT(*) FROM index_migration_scope WHERE completed)"""
+        )
+        assert migration_status(conn).remaining == 2
+
+    _reconcile(supported_parser, supported, config, conn)
+
+    done = migration_status(conn)
+    assert (done.phase, done.remaining) == ("idle", 0)
+    assert applied_version(conn) == INDEX_MIGRATION_VERSION
+    assert _message_snapshot(conn) == messages
+    still_parked = _catalog_row(conn, rollout_parser, rollout)
+    assert still_parked.last_error == "unsupported"
+    assert still_parked.current is False
 
 
 # --- rollback backup presence (REQ-RECON-010) ----------------------------
