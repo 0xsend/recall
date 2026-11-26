@@ -1237,6 +1237,7 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
             await embed_all()
             settled = await reconciliation()
             assert all(settled[flag] for flag in flags), settled
+            assert settled["keyword_search_state"] == "ready"
 
             with transcript.open("a", encoding="utf-8") as handle:
                 handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
@@ -1244,6 +1245,8 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
             noticed = await reconciliation()
             assert not any(noticed[flag] for flag in flags), noticed
             assert noticed["noticed_pending"] == 1
+            # Only a noticed write is missing, so keyword coverage itself is sound.
+            assert noticed["keyword_search_state"] == "recent_writes"
 
             await server.index_session_now(transcript)
             indexed = await reconciliation()
@@ -1959,6 +1962,7 @@ def test_watch_capture_retries_keep_readiness_false_until_observed(
             assert status["noticed_pending"] == 1
             assert status["raw_indexing_ready"] is False
             assert status["keyword_search_ready"] is False
+            assert status["keyword_search_state"] == "recent_writes"
             item = await server._run_readonly(
                 lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(path))
             )

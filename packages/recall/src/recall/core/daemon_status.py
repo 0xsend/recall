@@ -36,6 +36,11 @@ class RecoveryProgress(TypedDict):
 
 RecoveryState = Literal["running", "stalled", "interrupted", "stale"]
 
+# Why keyword search is or is not ready. `recent_writes` means the keyword
+# index is healthy and only transcript writes not yet indexed are missing;
+# `unready` means coverage itself is incomplete or failing.
+KeywordSearchState = Literal["ready", "recent_writes", "unready"]
+
 
 class RecoveryStatus(TypedDict):
     """An automatic index repair as a status reader sees it before any daemon serves.
@@ -292,6 +297,7 @@ class ReconciliationStatus(ReconciliationCoverage):
     """
 
     noticed_pending: int
+    keyword_search_state: KeywordSearchState
     keyword_repair_error: str | None
     # The last deferred keyword publication's cause, until a publication or
     # repair succeeds (REQ-FTS-SIDECAR-006).

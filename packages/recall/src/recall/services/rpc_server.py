@@ -32,7 +32,11 @@ import duckdb
 from pydantic import ValidationError
 
 from recall.core.config import AppConfig, create_private_dir
-from recall.core.daemon_status import StorageMaintenanceStatus, WriteAdmissionStatus
+from recall.core.daemon_status import (
+    KeywordSearchState,
+    StorageMaintenanceStatus,
+    WriteAdmissionStatus,
+)
 from recall.core.host_text import HostMessage
 from recall.core.read_cancellation import ReadCancelled
 from recall.core.repair_state import PublicationRole
@@ -3481,17 +3485,33 @@ class RpcServer:
         walked_since_start = all(row["scan_current_process"] for row in coverage["coverage"])
         observed = observation_stable and walked_since_start and noticed_pending == 0
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
-        reconciliation: ReconciliationStatus = {
-            **coverage,
-            "noticed_pending": noticed_pending,
-            "raw_indexing_ready": raw_indexing_ready,
-            "keyword_search_ready": coverage["keyword_search_ready"]
-            and observed
+        keyword_coverage_sound = (
+            coverage["catalog_scan_complete"]
+            and walked_since_start
             and not self._keyword_dirty
             and self._fts_repair_error is None
             and self._keyword_read_gate.error is None
             and not self._keyword_sync_owed
-            and not self._keyword_startup_failed,
+            and not self._keyword_startup_failed
+        )
+        # With sound coverage, what is left is writes the watcher reported but
+        # the daemon has not observed, or rows awaiting keyword publication.
+        keyword_writes_settled = (
+            observation_stable and noticed_pending == 0 and coverage["keyword_search_ready"]
+        )
+        keyword_search_state: KeywordSearchState
+        if not keyword_coverage_sound:
+            keyword_search_state = "unready"
+        elif keyword_writes_settled:
+            keyword_search_state = "ready"
+        else:
+            keyword_search_state = "recent_writes"
+        reconciliation: ReconciliationStatus = {
+            **coverage,
+            "noticed_pending": noticed_pending,
+            "raw_indexing_ready": raw_indexing_ready,
+            "keyword_search_ready": keyword_search_state == "ready",
+            "keyword_search_state": keyword_search_state,
             "keyword_repair_error": self._fts_repair_error
             or _optional_text(self._keyword_read_gate.error),
             "keyword_publish_error": _optional_text(self._keyword_gate.error),
