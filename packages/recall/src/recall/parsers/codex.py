@@ -360,8 +360,11 @@ class CodexParser:
                         metadata.source_session_id,
                     ):
                         continue
+                    # Lineage is elected once, by the meta that names the
+                    # rollout's own thread; a later meta never relinks it.
+                    if metadata.source_session_id is None and isinstance(meta_id, str) and meta_id:
+                        metadata.lineage = _subagent_lineage(payload)
                     metadata.source_session_id = meta_id or metadata.source_session_id
-                    metadata.lineage = metadata.lineage or _subagent_lineage(payload)
                     metadata.cwd = payload.get("cwd") or metadata.cwd
                     git_raw = payload.get("git")
                     git_info = git_raw if isinstance(git_raw, dict) else {}

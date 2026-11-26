@@ -175,6 +175,12 @@ class _ParentResponse:
     awaiting: bool = False
     response_id: str | None = None
 
+    # WAIVER(each response counted exactly once across indexed sessions): a fork
+    # indexed while its parent transcript is not omits the copied response, which
+    # then counts nowhere. Holding it needs a usage ledger keyed by spawn tree and
+    # matched at rollup time, larger than this rule; the parent sits beside the
+    # fork's subagents/ directory, so it is absent only outside the configured
+    # roots. Debt: removed by a tree-scoped response ledger.
     _STATE_KEY = "fork_parent_response"
 
     @classmethod
@@ -204,7 +210,11 @@ class _ParentResponse:
         if self.awaiting:
             self.awaiting = False
             self.response_id = response_id
-        return response_id is not None and response_id == self.response_id
+        return self.repeats(response_id)
+
+    def repeats(self, response_id: object) -> bool:
+        """Whether `response_id` names the copied parent response."""
+        return isinstance(response_id, str) and response_id == self.response_id
 
 
 def _first_admitted_counter(entry: dict[str, Any], *paths: str | tuple[str, ...]) -> int | None:
@@ -464,7 +474,8 @@ class ClaudeCodeParser:
                                 else max(metadata.ended_at, progress_ts)
                             )
 
-                        usage.add({"message": nested_payload})
+                        if not parent_response.repeats(nested_payload.get("id")):
+                            usage.add({"message": nested_payload})
 
                         message, message_tool_results = _parse_message(
                             message_payload=nested_payload,

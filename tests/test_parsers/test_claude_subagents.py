@@ -94,8 +94,19 @@ def test_root_transcript_has_no_lineage(tmp_path: Path) -> None:
 
 def test_fork_copy_of_parent_response_is_not_counted(tmp_path: Path) -> None:
     path = subagent_path(tmp_path)
-    # A later content block of the copied response repeats its id.
-    path.write_bytes(encoded([*fork_records(), response("copied-block", "msg_parent_spawn", 9)]))
+    # A later content block of the copied response repeats its id, top level or nested.
+    nested = {
+        "type": "progress",
+        "timestamp": "2026-03-15T10:00:09Z",
+        "data": {
+            "type": "agent_progress",
+            "agentId": "inner",
+            "message": response("nested-copy", "msg_parent_spawn", 9),
+        },
+    }
+    path.write_bytes(
+        encoded([*fork_records(), response("copied-block", "msg_parent_spawn", 9), nested])
+    )
 
     session = ClaudeCodeParser(roots=(tmp_path,)).parse(path).session
 
@@ -105,6 +116,7 @@ def test_fork_copy_of_parent_response_is_not_counted(tmp_path: Path) -> None:
         "own-1",
         "own-2",
         "copied-block",
+        "nested-copy",
     ]
 
 

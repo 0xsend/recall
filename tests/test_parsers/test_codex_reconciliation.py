@@ -689,6 +689,15 @@ def test_forked_rollout_carries_parent_thread_lineage(tmp_path: Path) -> None:
     assert without_tree.root_source_session_id == "root"
     assert without_tree.agent_id is None
     assert lineage("root", {"id": "root", "session_id": "root"}) is None
+    # A later meta without an id cannot relink a root rollout.
+    path = tmp_path / "relinked.jsonl"
+    path.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "a", "session_id": "a"}})
+        + "\n"
+        + json.dumps({"type": "session_meta", "payload": {"parent_thread_id": "b"}})
+        + "\n"
+    )
+    assert CodexParser().parse(path).session.lineage is None
     # An unpaired surrogate decodes from JSON but cannot be stored as UTF-8.
     broken = lineage("broken", {"id": "child", "session_id": "\ud800", "parent_thread_id": "p"})
     assert broken is not None
