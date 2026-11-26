@@ -35,6 +35,7 @@ from recall.cli.status_notices import (
 )
 from recall.cli.utils import with_fleet_host
 from recall.core.config import AppConfig
+from recall.core.daemon_status import KeywordSearchState
 from recall.core.search_filters import (
     ROLE_HELP,
     has_filtered_search_params,
@@ -216,6 +217,20 @@ def _acquire_tool_probe(
     return CountedProbe(len(unfiltered), sum(1 for row in unfiltered if row.get("lexical_match")))
 
 
+def _keyword_search_state(reconciliation: Mapping[str, object]) -> KeywordSearchState | None:
+    """Read why keyword search is unready; daemons before the state report only the flag."""
+    match reconciliation.get("keyword_search_state"):
+        case "ready":
+            return "ready"
+        case "recent_writes":
+            return "recent_writes"
+        case "unready":
+            return "unready"
+    if reconciliation.get("keyword_search_ready") is False:
+        return "unready"
+    return None
+
+
 def _emit_search_guidance(
     results: list[dict],
     *,
@@ -227,6 +242,7 @@ def _emit_search_guidance(
     limit: int,
     coverage_note: str | None = None,
     keyword_index_unready: bool = False,
+    keyword_recent_writes: bool = False,
     probe: ToolProbe = NO_PROBE,
 ) -> None:
     """Emit human guidance about search matches and coverage to stderr.
@@ -239,7 +255,8 @@ def _emit_search_guidance(
     on every zero-result branch because a backlog can mean "not indexed yet".
     Known-unready keyword coverage replaces match guidance even with results:
     neither absence nor semantic-only hits establish a lexical miss then
-    (REQ-CLI-019/023).
+    (REQ-CLI-019/023). Writes still being indexed leave older history complete,
+    so they add a note and keep the usual guidance.
     """
 
     def emit_guidance(note: str) -> None:
@@ -251,6 +268,12 @@ def _emit_search_guidance(
             "Retry after keyword_search_ready becomes true in recall daemon status."
         )
         return
+    if keyword_recent_writes:
+        typer.echo(
+            "note: active sessions may be missing their latest messages; "
+            "recent writes are still being indexed.",
+            err=True,
+        )
 
     if not results:
         if tool:
@@ -544,12 +567,12 @@ def command(
     coverage_note = pending_coverage_guidance(status) if not results else None
     reconciliation = status.get("reconciliation") if status is not None else None
     uses_keyword = mode != "vector" or bool(tool)
-    keyword_index_unready = (
-        not fleet
-        and uses_keyword
-        and isinstance(reconciliation, dict)
-        and reconciliation.get("keyword_search_ready") is False
+    keyword_state = (
+        _keyword_search_state(reconciliation)
+        if not fleet and uses_keyword and isinstance(reconciliation, dict)
+        else None
     )
+    keyword_index_unready = keyword_state == "unready"
 
     # REQ-CLI-018/019: stderr guidance for empty or semantic-only results, in
     # every output mode (runs before the structured early-return below).
@@ -577,6 +600,7 @@ def command(
         limit=limit,
         coverage_note=coverage_note,
         keyword_index_unready=keyword_index_unready,
+        keyword_recent_writes=keyword_state == "recent_writes",
         probe=probe,
     )
 

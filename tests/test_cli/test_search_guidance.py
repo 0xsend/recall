@@ -400,6 +400,50 @@ def test_search_warns_when_its_keyword_leg_is_unready(
 
 
 @pytest.mark.parametrize("format_args", [["--json"], ["--format", "text"]])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [{"score": 1.0, "lexical_match": False, "snippet": ""}],
+        [{"score": 1.0, "lexical_match": True, "snippet": ""}],
+    ],
+)
+def test_search_notes_recent_writes_and_keeps_its_guidance(
+    tmp_path, monkeypatch, format_args, rows
+) -> None:
+    """Writes still being indexed add a note; older history keeps its usual guidance."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    calls: list = []
+    args = ["search", "bulkneedle", *format_args]
+
+    def invoke(state: str):
+        _record_rpc(
+            monkeypatch,
+            calls,
+            results=rows,
+            status={
+                "reconciliation": {
+                    "keyword_search_ready": state == "ready",
+                    "keyword_search_state": state,
+                }
+            },
+        )
+        return CliRunner().invoke(app, args)
+
+    ready = invoke("ready")
+    recent = invoke("recent_writes")
+
+    assert ready.exit_code == recent.exit_code == 0
+    assert ready.stdout == recent.stdout
+    assert "keyword index is not ready" not in recent.stderr
+    assert recent.stderr == (
+        "note: active sessions may be missing their latest messages; "
+        "recent writes are still being indexed.\n" + ready.stderr
+    )
+
+
+@pytest.mark.parametrize("format_args", [["--json"], ["--format", "text"]])
 def test_search_unready_notice_obeys_status_opt_out(tmp_path, monkeypatch, format_args) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))

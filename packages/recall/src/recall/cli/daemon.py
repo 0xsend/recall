@@ -1433,6 +1433,7 @@ def _unreached_reconciliation(page: SourcePage | None) -> dict[str, object]:
         "live_observation_ready": False,
         "raw_indexing_ready": False,
         "keyword_search_ready": False,
+        "keyword_search_state": "unready",
         "enrichment_ready": False,
         "coverage": None,
         "source_page": page["source_page"] if page is not None else [],

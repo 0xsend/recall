@@ -331,6 +331,8 @@ def test_unresolvable_configured_roots_keep_diagnostics_and_prior_membership(
         failed = asyncio.run(scan())
         assert failed["raw_indexing_ready"] is False
         assert failed["keyword_search_ready"] is False
+        # A root that cannot be scanned is incomplete coverage, not recent writes.
+        assert failed["keyword_search_state"] == "unready"
         for root in roots:
             coverage = next(
                 row for row in failed["coverage"] if row["root_path"] == str(root.absolute())
