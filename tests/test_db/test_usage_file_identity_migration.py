@@ -26,7 +26,10 @@ def _legacy(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConne
         )
     conn.execute("INSERT INTO schema_version(version) VALUES (35)")
     conn.execute("INSERT INTO usage_log_cursors VALUES ('/log', 123, 456, 'tail', '2026-10-27')")
-    conn.execute("INSERT INTO sessions VALUES ('s1', 'grok', '/chat', 'sid')")
+    conn.execute(
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES ('s1', 'grok', '/chat', 'sid')"
+    )
     conn.execute(
         "INSERT INTO usage_events(id, source, source_session_id, prompt_tokens, harvested_at) "
         "VALUES ('e1', 'grok', 'sid', 17, '2026-10-27')"

@@ -18,6 +18,7 @@ from recall.core.models import (
     ParseDiagnostic,
     ParseResult,
     Session,
+    SessionLineage,
     StopMarker,
     TailFacts,
     ToolCall,
@@ -359,6 +360,10 @@ class CodexParser:
                         metadata.source_session_id,
                     ):
                         continue
+                    # Lineage is elected once, by the meta that names the
+                    # rollout's own thread; a later meta never relinks it.
+                    if metadata.source_session_id is None and isinstance(meta_id, str) and meta_id:
+                        metadata.lineage = _subagent_lineage(payload)
                     metadata.source_session_id = meta_id or metadata.source_session_id
                     metadata.cwd = payload.get("cwd") or metadata.cwd
                     git_raw = payload.get("git")
@@ -780,6 +785,37 @@ class CodexParser:
             reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
         )
+
+
+def _subagent_lineage(meta: dict[str, Any]) -> SessionLineage | None:
+    """A subagent rollout names its parent thread in its own meta (REQ-PARSE-046).
+
+    ``session_id`` names the tree's root thread at every spawn depth, while
+    ``parent_thread_id`` names the immediate parent; a depth-one spawn has both
+    equal. The root is the link, so a nested spawn files under the same session.
+    """
+    own_id = meta.get("id")
+    parent = meta.get("parent_thread_id")
+    if not isinstance(parent, str) or not parent or parent == own_id:
+        return None
+    root = meta.get("session_id")
+    if not isinstance(root, str) or not root or root == own_id:
+        root = parent
+    source = meta.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    spawn = spawn if isinstance(spawn, dict) else {}
+
+    def text(key: str) -> str | None:
+        value = spawn.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return SessionLineage(
+        root_source_session_id=root,
+        agent_id=text("agent_path"),
+        agent_type=text("agent_role"),
+        agent_description=text("agent_nickname"),
+    )
 
 
 def _reasoning_text(payload: dict[str, Any]) -> str:

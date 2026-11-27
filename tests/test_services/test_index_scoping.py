@@ -36,7 +36,8 @@ def _conn() -> duckdb.DuckDBPyConnection:
     conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
     conn.execute(
-        "INSERT INTO sessions VALUES "
+        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+        " VALUES "
         "('old', 'claude_code', '/s/old.jsonl', NULL), "
         "('recent', 'claude_code', '/s/recent.jsonl', NULL), "
         "('other-source', 'codex', '/s/recent.jsonl', NULL)"

@@ -56,7 +56,7 @@ def test_migration_0042_upgrades_schema_41_preserving_historical_totals_and_repl
     _schema_41_db(path)
     with duckdb.connect(str(path)) as conn:
         ensure_schema(conn)
-        assert get_schema_version(conn) == SCHEMA_VERSION == 43
+        assert get_schema_version(conn) == SCHEMA_VERSION == 44
         assert conn.execute(
             "SELECT migration_id FROM schema_migrations WHERE migration_id = ?",
             ["0042_claude_response_usage"],

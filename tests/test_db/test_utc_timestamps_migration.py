@@ -158,7 +158,7 @@ def test_migration_0043_converts_operational_tables_records_undo_and_reverses_un
         ensure_schema(conn)
         after_utc = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=5)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION == 43
+        assert get_schema_version(conn) == SCHEMA_VERSION == 44
         assert INDEX_MIGRATION_VERSION == 2
         assert applied_version(conn) == 1
         assert is_eligible(conn) is True
@@ -373,7 +373,7 @@ def test_migration_0043_is_zero_row_noop_on_utc_host(
     with duckdb.connect(str(path)) as conn:
         conn.execute("SET TimeZone = 'UTC'")
         ensure_schema(conn)
-        assert get_schema_version(conn) == SCHEMA_VERSION == 43
+        assert get_schema_version(conn) == SCHEMA_VERSION == 44
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migration_undo WHERE migration_id = '0043_utc_timestamps'"
         ).fetchone() == (0,)
@@ -432,7 +432,9 @@ def test_migration_0043_refuses_pre_42_and_damaged_fence(
         )
 
 
-def test_rollback_migration_accepts_schema_43_and_refuses_schema_42(tmp_path: Path) -> None:
+def test_rollback_migration_accepts_the_current_schema_and_refuses_an_older_one(
+    tmp_path: Path,
+) -> None:
     data = tmp_path / "data"
     data.mkdir()
     config = _config(data, None)
@@ -446,18 +448,19 @@ def test_rollback_migration_accepts_schema_43_and_refuses_schema_42(tmp_path: Pa
         sidecar.commit()
     assert job.backup_path is not None
 
-    # A schema-42 backup cannot be installed into a schema-43 DB (no logical downgrade).
+    # An older backup cannot be installed into a current DB (no logical downgrade).
+    older = SCHEMA_VERSION - 1
     with duckdb.connect(str(Path(job.backup_path) / "recall.duckdb")) as backup:
-        backup.execute("DELETE FROM schema_version WHERE version > 42")
-        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (42)")
+        backup.execute("DELETE FROM schema_version WHERE version > ?", [older])
+        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (?)", [older])
     before = config.db_path.read_bytes()
     with pytest.raises(RuntimeError, match="cannot lower the logical schema"):
         rollback_migration(config, preserve=tmp_path / "preserve_bad")
     assert config.db_path.read_bytes() == before
 
-    # Restoring the backup to schema 43 succeeds cleanly.
+    # Restoring the backup at the current schema succeeds cleanly.
     with duckdb.connect(str(Path(job.backup_path) / "recall.duckdb")) as backup:
-        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (43)")
+        backup.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (?)", [SCHEMA_VERSION])
     restored = rollback_migration(config, preserve=tmp_path / "preserve_ok")
     assert restored.exists()
     assert (config.data_dir / "daemon-refused").exists()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from recall.core.models import SessionLineage
 from recall.parsers.codex import CodexParser
 
 
@@ -656,3 +657,48 @@ def test_forked_rollout_keeps_its_own_identity_over_the_embedded_parent_meta(
 
     assert session.source_session_id == "child"
     assert session.cwd == "/work/child"
+
+
+def test_forked_rollout_carries_parent_thread_lineage(tmp_path: Path) -> None:
+    """REQ-PARSE-046: a spawned rollout links to its tree's root thread at any depth."""
+    spawn = {"agent_path": "/root/reviewer", "agent_role": "reviewer", "agent_nickname": "Ada"}
+
+    def lineage(name: str, meta: dict) -> SessionLineage | None:
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
+        return CodexParser().parse(path).session.lineage
+
+    nested = lineage(
+        "nested",
+        {
+            "id": "grandchild",
+            "session_id": "root",
+            "parent_thread_id": "child",
+            "source": {"subagent": {"thread_spawn": {**spawn, "depth": 2}}},
+        },
+    )
+    assert nested is not None
+    assert nested.model_dump() == {
+        "root_source_session_id": "root",
+        "agent_id": "/root/reviewer",
+        "agent_type": "reviewer",
+        "agent_description": "Ada",
+    }
+    without_tree = lineage("child", {"id": "child", "parent_thread_id": "root"})
+    assert without_tree is not None
+    assert without_tree.root_source_session_id == "root"
+    assert without_tree.agent_id is None
+    assert lineage("root", {"id": "root", "session_id": "root"}) is None
+    # A later meta without an id cannot relink a root rollout.
+    path = tmp_path / "relinked.jsonl"
+    path.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "a", "session_id": "a"}})
+        + "\n"
+        + json.dumps({"type": "session_meta", "payload": {"parent_thread_id": "b"}})
+        + "\n"
+    )
+    assert CodexParser().parse(path).session.lineage is None
+    # An unpaired surrogate decodes from JSON but cannot be stored as UTF-8.
+    broken = lineage("broken", {"id": "child", "session_id": "\ud800", "parent_thread_id": "p"})
+    assert broken is not None
+    assert broken.root_source_session_id.encode() == "\ufffd".encode()

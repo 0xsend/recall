@@ -40,6 +40,39 @@ AgentText = Annotated[str, BeforeValidator(_scrub_lone_surrogates)]
 OptionalAgentText = Annotated[str | None, BeforeValidator(_scrub_lone_surrogates)]
 
 
+# A listing names at most this many linked sessions per root; `subagent_count`
+# is the total.
+SUBAGENTS_LISTED_MAX = 1000
+
+
+class SessionLineage(BaseModel):
+    """Where a subagent's transcript sits in its spawn tree (REQ-PARSE-046).
+
+    The root session is named by its source session id, never its recall id:
+    readers resolve it at read time, so the link survives the root being
+    indexed later, moved, or absent (REQ-SCHEMA-007).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root_source_session_id: AgentText
+    agent_id: OptionalAgentText = None
+    agent_type: OptionalAgentText = None
+    agent_description: OptionalAgentText = None
+
+
+@dataclass(frozen=True)
+class SubagentSummary:
+    """One linked session under a root, as `show` lists it (REQ-CLI-031)."""
+
+    id: str
+    agent_id: str | None
+    agent_type: str | None
+    agent_description: str | None
+    started_at: datetime | None
+    message_count: int
+
+
 @dataclass(frozen=True)
 class SessionSummary:
     id: str
@@ -64,6 +97,11 @@ class SessionSummary:
     # mtime, so a session still being written outranks its last parsed row.
     last_activity_at: datetime
     host: str = UNATTRIBUTED_HOST
+    # REQ-CLI-031: a linked session's lineage and resolved root; a root row
+    # counts its linked sessions.
+    lineage: SessionLineage | None = None
+    root_session_id: str | None = None
+    subagent_count: int = 0
 
 
 class ToolCall(BaseModel):
@@ -147,6 +185,7 @@ class SessionMetadata(BaseModel):
     cwd: str | None = None
     git_repo: str | None = None
     git_branch: str | None = None
+    lineage: SessionLineage | None = None
 
 
 class Session(SessionMetadata):

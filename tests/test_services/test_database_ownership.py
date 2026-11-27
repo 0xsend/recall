@@ -95,7 +95,8 @@ def test_startup_status_cannot_create_or_displace_owner(
     if populated:
         with connect(config) as conn:
             conn.execute(
-                "INSERT INTO sessions VALUES ('persisted', 'codex', '/fixture/session', NULL)"
+                "INSERT INTO sessions (id, source, source_path, source_session_id)"
+                " VALUES ('persisted', 'codex', '/fixture/session', NULL)"
             )
             conn.execute("UPDATE runtime_state SET last_failure_message = 'persisted failure'")
         offline = daemon_status(config)

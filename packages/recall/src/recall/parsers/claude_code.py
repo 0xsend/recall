@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +21,7 @@ from recall.core.models import (
     ParseDiagnostic,
     ParseResult,
     Session,
+    SessionLineage,
     StopMarker,
     TailFacts,
     ToolCall,
@@ -98,6 +100,131 @@ _KNOWN_RECORD_TYPES = frozenset(
 # harness-injected context the adapter does not index (REQ-PARSE-033). These
 # records are routed away before any message, tool or token normalization.
 _REQUEST_LOG_RECORD_TYPES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
+
+# Subagent transcripts live at <project>/<parent sessionId>/subagents/agent-<id>.jsonl
+# beside agent-<id>.meta.json (REQ-PARSE-046).
+_SUBAGENT_DIRECTORY = "subagents"
+_AGENT_FILE_PREFIX = "agent-"
+_TRANSCRIPT_SUFFIX = ".jsonl"
+_AGENT_META_SUFFIX = ".meta.json"
+# Observed meta files are under 1 KiB; anything larger is not one.
+_AGENT_META_BYTES_MAX = 64 * 1024
+_FORK_CONTEXT_RECORD_TYPE = "fork-context-ref"
+
+
+def _subagent_agent_id(path: Path) -> str | None:
+    """The agent id a subagent transcript's path names, else None for a root transcript."""
+    name = path.name
+    if (
+        path.parent.name != _SUBAGENT_DIRECTORY
+        or not name.startswith(_AGENT_FILE_PREFIX)
+        or not name.endswith(_TRANSCRIPT_SUFFIX)
+    ):
+        return None
+    agent_id = name[len(_AGENT_FILE_PREFIX) : -len(_TRANSCRIPT_SUFFIX)]
+    return agent_id or None
+
+
+def _agent_meta_path(path: Path, agent_id: str) -> Path:
+    return path.with_name(f"{_AGENT_FILE_PREFIX}{agent_id}{_AGENT_META_SUFFIX}")
+
+
+def _read_agent_meta(path: Path) -> dict[str, Any]:
+    """The meta object, or empty when it cannot be one; the file is optional enrichment."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_AGENT_META_BYTES_MAX + 1)
+    except OSError:
+        return {}
+    if len(raw) > _AGENT_META_BYTES_MAX:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        # Deep nesting exhausts the decoder's recursion; it is not a meta object.
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _subagent_lineage(path: Path) -> SessionLineage | None:
+    agent_id = _subagent_agent_id(path)
+    if agent_id is None:
+        return None
+    meta = _read_agent_meta(_agent_meta_path(path, agent_id))
+    agent_type = meta.get("agentType")
+    description = meta.get("description")
+    return SessionLineage(
+        root_source_session_id=path.parent.parent.name,
+        agent_id=agent_id,
+        agent_type=agent_type if isinstance(agent_type, str) else None,
+        agent_description=description if isinstance(description, str) else None,
+    )
+
+
+@dataclass
+class _ParentResponse:
+    """The parent's spawning response a fork transcript repeats (REQ-PARSE-047).
+
+    A fork's first record is `fork-context-ref`, and the record after it repeats
+    the parent's response that spawned the fork. The parent transcript counts
+    that response, so every record carrying its id adds no usage here.
+    `awaiting` holds between the two records, and `opened` once any record has
+    been seen; both cross a checkpoint, since a byte offset past blank lines
+    does not mean a record was seen.
+    """
+
+    opened: bool = False
+    awaiting: bool = False
+    response_id: str | None = None
+
+    # WAIVER(each response counted exactly once across indexed sessions): a fork
+    # indexed while its parent transcript is not omits the copied response, which
+    # then counts nowhere. Holding it needs a usage ledger keyed by spawn tree and
+    # matched at rollup time, larger than this rule; the parent sits beside the
+    # fork's subagents/ directory, so it is absent only outside the configured
+    # roots. Debt: removed by a tree-scoped response ledger.
+    _STATE_KEY = "fork_parent_response"
+
+    @classmethod
+    def resume(cls, state: Mapping[str, Any], *, offset: int) -> _ParentResponse:
+        if offset == 0:
+            return cls()
+        raw = state.get(cls._STATE_KEY)
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"opened", "awaiting", "response_id"}
+            or not isinstance(raw["opened"], bool)
+            or not isinstance(raw["awaiting"], bool)
+            or not (raw["response_id"] is None or isinstance(raw["response_id"], str))
+        ):
+            raise UnsupportedResumeState("unsupported Claude fork parent response")
+        return cls(raw["opened"], raw["awaiting"], raw["response_id"])
+
+    def state(self) -> dict[str, Any]:
+        return {
+            self._STATE_KEY: {
+                "opened": self.opened,
+                "awaiting": self.awaiting,
+                "response_id": self.response_id,
+            }
+        }
+
+    def owns(self, entry: dict[str, Any], *, fork_capable: bool) -> bool:
+        """Whether `entry`'s usage belongs to the parent transcript."""
+        response_id = first_of(entry, ("message", "id"))
+        response_id = response_id if isinstance(response_id, str) else None
+        if not self.opened:
+            self.opened = True
+            self.awaiting = fork_capable and entry.get("type") == _FORK_CONTEXT_RECORD_TYPE
+            return False
+        if self.awaiting:
+            self.awaiting = False
+            self.response_id = response_id
+        return self.repeats(response_id)
+
+    def repeats(self, response_id: object) -> bool:
+        """Whether `response_id` names the copied parent response."""
+        return isinstance(response_id, str) and response_id == self.response_id
 
 
 def _first_admitted_counter(entry: dict[str, Any], *paths: str | tuple[str, ...]) -> int | None:
@@ -205,8 +332,9 @@ class ClaudeCodeParser:
         return default_discover(self)
 
     def sidecar_paths(self, path: Path) -> list[Path]:
-        """No sidecars: all metadata comes from the session file itself."""
-        return []
+        """A subagent transcript's meta file; a root transcript has none."""
+        agent_id = _subagent_agent_id(path)
+        return [] if agent_id is None else [_agent_meta_path(path, agent_id)]
 
     def live_candidates(self, *, now: datetime, idle_threshold: float) -> list[Path]:
         return default_live_candidates(self, now=now, idle_threshold=idle_threshold)
@@ -221,8 +349,14 @@ class ClaudeCodeParser:
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
     ) -> ParseResult:
-        state = read_resume_state(resume_state, offset=offset, supported=frozenset({"usage_scope"}))
+        state = read_resume_state(
+            resume_state,
+            offset=offset,
+            supported=frozenset({"usage_scope", "fork_parent_response"}),
+        )
         scope_token = _usage_scope(state, offset=offset)
+        parent_response = _ParentResponse.resume(state, offset=offset)
+        fork_capable = _subagent_agent_id(path) is not None
         usage = _ResponseUsage()
         metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
@@ -247,7 +381,10 @@ class ClaudeCodeParser:
                     capture,
                     diagnostics=diagnostics,
                     metadata=metadata,
-                    adapter_state={"usage_scope": {"format": 1, "token": scope_token}},
+                    adapter_state={
+                        "usage_scope": {"format": 1, "token": scope_token},
+                        **parent_response.state(),
+                    },
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(),
                     message_idx_base=message_idx_base + len(messages),
@@ -265,6 +402,7 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
+                owned_by_parent = parent_response.owns(entry, fork_capable=fork_capable)
                 if record_type == "session-owner":
                     # Ownership metadata cannot establish conversation identity
                     # or contribute any session, usage or conversation fields.
@@ -311,7 +449,8 @@ class ClaudeCodeParser:
                 if metadata.source_session_id is None:
                     metadata.source_session_id = first_of(entry, "sessionId")
 
-                usage.add(entry)
+                if not owned_by_parent:
+                    usage.add(entry)
 
                 # -- Subagent progress: extract nested messages with agent_id --
                 # Progress entries have a top-level `message` key containing
@@ -341,7 +480,8 @@ class ClaudeCodeParser:
                                 else max(metadata.ended_at, progress_ts)
                             )
 
-                        usage.add({"message": nested_payload})
+                        if not parent_response.repeats(nested_payload.get("id")):
+                            usage.add({"message": nested_payload})
 
                         message, message_tool_results = _parse_message(
                             message_payload=nested_payload,
@@ -406,6 +546,7 @@ class ClaudeCodeParser:
             published.git_repo = published.cwd
 
         published.source_session_id = metadata.source_session_id or path.stem
+        published.lineage = _subagent_lineage(path)
 
         message_count = len(messages)
         tool_count = len(tool_calls)

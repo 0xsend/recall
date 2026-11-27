@@ -14,6 +14,7 @@ from recall.core.types import Source, default_session_host
 from recall.db.lease import DbLease
 from recall.db.ownership import standalone_read_lease
 from recall.parsers.skills import derive_skill_names, is_skill_candidate
+from recall.services.lineage_sql import lineage_sql
 
 DEFAULT_TOOL_STATS_LIMIT = 50
 DEFAULT_BASH_STATS_LIMIT = 100
@@ -612,6 +613,7 @@ def _usage_by_source(
     has_host = _column_exists(conn, "session_state", "host")
     has_cached = _column_exists(conn, "session_state", "cached_input_tokens")
     host_expr = "ss.host" if has_host else "CAST(NULL AS VARCHAR)"
+    lineage_root = lineage_sql(conn).root
     # SUM ignores NULLs; all-NULL → NULL (unknown cache). Do not COALESCE to 0
     # before SUM — that invents zero-cache for Claude/Kimi (REQ-USAGE-021).
     cached_expr = "SUM(ss.cached_input_tokens)" if has_cached else "CAST(NULL AS BIGINT)"
@@ -635,7 +637,10 @@ def _usage_by_source(
             SUM(COALESCE(ss.input_tokens, 0)) AS input_tokens,
             {cached_expr} AS cached_input_tokens,
             SUM(COALESCE(ss.output_tokens, 0)) AS output_tokens,
-            COUNT(*) AS session_count
+            -- One per spawn tree: a root and its linked sessions share the key
+            -- (REQ-CLI-031); tokens still sum over every session.
+            COUNT(DISTINCT COALESCE({lineage_root}, s.source_session_id, s.id))
+                AS session_count
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         WHERE {where_sql}

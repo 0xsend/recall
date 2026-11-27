@@ -18,7 +18,7 @@ from .migrations import run_pending_migrations_on
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 43
+SCHEMA_VERSION = 44
 INDEX_MIGRATION_VERSION = 2
 
 

@@ -53,6 +53,8 @@ class ListParams(Params):
     project: str | None = None
     host: str | None = None
     limit: int = 50
+    # Include sessions linked under an indexed root (REQ-CLI-031).
+    subagents: bool = False
 
 
 class ListBySessionParams(ListParams):

@@ -183,7 +183,10 @@ print('reader-closed', flush=True)
         async def tick():
             async with daemon_ownership(index.db_path):
                 with connect(index) as conn:
-                    conn.execute("INSERT INTO sessions VALUES ('next', 'codex', '/next', NULL)")
+                    conn.execute(
+                        "INSERT INTO sessions (id, source, source_path, source_session_id)"
+                        " VALUES ('next', 'codex', '/next', NULL)"
+                    )
 
         async def run():
             task = asyncio.create_task(tick())

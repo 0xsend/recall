@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from recall.core.host_text import HostValue
+from recall.core.models import SUBAGENTS_LISTED_MAX
 from recall.core.rpc_params import (
     ListParams,
     LiveParams,
@@ -294,6 +295,7 @@ def fleet_list(
     source: str | None = None,
     project: str | None = None,
     limit: int = 50,
+    subagents: bool = False,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetQueryResult:
@@ -301,24 +303,83 @@ def fleet_list(
     for flag, value in (("--since", since), ("--source", source), ("--project", project)):
         if value:
             argv.extend([flag, value])
+    # A host older than REQ-CLI-031 has no `--subagents`; its plain list already
+    # returns every transcript, linked or not.
+    legacy_argv = list(argv) if subagents else None
+    if subagents:
+        argv.append("--subagents")
     raw = _arrays(
         executor,
         FleetOperation(
             "recall.list",
-            ListParams(since=since, source=source, project=project, limit=limit),
+            ListParams(
+                since=since, source=source, project=project, limit=limit, subagents=subagents
+            ),
             argv,
             decode_array,
             local_seconds=timeout,
             remote_seconds=timeout,
+            legacy_remote_argv=legacy_argv,
         ),
         concurrency,
     )
-    merged_rows, merged_endpoints = _merge_with_endpoints(
-        raw.rows, raw.endpoints, key=_recency_key, limit=limit
-    )
+    if subagents:
+        merged_rows, merged_endpoints = _merge_session_trees(raw.rows, raw.endpoints, limit=limit)
+    else:
+        merged_rows, merged_endpoints = _merge_with_endpoints(
+            raw.rows, raw.endpoints, key=_recency_key, limit=limit
+        )
     return FleetQueryResult(
         merged_rows, raw.errors, raw.hosts_ok, raw.hosts_failed, endpoints=merged_endpoints
     )
+
+
+@dataclass
+class _PeerTree:
+    """One peer's rows for a tree: at most one head and `SUBAGENTS_LISTED_MAX` linked."""
+
+    rows: list[tuple[dict[str, Any], HostValue]] = field(default_factory=list)
+    has_head: bool = False
+    linked_count: int = 0
+
+    def add(self, row: dict[str, Any], endpoint: HostValue) -> None:
+        if row.get("root_session_id"):
+            if self.linked_count == SUBAGENTS_LISTED_MAX:
+                return
+            self.linked_count += 1
+        else:
+            if self.has_head:
+                return
+            self.has_head = True
+        self.rows.append((row, endpoint))
+
+
+def _merge_session_trees(
+    rows: Sequence[dict[str, Any]],
+    endpoints: Sequence[HostValue],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], tuple[HostValue, ...]]:
+    """Merge list pages so `limit` counts whole session trees (REQ-CLI-031).
+
+    Each endpoint lists a tree's head first; its linked rows name the tree in
+    `root_session_id`. A row without one, including every row from a host
+    that predates lineage, is a tree of its own. A peer's tree is held to the
+    size a conforming peer can send: its head and `SUBAGENTS_LISTED_MAX` rows.
+    """
+    trees: dict[tuple[HostValue, str], _PeerTree] = {}
+    for row, endpoint in zip(rows, endpoints, strict=True):
+        tree_id = row.get("root_session_id") or row.get("id")
+        trees.setdefault((endpoint, str(tree_id)), _PeerTree()).add(row, endpoint)
+    ordered = sorted(
+        (tree.rows for tree in trees.values()),
+        key=lambda tree: _recency_key(tree[0][0]),
+        reverse=True,
+    )
+    if limit > 0:
+        ordered = ordered[:limit]
+    placed = [item for tree in ordered for item in tree]
+    return [row for row, _ in placed], tuple(endpoint for _, endpoint in placed)
 
 
 def _parse_finite_score(value: Any) -> float:

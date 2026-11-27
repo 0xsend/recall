@@ -24,7 +24,10 @@ def test_confirmed_reset_preserves_scores_when_republishing_the_same_corpus(kind
     config = replace(AppConfig.load(), fts=FtsConfig(backend="sqlite_sidecar"))
 
     def seed_canonical(conn):
-        conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/fixture/source', NULL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('s', 'codex', '/fixture/source', NULL)"
+        )
         if kind == "message":
             conn.execute("INSERT INTO messages VALUES ('a','s',0,NULL),('b','s',1,NULL)")
             conn.execute(

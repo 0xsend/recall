@@ -539,6 +539,15 @@ COMMANDS: dict[str, dict[str, Any]] = {
             },
             {"name": "fleet_config", "type": "string"},
             {"name": "limit", "type": "integer", "default": 50},
+            {
+                "name": "subagents",
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Also list subagent sessions whose root session is indexed; by default"
+                    " they are counted in their root's subagent_count."
+                ),
+            },
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
             {"name": "json", "type": "boolean", "default": False},
@@ -755,6 +764,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "file_mtime",
                     "file_size",
                     "indexed_at",
+                    "lineage",
+                    "root_session_id",
+                    "subagent_count",
+                    "subagents",
                     "freshness",
                     "cursor",
                     "cursor_reset",

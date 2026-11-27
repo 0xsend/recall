@@ -220,6 +220,7 @@ def run_fleet_list(
     limit: int,
     fleet_config: str | None,
     fleet_inventory_only: bool = False,
+    subagents: bool = False,
 ) -> tuple[list[dict[str, object]], str | None]:
     from recall.services.fleet_query import fleet_list
 
@@ -230,6 +231,7 @@ def run_fleet_list(
         source=source,
         project=project,
         limit=limit,
+        subagents=subagents,
     )
     _emit_skips(result.errors)
     _require_any_ok(result.hosts_ok, verb="list")

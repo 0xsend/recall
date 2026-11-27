@@ -611,11 +611,31 @@ def _normalize_session_identity(
 
 
 def _publish_session_binding(conn: duckdb.DuckDBPyConnection, session: Session) -> None:
-    """Transfer catalog ownership inside the content transaction."""
+    """Transfer catalog ownership and publish lineage inside the content transaction."""
     conn.execute(
         "UPDATE source_files SET session_id = ? WHERE source = ? AND source_path = ?"
         " AND session_id IS DISTINCT FROM ?",
         [session.id, session.source.value, session.source_path, session.id],
+    )
+    lineage = session.lineage
+    values = (
+        (None, None, None, None)
+        if lineage is None
+        else (
+            lineage.root_source_session_id,
+            lineage.agent_id,
+            lineage.agent_type,
+            lineage.agent_description,
+        )
+    )
+    # Only a changed lineage rewrites the identity row (REQ-SCHEMA-007).
+    conn.execute(
+        """UPDATE sessions SET root_source_session_id = ?, agent_id = ?,
+               agent_type = ?, agent_description = ?
+           WHERE id = ? AND (root_source_session_id IS DISTINCT FROM ?
+               OR agent_id IS DISTINCT FROM ? OR agent_type IS DISTINCT FROM ?
+               OR agent_description IS DISTINCT FROM ?)""",
+        [*values, session.id, *values],
     )
 
 

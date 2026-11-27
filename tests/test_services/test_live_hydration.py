@@ -22,7 +22,11 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
         for name, path in paths.items():
             path.write_text("transcript\n")
             stat = path.stat()
-            conn.execute("INSERT INTO sessions VALUES (?, 'codex', ?, ?)", [name, str(path), name])
+            conn.execute(
+                "INSERT INTO sessions (id, source, source_path, source_session_id)"
+                " VALUES (?, 'codex', ?, ?)",
+                [name, str(path), name],
+            )
             conn.execute(
                 "INSERT INTO session_state (session_id, file_mtime, file_size) VALUES (?, ?, ?)",
                 [name, stat.st_mtime, stat.st_size],
@@ -120,7 +124,11 @@ def test_live_tail_keeps_main_thread_text_when_newer_message_state_is_missing(
     path.write_text("transcript\n")
     with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
-        conn.execute("INSERT INTO sessions VALUES ('tail', 'codex', ?, 'tail')", [str(path)])
+        conn.execute(
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('tail', 'codex', ?, 'tail')",
+            [str(path)],
+        )
         conn.execute(
             "INSERT INTO session_state (session_id, file_mtime, file_size) VALUES ('tail', ?, ?)",
             [path.stat().st_mtime, path.stat().st_size],

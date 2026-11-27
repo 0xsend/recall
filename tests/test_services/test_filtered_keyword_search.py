@@ -191,7 +191,8 @@ def test_filtered_paging_and_candidate_ranking_agree(
     sidecar = open_sidecar(sidecar_path(tmp_path))
     try:
         conn.execute(
-            "INSERT INTO sessions VALUES ('eligible', 'claude_code', '/eligible', NULL), "
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('eligible', 'claude_code', '/eligible', NULL), "
             "('outside', 'codex', '/outside', NULL)"
         )
         # Identical documents tie. Stale and outside hits precede the eligible

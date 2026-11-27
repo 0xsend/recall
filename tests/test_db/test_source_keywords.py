@@ -12,7 +12,8 @@ def test_membership_uses_canonical_binding_and_leaves_duplicate_intents_intact()
     with duckdb.connect() as conn:
         ensure_schema(conn)
         conn.execute(
-            "INSERT INTO sessions VALUES ('bound','codex','/canonical/moved.jsonl',NULL), "
+            "INSERT INTO sessions (id, source, source_path, source_session_id)"
+            " VALUES ('bound','codex','/canonical/moved.jsonl',NULL), "
             "('outside','codex','/canonical/outside.jsonl',NULL)"
         )
         conn.execute("INSERT INTO messages VALUES ('message','bound',0,NULL)")
