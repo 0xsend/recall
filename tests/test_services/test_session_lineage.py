@@ -123,6 +123,23 @@ def test_a_tree_orders_by_its_root_when_filters_leave_the_root_out(indexed) -> N
     assert [row.id for row in rows] == [ids["agent-lost1"]]
 
 
+def test_a_root_without_a_start_time_lists_its_tree_once(indexed) -> None:
+    conn, config = indexed
+    ids = _ids(conn)
+    conn.execute("UPDATE session_state SET started_at = NULL WHERE session_id = ?", [ids[ROOT_SID]])
+    rows = list_sessions(
+        source=None,
+        since=None,
+        project=None,
+        session=ROOT_SID,
+        subagents=True,
+        limit=2,
+        config=config,
+        conn=conn,
+    )
+    assert [row.id for row in rows] == [ids[ROOT_SID], ids["agent-explore1"], ids["agent-plan1"]]
+
+
 def test_a_selected_session_lists_with_its_subagents(indexed) -> None:
     conn, config = indexed
     ids = _ids(conn)

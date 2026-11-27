@@ -6,6 +6,7 @@ import json
 
 import pytest
 from recall.core.fleet import FleetHost
+from recall.core.models import SUBAGENTS_LISTED_MAX
 from recall.services.fleet_query import (
     fleet_list,
     fleet_live,
@@ -364,3 +365,30 @@ def test_fleet_list_subagents_keeps_each_tree_whole(monkeypatch: pytest.MonkeyPa
 
     assert listed(1) == ["newer-root"]
     assert listed(2) == ["newer-root", "older-root", "older-child-1", "older-child-2"]
+
+
+def test_fleet_list_holds_a_peer_to_its_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-CLI-031: tree membership from a peer never lifts the row limits."""
+    hosts = (FleetHost(name="peer", ssh="peer"),)
+    page: list[dict[str, object]] = [
+        {"id": "root", "source": "claude_code", "started_at": "2026-11-20T10:00:00Z"}
+    ]
+    page += [
+        {
+            "id": f"child-{index}",
+            "source": "claude_code",
+            "started_at": "2026-11-20T11:00:00Z",
+            "root_session_id": "root",
+        }
+        for index in range(SUBAGENTS_LISTED_MAX + 1)
+    ]
+
+    def fake_run(host: FleetHost, remote_argv: list[str], **_k: object) -> FleetRemoteResult:
+        return FleetRemoteResult(ok=True, stdout=json.dumps(page), stderr="", returncode=0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    plain = fleet_list(inventory_executor(hosts), limit=1)
+    assert len(plain.rows) == 1
+    trees = fleet_list(inventory_executor(hosts), limit=1, subagents=True)
+    assert len(trees.rows) == 1 + SUBAGENTS_LISTED_MAX
+    assert trees.rows[0]["id"] == "root"

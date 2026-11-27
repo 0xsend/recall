@@ -40,6 +40,11 @@ AgentText = Annotated[str, BeforeValidator(_scrub_lone_surrogates)]
 OptionalAgentText = Annotated[str | None, BeforeValidator(_scrub_lone_surrogates)]
 
 
+# A listing names at most this many linked sessions per root; `subagent_count`
+# is the total.
+SUBAGENTS_LISTED_MAX = 1000
+
+
 class SessionLineage(BaseModel):
     """Where a subagent's transcript sits in its spawn tree (REQ-PARSE-046).
 

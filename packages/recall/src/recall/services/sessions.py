@@ -9,6 +9,7 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.models import (
+    SUBAGENTS_LISTED_MAX,
     Message,
     Session,
     SessionLineage,
@@ -32,10 +33,6 @@ def _session_host_label(raw: object) -> str:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return UNATTRIBUTED_HOST
-
-
-# `show` lists at most this many linked sessions; `subagent_count` is the total.
-SUBAGENTS_LISTED_MAX = 1000
 
 
 def lineage_from_row(values: tuple[Any, ...]) -> SessionLineage | None:
@@ -168,8 +165,10 @@ def _list_sessions(
                    {lineage.agent_description} AS lineage_agent_description,
                    r.root_id, COALESCE(c.subagent_count, 0) AS subagent_count,
                    COALESCE(r.root_id, s.id) AS tree_id, r.root_id IS NOT NULL AS is_linked,
-                   COALESCE(rs.started_at, ss.started_at) AS tree_started_at,
-                   COALESCE(rs.indexed_at, ss.indexed_at) AS tree_indexed_at
+                   CASE WHEN r.root_id IS NULL THEN ss.started_at ELSE rs.started_at END
+                     AS tree_started_at,
+                   CASE WHEN r.root_id IS NULL THEN ss.indexed_at ELSE rs.indexed_at END
+                     AS tree_indexed_at
             FROM sessions s
             JOIN session_state ss ON ss.session_id = s.id
             LEFT JOIN lineage_roots r
@@ -182,8 +181,12 @@ def _list_sessions(
             {where_clause}
         ),
         trees AS (
-            SELECT DISTINCT tree_id, tree_started_at, tree_indexed_at
+            -- Every row of a tree carries its root's values, so the aggregates
+            -- only collapse the tree to one row.
+            SELECT tree_id, MAX(tree_started_at) AS tree_started_at,
+                   MAX(tree_indexed_at) AS tree_indexed_at
             FROM matched
+            GROUP BY tree_id
             ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id
             LIMIT {limit}
         ),
