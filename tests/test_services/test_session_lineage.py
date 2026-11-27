@@ -98,23 +98,50 @@ def test_a_selected_session_lists_with_its_subagents(indexed) -> None:
     conn, config = indexed
     ids = _ids(conn)
 
-    def listed(session: str, *, subagents: bool) -> set[str]:
+    def listed(session: str, *, subagents: bool, limit: int = 50) -> list[str]:
         rows = list_sessions(
             source=None,
             since=None,
             project=None,
             session=session,
             subagents=subagents,
+            limit=limit,
             config=config,
             conn=conn,
         )
-        return {row.id for row in rows}
+        return [row.id for row in rows]
 
-    tree = {ids[ROOT_SID], ids["agent-explore1"], ids["agent-plan1"]}
+    tree = [ids[ROOT_SID], ids["agent-explore1"], ids["agent-plan1"]]
     assert listed(ROOT_SID, subagents=True) == tree
-    assert listed(ids[ROOT_SID], subagents=True) == tree
-    assert listed(ROOT_SID, subagents=False) == {ids[ROOT_SID]}
-    assert listed(ids["agent-plan1"], subagents=True) == {ids["agent-plan1"]}
+    assert listed(ids[ROOT_SID], subagents=True, limit=1) == tree
+    assert listed(ROOT_SID, subagents=False) == [ids[ROOT_SID]]
+    assert listed(ids["agent-plan1"], subagents=True) == [ids["agent-plan1"]]
+
+
+def test_the_limit_counts_whole_session_trees(indexed) -> None:
+    conn, config = indexed
+    ids = _ids(conn)
+
+    def listed(limit: int) -> list[str]:
+        rows = list_sessions(
+            source=None,
+            since=None,
+            project=None,
+            subagents=True,
+            limit=limit,
+            config=config,
+            conn=conn,
+        )
+        return [row.id for row in rows]
+
+    # The orphan started last, so its tree comes first; the root's tree follows whole.
+    assert listed(1) == [ids["agent-lost1"]]
+    assert listed(2) == [
+        ids["agent-lost1"],
+        ids[ROOT_SID],
+        ids["agent-explore1"],
+        ids["agent-plan1"],
+    ]
 
 
 def test_source_id_selects_the_root_and_show_lists_its_subagents(indexed) -> None:

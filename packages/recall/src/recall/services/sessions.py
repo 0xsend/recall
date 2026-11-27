@@ -149,26 +149,60 @@ def _list_sessions(
         # stays visible on its own (REQ-CLI-031).
         where_parts.append(f"({lineage.root} IS NULL OR r.root_id IS NULL)")
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    # `limit` counts session trees, not rows, so a page never splits a tree: a
+    # tree is a root, or a linked session whose root is not indexed, together
+    # with the matching sessions linked under it, listed root first.
     sql = f"""
-        WITH lineage_roots AS ({lineage.roots}), lineage_children AS ({lineage.children})
-        SELECT s.id, s.source, s.source_session_id, ss.started_at, ss.ended_at,
-               ss.cwd, ss.git_repo, ss.git_branch,
-               ss.model, ss.message_count, ss.tool_count, ss.input_tokens, ss.output_tokens,
-               ss.is_complete, ss.host, ss.file_mtime, ss.file_size, ss.indexed_at,
-               GREATEST(ss.ended_at, to_timestamp(ss.file_mtime) AT TIME ZONE 'UTC')
-                 AS last_activity_at,
-               {lineage.columns}, r.root_id, COALESCE(c.subagent_count, 0)
-        FROM sessions s
-        JOIN session_state ss ON ss.session_id = s.id
-        LEFT JOIN lineage_roots r
-          ON r.source = s.source AND r.source_session_id = {lineage.root}
-         AND r.host = ss.host
-        LEFT JOIN lineage_children c
-          ON {lineage.root} IS NULL AND c.source = s.source
-         AND c.root_source_session_id = s.source_session_id AND c.host = ss.host
-        {where_clause}
-        ORDER BY ss.started_at DESC NULLS LAST, ss.indexed_at DESC
-        LIMIT {limit}
+        WITH lineage_roots AS ({lineage.roots}), lineage_children AS ({lineage.children}),
+        matched AS (
+            SELECT s.id, s.source, s.source_session_id, ss.started_at, ss.ended_at,
+                   ss.cwd, ss.git_repo, ss.git_branch,
+                   ss.model, ss.message_count, ss.tool_count, ss.input_tokens,
+                   ss.output_tokens, ss.is_complete, ss.host, ss.file_mtime, ss.file_size,
+                   ss.indexed_at,
+                   GREATEST(ss.ended_at, to_timestamp(ss.file_mtime) AT TIME ZONE 'UTC')
+                     AS last_activity_at,
+                   {lineage.root} AS lineage_root, {lineage.agent_id} AS lineage_agent_id,
+                   {lineage.agent_type} AS lineage_agent_type,
+                   {lineage.agent_description} AS lineage_agent_description,
+                   r.root_id, COALESCE(c.subagent_count, 0) AS subagent_count,
+                   COALESCE(r.root_id, s.id) AS tree_id, r.root_id IS NOT NULL AS is_linked
+            FROM sessions s
+            JOIN session_state ss ON ss.session_id = s.id
+            LEFT JOIN lineage_roots r
+              ON r.source = s.source AND r.source_session_id = {lineage.root}
+             AND r.host = ss.host
+            LEFT JOIN lineage_children c
+              ON {lineage.root} IS NULL AND c.source = s.source
+             AND c.root_source_session_id = s.source_session_id AND c.host = ss.host
+            {where_clause}
+        ),
+        trees AS (
+            SELECT tree_id,
+                   COALESCE(MIN(started_at) FILTER (WHERE NOT is_linked), MIN(started_at))
+                     AS tree_started_at,
+                   MAX(indexed_at) AS tree_indexed_at
+            FROM matched
+            GROUP BY tree_id
+            ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id
+            LIMIT {limit}
+        ),
+        placed AS (
+            SELECT m.*, t.tree_started_at, t.tree_indexed_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY m.tree_id
+                       ORDER BY m.is_linked, m.started_at NULLS LAST, m.id
+                   ) AS tree_position
+            FROM matched m JOIN trees t ON t.tree_id = m.tree_id
+        )
+        SELECT id, source, source_session_id, started_at, ended_at, cwd, git_repo, git_branch,
+               model, message_count, tool_count, input_tokens, output_tokens, is_complete,
+               host, file_mtime, file_size, indexed_at, last_activity_at,
+               lineage_root, lineage_agent_id, lineage_agent_type, lineage_agent_description,
+               root_id, subagent_count
+        FROM placed
+        WHERE tree_position <= {1 + SUBAGENTS_LISTED_MAX}
+        ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id, tree_position
     """
     rows = conn.execute(sql, params).fetchall()
     return [
