@@ -39,6 +39,33 @@ def test_catalog_persists_pending_and_does_not_ack_newer_generation() -> None:
         conn.close()
 
 
+def test_renumbered_device_is_stored_without_making_the_source_pending() -> None:
+    from dataclasses import replace
+
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = _native.duckdb_connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        before = SourceSignature(dev=16777233, inode=2, ctime_ns=3, mtime_ns=4, size=5)
+        generation = catalog.observe("codex", "/root", "/root/a.jsonl", before)
+        assert catalog.acknowledge("codex", "/root/a.jsonl", generation, 5, "a" * 64)
+
+        after = replace(before, dev=16777232)
+        changed = catalog.observe_batch([("codex", "/root", "/root/a.jsonl", after)])
+
+        assert changed == ()
+        source = catalog.get("codex", "/root/a.jsonl")
+        assert source is not None and source.current
+        assert source.desired_generation == generation
+        assert source.first_pending_at is None
+        assert source.signature is not None and source.signature.dev == 16777232
+    finally:
+        conn.close()
+
+
 def test_scheduler_reserves_oldest_work_under_active_pressure() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature

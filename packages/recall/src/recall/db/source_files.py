@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import MappingProxyType
 from typing import cast
 
@@ -94,6 +94,12 @@ class SourceSignature:
     size: int
     sidecar_mtime_ns: int = 0
     sidecar_signature: str = ""
+
+
+# `SourceSignature` fields, named as their `source_files` columns, whose change
+# means new content to read. See `content_identity`.
+_CONTENT_FIELDS = ("inode", "ctime_ns", "mtime_ns", "size", "sidecar_mtime_ns", "sidecar_signature")
+assert set(_CONTENT_FIELDS) < {field.name for field in fields(SourceSignature)}
 
 
 @dataclass(frozen=True)
@@ -256,23 +262,28 @@ def source_key(source: str, source_path: str) -> str:
     return f"{source}\x1f{source_path}"
 
 
-def observation_identity(signature: SourceSignature) -> tuple[object, ...]:
+def content_identity(signature: SourceSignature) -> tuple[object, ...]:
     """The transcript and sidecar facts whose change means new content to read.
 
-    The parser revision is deliberately absent: a parser build change re-parses
-    supported content only when its own bytes change next, never the whole corpus.
-    Unsupported parks separately become retryable when their parser changes.
-    Rebuilding history is a versioned index migration (`REQ-RECON-010`).
+    The device number is absent: macOS can renumber a volume across a reboot or
+    remount without touching a byte, and treating that as a change re-reads the
+    whole catalog. The inode, timestamps and size still witness a replacement.
+    The parser revision is deliberately absent too: a parser build change
+    re-parses supported content only when its own bytes change next, never the
+    whole corpus. Unsupported parks separately become retryable when their
+    parser changes. Rebuilding history is a versioned index migration
+    (`REQ-RECON-010`).
     """
-    return (
-        signature.dev,
-        signature.inode,
-        signature.ctime_ns,
-        signature.mtime_ns,
-        signature.size,
-        signature.sidecar_mtime_ns,
-        signature.sidecar_signature,
-    )
+    return tuple(getattr(signature, field) for field in _CONTENT_FIELDS)
+
+
+def observation_identity(signature: SourceSignature) -> tuple[object, ...]:
+    """Every stored observation fact, in `source_files` column order.
+
+    A difference here means the catalog row needs a write; only a difference in
+    `content_identity` makes the source pending.
+    """
+    return (signature.dev, *content_identity(signature))
 
 
 class SourceCatalog:
@@ -318,9 +329,10 @@ class SourceCatalog:
 
         The generation, retry and pending-age rules are shared by notifications
         and inventory. Existing ownership is preserved until `reassign_roots`.
-        Only new, changed or returning sources are written: every root is walked
-        on a timer, and re-observing an unchanged
-        source must cost a read, not a row rewrite.
+        Only new, changed, renumbered or returning sources are written: every
+        root is walked on a timer, and re-observing an unchanged source must
+        cost a read, not a row rewrite. A renumbered device is stored without
+        making the source pending.
         """
         if not 1 <= len(observations) <= 256:
             raise ValueError("observation batch must contain 1..256 paths")
@@ -350,13 +362,13 @@ class SourceCatalog:
             if row is None:
                 writes.append(observation)
                 continue
-            root_path, missing, *content = row
+            root_path, missing, dev, *content = row
             # Observations admit content; only complete inventory transfers ownership.
             observation = (_source, str(root_path), path, signature)
-            content_changed = tuple(content) != observation_identity(signature)
+            content_changed = tuple(content) != content_identity(signature)
             if content_changed:
                 changed_paths.append(path)
-            if content_changed or missing:
+            if content_changed or missing or dev != signature.dev:
                 writes.append(observation)
         if writes:
             self._merge_observations(writes)
@@ -389,15 +401,7 @@ class SourceCatalog:
         selection = ", ".join(f"observation.{column}" for column in _OBSERVATION_COLUMNS)
         changed = " OR ".join(
             f"source_files.{column} IS DISTINCT FROM excluded.{column}"
-            for column in (
-                "dev",
-                "inode",
-                "ctime_ns",
-                "mtime_ns",
-                "size",
-                "sidecar_mtime_ns",
-                "sidecar_signature",
-            )
+            for column in _CONTENT_FIELDS
         )
         # Naming an indexed column in UPDATE rewrites the row on DuckDB 1.5.5.
         # Separate MERGE arms keep a returning or re-rooted source off the indexes
@@ -427,7 +431,7 @@ class SourceCatalog:
                 next_retry_at = 0,
                 missing = FALSE, observed_at = excluded.observed_at
             WHEN MATCHED THEN UPDATE SET
-                root_path = excluded.root_path,
+                root_path = excluded.root_path, dev = excluded.dev,
                 missing = FALSE, observed_at = excluded.observed_at
             WHEN NOT MATCHED THEN INSERT ({columns}, first_pending_seq)
                 VALUES ({inserted}, excluded.first_pending_seq)
