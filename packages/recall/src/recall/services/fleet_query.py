@@ -334,6 +334,26 @@ def fleet_list(
     )
 
 
+@dataclass
+class _PeerTree:
+    """One peer's rows for a tree: at most one head and `SUBAGENTS_LISTED_MAX` linked."""
+
+    rows: list[tuple[dict[str, Any], HostValue]] = field(default_factory=list)
+    has_head: bool = False
+    linked_count: int = 0
+
+    def add(self, row: dict[str, Any], endpoint: HostValue) -> None:
+        if row.get("root_session_id"):
+            if self.linked_count == SUBAGENTS_LISTED_MAX:
+                return
+            self.linked_count += 1
+        else:
+            if self.has_head:
+                return
+            self.has_head = True
+        self.rows.append((row, endpoint))
+
+
 def _merge_session_trees(
     rows: Sequence[dict[str, Any]],
     endpoints: Sequence[HostValue],
@@ -347,13 +367,15 @@ def _merge_session_trees(
     that predates lineage, is a tree of its own. A peer's tree is held to the
     size a conforming peer can send: its head and `SUBAGENTS_LISTED_MAX` rows.
     """
-    trees: dict[tuple[HostValue, str], list[tuple[dict[str, Any], HostValue]]] = {}
+    trees: dict[tuple[HostValue, str], _PeerTree] = {}
     for row, endpoint in zip(rows, endpoints, strict=True):
         tree_id = row.get("root_session_id") or row.get("id")
-        tree = trees.setdefault((endpoint, str(tree_id)), [])
-        if len(tree) <= SUBAGENTS_LISTED_MAX:
-            tree.append((row, endpoint))
-    ordered = sorted(trees.values(), key=lambda tree: _recency_key(tree[0][0]), reverse=True)
+        trees.setdefault((endpoint, str(tree_id)), _PeerTree()).add(row, endpoint)
+    ordered = sorted(
+        (tree.rows for tree in trees.values()),
+        key=lambda tree: _recency_key(tree[0][0]),
+        reverse=True,
+    )
     if limit > 0:
         ordered = ordered[:limit]
     placed = [item for tree in ordered for item in tree]

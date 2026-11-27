@@ -392,3 +392,8 @@ def test_fleet_list_holds_a_peer_to_its_limits(monkeypatch: pytest.MonkeyPatch) 
     trees = fleet_list(inventory_executor(hosts), limit=1, subagents=True)
     assert len(trees.rows) == 1 + SUBAGENTS_LISTED_MAX
     assert trees.rows[0]["id"] == "root"
+
+    # With its root filtered out, the tree still holds no more linked rows.
+    page[:] = page[1:]
+    headless = fleet_list(inventory_executor(hosts), limit=1, subagents=True)
+    assert len(headless.rows) == SUBAGENTS_LISTED_MAX
