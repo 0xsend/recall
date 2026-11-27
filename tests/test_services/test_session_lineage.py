@@ -94,6 +94,29 @@ def test_list_files_linked_sessions_under_an_indexed_root(indexed) -> None:
     )
 
 
+def test_a_selected_session_lists_with_its_subagents(indexed) -> None:
+    conn, config = indexed
+    ids = _ids(conn)
+
+    def listed(session: str, *, subagents: bool) -> set[str]:
+        rows = list_sessions(
+            source=None,
+            since=None,
+            project=None,
+            session=session,
+            subagents=subagents,
+            config=config,
+            conn=conn,
+        )
+        return {row.id for row in rows}
+
+    tree = {ids[ROOT_SID], ids["agent-explore1"], ids["agent-plan1"]}
+    assert listed(ROOT_SID, subagents=True) == tree
+    assert listed(ids[ROOT_SID], subagents=True) == tree
+    assert listed(ROOT_SID, subagents=False) == {ids[ROOT_SID]}
+    assert listed(ids["agent-plan1"], subagents=True) == {ids["agent-plan1"]}
+
+
 def test_source_id_selects_the_root_and_show_lists_its_subagents(indexed) -> None:
     conn, _ = indexed
     ids = _ids(conn)

@@ -125,8 +125,13 @@ def _list_sessions(
         identity = resolve_session_identifier(
             conn, session, source=source.value if source is not None else None, host=host
         )
-        where_parts.append("s.id = ?")
-        params.append(identity.id)
+        if subagents:
+            # The selected session together with the sessions linked under it.
+            where_parts.append("(s.id = ? OR r.root_id = ?)")
+            params.extend([identity.id, identity.id])
+        else:
+            where_parts.append("s.id = ?")
+            params.append(identity.id)
     if source is not None:
         where_parts.append("s.source = ?")
         params.append(source.value)
