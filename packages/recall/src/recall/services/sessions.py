@@ -151,7 +151,8 @@ def _list_sessions(
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     # `limit` counts session trees, not rows, so a page never splits a tree: a
     # tree is a root, or a linked session whose root is not indexed, together
-    # with the matching sessions linked under it, listed root first.
+    # with the matching sessions linked under it, listed root first. A tree
+    # orders by its root even when the filters leave the root out.
     sql = f"""
         WITH lineage_roots AS ({lineage.roots}), lineage_children AS ({lineage.children}),
         matched AS (
@@ -166,33 +167,32 @@ def _list_sessions(
                    {lineage.agent_type} AS lineage_agent_type,
                    {lineage.agent_description} AS lineage_agent_description,
                    r.root_id, COALESCE(c.subagent_count, 0) AS subagent_count,
-                   COALESCE(r.root_id, s.id) AS tree_id, r.root_id IS NOT NULL AS is_linked
+                   COALESCE(r.root_id, s.id) AS tree_id, r.root_id IS NOT NULL AS is_linked,
+                   COALESCE(rs.started_at, ss.started_at) AS tree_started_at,
+                   COALESCE(rs.indexed_at, ss.indexed_at) AS tree_indexed_at
             FROM sessions s
             JOIN session_state ss ON ss.session_id = s.id
             LEFT JOIN lineage_roots r
               ON r.source = s.source AND r.source_session_id = {lineage.root}
              AND r.host = ss.host
+            LEFT JOIN session_state rs ON rs.session_id = r.root_id
             LEFT JOIN lineage_children c
               ON {lineage.root} IS NULL AND c.source = s.source
              AND c.root_source_session_id = s.source_session_id AND c.host = ss.host
             {where_clause}
         ),
         trees AS (
-            SELECT tree_id,
-                   COALESCE(MIN(started_at) FILTER (WHERE NOT is_linked), MIN(started_at))
-                     AS tree_started_at,
-                   MAX(indexed_at) AS tree_indexed_at
+            SELECT DISTINCT tree_id, tree_started_at, tree_indexed_at
             FROM matched
-            GROUP BY tree_id
             ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id
             LIMIT {limit}
         ),
         placed AS (
-            SELECT m.*, t.tree_started_at, t.tree_indexed_at,
+            SELECT m.*,
                    ROW_NUMBER() OVER (
-                       PARTITION BY m.tree_id
-                       ORDER BY m.is_linked, m.started_at NULLS LAST, m.id
-                   ) AS tree_position
+                       PARTITION BY m.tree_id, m.is_linked
+                       ORDER BY m.started_at NULLS LAST, m.id
+                   ) AS linked_position
             FROM matched m JOIN trees t ON t.tree_id = m.tree_id
         )
         SELECT id, source, source_session_id, started_at, ended_at, cwd, git_repo, git_branch,
@@ -201,8 +201,9 @@ def _list_sessions(
                lineage_root, lineage_agent_id, lineage_agent_type, lineage_agent_description,
                root_id, subagent_count
         FROM placed
-        WHERE tree_position <= {1 + SUBAGENTS_LISTED_MAX}
-        ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id, tree_position
+        WHERE NOT is_linked OR linked_position <= {SUBAGENTS_LISTED_MAX}
+        ORDER BY tree_started_at DESC NULLS LAST, tree_indexed_at DESC, tree_id,
+                 is_linked, linked_position
     """
     rows = conn.execute(sql, params).fetchall()
     return [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,34 @@ def test_list_files_linked_sessions_under_an_indexed_root(indexed) -> None:
         "Explore",
         "Find the parser",
     )
+
+
+def test_a_tree_orders_by_its_root_when_filters_leave_the_root_out(indexed) -> None:
+    conn, config = indexed
+    ids = _ids(conn)
+    # The root starts before the cutoff and its subagents after it.
+    conn.execute(
+        "UPDATE session_state SET started_at = TIMESTAMP '2026-11-01 00:00:00',"
+        " ended_at = TIMESTAMP '2026-11-01 00:00:00' WHERE session_id = ?",
+        [ids[ROOT_SID]],
+    )
+    conn.execute(
+        "UPDATE session_state SET started_at = TIMESTAMP '2026-11-10 00:00:00',"
+        " ended_at = TIMESTAMP '2026-11-10 00:00:00' WHERE session_id = ?",
+        [ids["agent-lost1"]],
+    )
+    rows = list_sessions(
+        source=None,
+        since=datetime(2026, 11, 2, tzinfo=UTC),
+        project=None,
+        subagents=True,
+        limit=1,
+        config=config,
+        conn=conn,
+    )
+    # The orphan's tree (Nov 10) outranks the root's (Nov 1), although the
+    # root's subagents started later than the orphan.
+    assert [row.id for row in rows] == [ids["agent-lost1"]]
 
 
 def test_a_selected_session_lists_with_its_subagents(indexed) -> None:

@@ -332,3 +332,35 @@ def test_fleet_list_subagents_reads_a_host_that_predates_the_option(
     assert sorted(row["id"] for row in result.rows) == ["current-1", "older-1"]
     older = [argv for name, argv in calls if name == "older"]
     assert ["--subagents" in argv for argv in older] == [True, False]
+
+
+def test_fleet_list_subagents_keeps_each_tree_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-CLI-031: the fleet limit counts whole session trees, not rows."""
+    hosts = (FleetHost(name="current", ssh="current"),)
+
+    def row(row_id: str, started: str, root: str | None = None) -> dict[str, object]:
+        return {
+            "id": row_id,
+            "source": "claude_code",
+            "started_at": started,
+            "root_session_id": root,
+        }
+
+    page = [
+        row("newer-root", "2026-11-20T10:00:00Z"),
+        row("older-root", "2026-11-19T10:00:00Z"),
+        row("older-child-1", "2026-11-21T10:00:00Z", "older-root"),
+        row("older-child-2", "2026-11-21T11:00:00Z", "older-root"),
+    ]
+
+    def fake_run(host: FleetHost, remote_argv: list[str], **_k: object) -> FleetRemoteResult:
+        return FleetRemoteResult(ok=True, stdout=json.dumps(page), stderr="", returncode=0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+
+    def listed(limit: int) -> list[object]:
+        result = fleet_list(inventory_executor(hosts), limit=limit, subagents=True)
+        return [item["id"] for item in result.rows]
+
+    assert listed(1) == ["newer-root"]
+    assert listed(2) == ["newer-root", "older-root", "older-child-1", "older-child-2"]
